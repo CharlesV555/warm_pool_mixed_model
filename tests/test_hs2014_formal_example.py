@@ -1,4 +1,5 @@
 from polymer_sim import (
+    ChannelBlock,
     assign_paper_minimal_catalysis,
     build_n3_wh_network,
     build_n3_wh_reactions,
@@ -34,6 +35,20 @@ def test_build_n3_wh_reactions():
     assert "1+1->11" in reaction_ids
     assert "00+0->000" in reaction_ids
     assert "11+1->111" in reaction_ids
+
+
+def test_nonfood_species_have_outflow_channels():
+    network = build_n3_wh_network(k_nonfood_outflow=0.8)
+    food = {"0", "1"}
+    expected_sources = {name for name in network.species_names if name not in food}
+    outflow_sources = {
+        network.species_names[network.get_channel_reactants(channel_id)[0]]
+        for channel_id in range(network.n_channels)
+        if network.get_channel_block(channel_id) == ChannelBlock.OUTFLOW
+    }
+
+    assert outflow_sources == expected_sources
+    assert network.channel_sizes[ChannelBlock.OUTFLOW] == len(expected_sources)
 
 
 def test_assign_paper_minimal_catalysis():

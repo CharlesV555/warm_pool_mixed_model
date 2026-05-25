@@ -1,0 +1,31 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test caches and temporary pytest directories
+.pytest_cache/
+pytest-cache-files-*/
+
+# Local Python environments
+.venv/
+venv/
+env/
+.conda/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Generated simulation outputs
+*.npz
+examples/*_outputs/
+examples/paired_method_outputs*/
+
+# Local logs and temporary files
+*.log
+*.tmp

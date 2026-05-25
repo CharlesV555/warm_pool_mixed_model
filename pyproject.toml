@@ -6,6 +6,8 @@ requires-python = ">=3.10"
 dependencies = [
     "matplotlib",
     "numpy",
+    "pandas",
+    "seaborn",
 ]
 
 [tool.pytest.ini_options]

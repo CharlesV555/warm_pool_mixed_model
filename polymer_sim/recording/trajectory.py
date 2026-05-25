@@ -60,12 +60,46 @@ class TrajectoryRecorder(BaseRecorder):
         self._times: list[float] = []
         self._states: list[np.ndarray] = []
         self._metadata: dict = {}
+        self._channel_trigger_counts: np.ndarray | None = None
+        self._channel_event_times: list[float] = []
+        self._channel_event_ids: list[int] = []
+        self._reaction_intervals: list[float] = []
+        self._reaction_interval_times: list[float] = []
+        self._last_reaction_event_time: float = 0.0
+        self._tracked_outflow_species: list[str] = []
+        self._tracked_outflow_channel_to_col: dict[int, int] = {}
+        self._tracked_outflow_times: list[float] = []
+        self._tracked_outflow_removed: list[list[float]] = []
 
     def initialize(self, species_names: list[str], initial_state: np.ndarray, metadata: dict | None = None) -> None:
         self._species_names = list(species_names)
         self._times = [0.0]
         self._states = [np.asarray(initial_state, dtype=float).copy()]
         self._metadata = dict(metadata or {})
+        n_channels = self._metadata.get("n_channels")
+        self._channel_trigger_counts = (
+            np.zeros(int(n_channels), dtype=np.int64) if n_channels is not None else None
+        )
+        self._channel_event_times = []
+        self._channel_event_ids = []
+        self._reaction_intervals = []
+        self._reaction_interval_times = []
+        self._last_reaction_event_time = 0.0
+        self._tracked_outflow_species = []
+        self._tracked_outflow_channel_to_col = {}
+        self._tracked_outflow_times = []
+        self._tracked_outflow_removed = []
+        for channel_label in self._metadata.get("channel_labels", []):
+            if channel_label.get("block_type") != "OUTFLOW":
+                continue
+            reactants = channel_label.get("reactants", ())
+            if not reactants:
+                continue
+            source_sid = int(reactants[0])
+            source_name = self._species_names[source_sid]
+            if source_name not in self._tracked_outflow_species:
+                self._tracked_outflow_species.append(source_name)
+            self._tracked_outflow_channel_to_col[int(channel_label["channel_id"])] = self._tracked_outflow_species.index(source_name)
 
     def record_step(
         self,
@@ -79,12 +113,44 @@ class TrajectoryRecorder(BaseRecorder):
     ) -> None:
         self._times.append(float(time))
         self._states.append(np.asarray(state, dtype=float).copy())
+        channel_id = metadata.get("channel_id") if metadata else None
+        is_reaction_event = channel_id is not None or event_time is not None
         if metadata:
             self._metadata.update(metadata)
+        if is_reaction_event:
+            event_timestamp = float(event_time if event_time is not None else time)
+            if channel_id is not None and self._channel_trigger_counts is not None:
+                self._channel_trigger_counts[int(channel_id)] += 1
+                self._channel_event_times.append(event_timestamp)
+                self._channel_event_ids.append(int(channel_id))
+            interval = event_timestamp - self._last_reaction_event_time
+            self._reaction_intervals.append(float(max(interval, 0.0)))
+            self._reaction_interval_times.append(event_timestamp)
+            self._last_reaction_event_time = event_timestamp
+        if self._tracked_outflow_species:
+            outflow_row = [0.0 for _ in self._tracked_outflow_species]
+            if metadata:
+                channel_id = metadata.get("channel_id")
+                if channel_id is not None and int(channel_id) in self._tracked_outflow_channel_to_col:
+                    outflow_row[self._tracked_outflow_channel_to_col[int(channel_id)]] = 1.0
+            self._tracked_outflow_times.append(float(time))
+            self._tracked_outflow_removed.append(outflow_row)
         self._metadata["n_steps"] = int(step_count)
         self._metadata["n_events"] = int(event_count)
 
     def finalize(self) -> TrajectoryRecord:
+        if self._channel_trigger_counts is not None:
+            self._metadata["channel_trigger_counts"] = self._channel_trigger_counts.tolist()
+        self._metadata["channel_event_times"] = list(self._channel_event_times)
+        self._metadata["channel_event_ids"] = list(self._channel_event_ids)
+        self._metadata["reaction_intervals"] = list(self._reaction_intervals)
+        self._metadata["reaction_interval_times"] = list(self._reaction_interval_times)
+        if self._tracked_outflow_times:
+            self._metadata["tracked_outflow"] = {
+                "times": list(self._tracked_outflow_times),
+                "species_names": list(self._tracked_outflow_species),
+                "removed": [list(row) for row in self._tracked_outflow_removed],
+            }
         return TrajectoryRecord(
             times=np.asarray(self._times, dtype=float),
             states=np.vstack(self._states) if self._states else np.empty((0, 0), dtype=float),

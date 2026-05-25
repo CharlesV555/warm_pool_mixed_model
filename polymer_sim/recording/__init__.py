@@ -9,12 +9,19 @@
 """
 
 from polymer_sim.recording.base import BaseRecorder, BaseRunSummary, BaseTrajectoryRecord
-from polymer_sim.recording.plot_single_run import plot_time_series
-from polymer_sim.recording.plot_summary import (
+from polymer_sim.recording.plot_single_run import (
+    plot_channel_propensity_time_series,
     plot_event_time_distribution,
     plot_final_state_distribution,
     plot_mean_std_over_runs,
+    plot_reaction_interval_bar,
+    plot_reaction_interval_wave,
+    plot_reaction_frequency_over_time,
+    plot_reaction_trigger_frequency,
+    plot_species_with_outflow,
+    plot_time_series,
 )
+from polymer_sim.recording.plot_summary import plot_summary_pipeline
 from polymer_sim.recording.summary import RunSummary, SummaryRecorder, load_summary, save_summary
 from polymer_sim.recording.timing import TimingRecorder, TimingSummary, load_timing_summary, save_timing_summary
 from polymer_sim.recording.trajectory import (
@@ -40,6 +47,13 @@ __all__ = [
     "plot_event_time_distribution",
     "plot_final_state_distribution",
     "plot_mean_std_over_runs",
+    "plot_channel_propensity_time_series",
+    "plot_reaction_interval_bar",
+    "plot_reaction_interval_wave",
+    "plot_reaction_frequency_over_time",
+    "plot_reaction_trigger_frequency",
+    "plot_summary_pipeline",
+    "plot_species_with_outflow",
     "plot_time_series",
     "save_summary",
     "save_timing_summary",

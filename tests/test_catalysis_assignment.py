@@ -73,8 +73,19 @@ def test_method2_assigns_distinct_catalysts_to_distinct_channels():
         cats = network.get_channel_catalysts(int(channel_id))
         assert cats.tolist() == [int(catalyst_sid)]
         assert np.isclose(network.get_catalytic_strength(int(channel_id), int(catalyst_sid)), float(strength))
+        for reverse_channel_id in network.get_reverse_channel_ids(int(channel_id)):
+            assert int(catalyst_sid) in network.get_channel_catalysts(int(reverse_channel_id))
+            assert np.isclose(
+                network.get_catalytic_strength(int(reverse_channel_id), int(catalyst_sid)),
+                float(strength),
+            )
 
-    untouched = set(range(network.n_channels)) - set(int(cid) for cid in channel_ids)
+    mirrored = {
+        int(reverse_channel_id)
+        for channel_id in channel_ids
+        for reverse_channel_id in network.get_reverse_channel_ids(int(channel_id))
+    }
+    untouched = set(range(network.n_channels)) - set(int(cid) for cid in channel_ids) - mirrored
     for channel_id in untouched:
         assert network.get_channel_catalysts(channel_id).size == 0
 

@@ -1,9 +1,10 @@
 import numpy as np
+import pytest
 
 from polymer_sim import ChannelBlock, ReactionNetworkData, SystemState, build_reaction_rule_tables, generate_fixed_species_space
 
 
-def make_network(k_poly=1.0, k_frag=1.0):
+def make_network(k_poly=1.0, k_frag=1.0, **kwargs):
     space = generate_fixed_species_space(["A", "B"], max_len=3)
     tables = build_reaction_rule_tables(space)
     network = ReactionNetworkData.from_species_space(
@@ -13,6 +14,7 @@ def make_network(k_poly=1.0, k_frag=1.0):
         k_poly_right=k_poly,
         k_frag_left=k_frag,
         k_frag_right=k_frag,
+        **kwargs,
     )
     return network
 
@@ -89,3 +91,74 @@ def test_propensity_without_and_with_catalysis():
     assert network.compute_propensity(channel, state) == 50.0
     assert b in network.channel_to_catalysts[channel]
     assert channel in network.species_to_channels[b]
+
+
+def test_catalysis_assignment_mirrors_reverse_reaction():
+    network = make_network()
+    catalyst = network.species_idx("B")
+    source = network.species_idx("BA")
+    monomer = network.species_idx("A")
+    product = network.species_idx("BAA")
+    local = int(network.right_add_local_id[source, monomer])
+    channel = network.channel_id(ChannelBlock.RIGHT_ADD, local)
+    reverse_channel = network.channel_id(
+        ChannelBlock.RIGHT_SPLIT,
+        int(network.right_split_local_id_by_source[product]),
+    )
+
+    assert reverse_channel in network.get_reverse_channel_ids(channel)
+    network.set_catalytic_strength(channel, catalyst_sid=catalyst, strength=0.75)
+
+    assert network.get_catalytic_strength(channel, catalyst) == 0.75
+    assert network.get_catalytic_strength(reverse_channel, catalyst) == 0.75
+    assert catalyst in network.get_channel_catalysts(reverse_channel)
+    assert reverse_channel in network.species_to_channels[catalyst]
+
+
+def test_substrate_saturating_propensity_uses_per_catalyst_capacity():
+    network = make_network(k_poly=2.0, catalysis_mode="substrate_saturating", saturation_alpha=0.25)
+    a = network.species_idx("A")
+    b = network.species_idx("B")
+    ba = network.species_idx("BA")
+    bb = network.species_idx("BB")
+    local = int(network.left_add_local_id[a, b])
+    channel = network.channel_id(ChannelBlock.LEFT_ADD, local)
+
+    x = np.zeros(network.n_species)
+    x[a] = 10.0
+    x[b] = 4.0
+    x[ba] = 4.0
+    x[bb] = 4.0
+    state = SystemState.from_x0(x)
+
+    network.set_catalytic_strength(channel, catalyst_sid=ba, strength=0.5, rebuild=False)
+    network.set_catalytic_strength(channel, catalyst_sid=bb, strength=0.25, rebuild=True)
+
+    substrate_capacity = 4.0
+    effective_per_catalyst = substrate_capacity * 4.0 / (0.25 * substrate_capacity + 4.0)
+    expected_factor = 1.0 + 0.5 * effective_per_catalyst + 0.25 * effective_per_catalyst
+    assert network.compute_base_propensity(channel, state) == 80.0
+    assert network.get_catalytic_factor(channel, state) == pytest.approx(expected_factor)
+    assert network.compute_propensity(channel, state) == pytest.approx(80.0 * expected_factor)
+
+
+def test_substrate_saturating_same_species_capacity_floor_can_zero_propensity():
+    network = make_network(k_poly=2.0, catalysis_mode="substrate_saturating", saturation_alpha=0.25)
+    a = network.species_idx("A")
+    b = network.species_idx("B")
+    local = int(network.left_add_local_id[a, a])
+    channel = network.channel_id(ChannelBlock.LEFT_ADD, local)
+
+    x = np.zeros(network.n_species)
+    x[a] = 1.5
+    x[b] = 3.0
+    state = SystemState.from_x0(x)
+    network.set_catalytic_strength(channel, catalyst_sid=b, strength=0.5)
+
+    assert network.compute_base_propensity(channel, state) > 0.0
+    assert network.compute_propensity(channel, state) == 0.0
+
+
+def test_saturation_alpha_must_be_positive():
+    with pytest.raises(ValueError, match="saturation_alpha"):
+        make_network(catalysis_mode="substrate_saturating", saturation_alpha=0.0)

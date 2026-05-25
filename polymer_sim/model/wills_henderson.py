@@ -32,9 +32,33 @@ def build_n3_wh_network(
     *,
     initial_counts: dict[str, float] | None = None,
     k_right_add: float = 1.0,
+    k_trimer_outflow: float = 0.0,
+    k_nonfood_outflow: float | None = None,
+    food_species: tuple[str, ...] = ("0", "1"),
+    catalysis_mode: str = "linear",
+    saturation_alpha: float = 0.25,
 ) -> ReactionNetworkData:
+    """Build the n=3 Wills-Henderson network.
+
+    ``k_trimer_outflow`` is retained as a compatibility alias. New code should
+    use ``k_nonfood_outflow`` because outflow now applies to every non-food
+    species, not only trimers. ``food_species`` controls which species are
+    excluded from natural outflow.
+    """
+
     space = build_n3_wh_species(initial_counts=initial_counts)
     tables = build_reaction_rule_tables(space)
+    if k_nonfood_outflow is not None and k_trimer_outflow != 0.0:
+        if not np.isclose(float(k_nonfood_outflow), float(k_trimer_outflow)):
+            raise ValueError("k_trimer_outflow and k_nonfood_outflow specify different rates")
+
+    outflow_rate = float(k_trimer_outflow if k_nonfood_outflow is None else k_nonfood_outflow)
+    food_species_ids = np.asarray([space.idx(name) for name in food_species], dtype=np.int64)
+    nonfood_species_ids = np.setdiff1d(
+        np.arange(space.n_species, dtype=np.int64),
+        food_species_ids,
+        assume_unique=True,
+    )
     return ReactionNetworkData.from_species_space(
         space,
         tables,
@@ -42,6 +66,10 @@ def build_n3_wh_network(
         k_poly_right=k_right_add,
         k_frag_left=0.0,
         k_frag_right=0.0,
+        k_outflow=outflow_rate,
+        outflow_species_ids=nonfood_species_ids if outflow_rate > 0.0 else None,
+        catalysis_mode=catalysis_mode,
+        saturation_alpha=saturation_alpha,
     )
 
 
