@@ -10,6 +10,7 @@
 
 from polymer_sim.recording.base import BaseRecorder, BaseRunSummary, BaseTrajectoryRecord
 from polymer_sim.recording.plot_single_run import (
+    animate_reaction_network_state_tree,
     plot_channel_propensity_time_series,
     plot_event_time_distribution,
     plot_final_state_distribution,
@@ -17,6 +18,7 @@ from polymer_sim.recording.plot_single_run import (
     plot_reaction_interval_bar,
     plot_reaction_interval_wave,
     plot_reaction_frequency_over_time,
+    plot_reaction_network_state_tree,
     plot_reaction_trigger_frequency,
     plot_species_with_outflow,
     plot_time_series,
@@ -32,6 +34,7 @@ from polymer_sim.recording.trajectory import (
 )
 
 __all__ = [
+    "animate_reaction_network_state_tree",
     "BaseRecorder",
     "BaseRunSummary",
     "BaseTrajectoryRecord",
@@ -51,6 +54,7 @@ __all__ = [
     "plot_reaction_interval_bar",
     "plot_reaction_interval_wave",
     "plot_reaction_frequency_over_time",
+    "plot_reaction_network_state_tree",
     "plot_reaction_trigger_frequency",
     "plot_summary_pipeline",
     "plot_species_with_outflow",

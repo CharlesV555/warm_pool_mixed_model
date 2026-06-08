@@ -7,6 +7,7 @@ from polymer_sim import (
     ExperimentRunner,
     SSAStepper,
     TrajectoryRecorder,
+    animate_reaction_network_state_tree,
     assign_paper_minimal_catalysis,
     build_restriction,
     build_n3_wh_network,
@@ -14,8 +15,10 @@ from polymer_sim import (
     plot_reaction_interval_bar,
     plot_reaction_interval_wave,
     plot_reaction_frequency_over_time,
+    plot_reaction_network_state_tree,
     plot_reaction_trigger_frequency,
     plot_species_with_outflow,
+    plot_time_series,
 )
 
 
@@ -85,9 +88,24 @@ def test_plot_functions_run_on_record():
             {"label": "0.2-end", "start": 0.2, "end": None},
         ],
     )
+    fig7, ax7 = plot_reaction_network_state_tree(record, time_points=(0.0, 0.5), label_alpha=0.6)
+    fig8, ax8, anim8 = animate_reaction_network_state_tree(
+        record,
+        dt=0.1,
+        time_range=(0.0, 0.5),
+        label_alpha=0.6,
+    )
+    fig9, ax9 = plot_time_series(record, species_indices=[0, 1], time_range=(0.1, 0.3))
     assert fig1 is not None and ax1 is not None
     assert fig2 is not None and axes2 is not None
     assert fig3 is not None and ax3 is not None
     assert fig4 is not None and ax4 is not None
     assert fig5 is not None and ax5 is not None
     assert fig6 is not None and ax6 is not None
+    assert fig7 is not None and ax7 is not None
+    assert fig8 is not None and ax8 is not None and anim8 is not None
+    assert fig9 is not None and ax9 is not None
+    for line in ax9.lines:
+        xdata = line.get_xdata()
+        assert xdata.min() >= 0.1
+        assert xdata.max() <= 0.3

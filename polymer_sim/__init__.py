@@ -28,6 +28,7 @@ from polymer_sim.partition.strategies import (
     PartitionStrategy,
 )
 from polymer_sim.recording import (
+    animate_reaction_network_state_tree,
     BaseRecorder,
     RunSummary,
     SummaryRecorder,
@@ -45,6 +46,7 @@ from polymer_sim.recording import (
     plot_reaction_interval_bar,
     plot_reaction_interval_wave,
     plot_reaction_frequency_over_time,
+    plot_reaction_network_state_tree,
     plot_reaction_trigger_frequency,
     plot_summary_pipeline,
     plot_species_with_outflow,
@@ -74,6 +76,7 @@ from polymer_sim.simulation.restriction import (
 )
 
 __all__ = [
+    "animate_reaction_network_state_tree",
     "BLOCK_ORDER",
     "BaseStepper",
     "BaseRestriction",
@@ -135,6 +138,7 @@ __all__ = [
     "plot_reaction_interval_bar",
     "plot_reaction_interval_wave",
     "plot_reaction_frequency_over_time",
+    "plot_reaction_network_state_tree",
     "plot_reaction_trigger_frequency",
     "plot_summary_pipeline",
     "plot_species_with_outflow",

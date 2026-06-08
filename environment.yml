@@ -1,0 +1,17 @@
+name: warm_pool
+channels:
+  - defaults
+dependencies:
+  - python=3.13
+  - scipy
+  - matplotlib
+  - numpy
+  - pandas
+  - scikit-learn
+  - numba
+  - regex
+  - networkx
+  - graphviz
+  - ipykernel
+  - pytest
+  - seaborn

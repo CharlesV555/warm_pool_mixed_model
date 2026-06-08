@@ -26,13 +26,13 @@ from polymer_sim.simulation.restriction import build_restriction
 
 # Keep the same reaction network, catalysis assignment, rates, outflow, and
 # restriction as catalyst_run.py, but use a short horizon for this smoke test.
-T_END = min(catalyst_run.T_END, 0.01)
+T_END = min(catalyst_run.T_END, 0.2)
 SEED = catalyst_run.SEED
 MAX_STEPS = catalyst_run.MAX_STEPS
 MAX_TIMES = min(catalyst_run.MAX_TIMES, 60.0)
 BLENDED_I1 = 10.0
 BLENDED_I2 = 30.0
-BLENDED_DT_CLE = 0.01
+BLENDED_DT_CLE = 0.00001
 BLENDED_DT_MACRO = 0.01
 OUTPUT_PATH = EXAMPLES_DIR / "blended_hybrid_minimal_trajectory.npz"
 

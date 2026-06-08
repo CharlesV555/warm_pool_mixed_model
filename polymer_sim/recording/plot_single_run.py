@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from matplotlib.animation import FuncAnimation
+from matplotlib.patches import Circle, Patch
 from polymer_sim.core.enums import ChannelBlock
 from polymer_sim.core.network import ReactionNetworkData
 from polymer_sim.core.state import SystemState
@@ -24,6 +27,7 @@ def plot_time_series(
     record_or_path: TrajectoryRecord | PathLike,
     species_indices: list[int] | np.ndarray | None = None,
     title: str | None = None,
+    time_range: tuple[float | None, float | None] | None = None,
 ):
     """绘制单次轨迹的时间序列图。
 
@@ -36,14 +40,23 @@ def plot_time_series(
     else:
         indices = np.asarray(species_indices, dtype=np.int64)
 
+    times, states = _time_series_window(record, time_range)
+
     fig, ax = plt.subplots(figsize=(8, 4.5))
     for sid in indices:
-        ax.plot(record.times, record.states[:, sid], label=record.species_names[int(sid)])
+        ax.plot(times, states[:, sid], label=record.species_names[int(sid)])
     ax.set_xlabel("Time")
     ax.set_ylabel("Count / Concentration")
     ax.set_title(title or "Single Run Time Series")
+
     if indices.size <= 12:
-        ax.legend()
+        ax.legend(
+            facecolor="white",      # 图例背景
+            edgecolor="black",      # 图例边框
+            framealpha=1.0,         # 不透明
+            labelcolor="black"      # 图例文字颜色
+        )
+
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     return fig, ax
@@ -354,6 +367,279 @@ def plot_species_with_outflow(
     return fig, (ax_left, ax_right)
 
 
+def plot_reaction_network_state_tree(
+    record_or_path: TrajectoryRecord | PathLike,
+    time_points: tuple[float | None, float | None] | None = None,
+    *,
+    state_pair: tuple[np.ndarray, np.ndarray] | None = None,
+    species_lengths: list[int] | np.ndarray | None = None,
+    radius_mode: str = "area",
+    radius_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+    max_node_radius: float = 0.18,
+    spacing_area_factor: float = 1.2,
+    start_color: str = "#2ca02c",
+    end_color: str = "#d62728",
+    edge_color: str = "#8a8a8a",
+    show_layer_guides: bool = True,
+    label_alpha: float = 1.0,
+    title: str | None = None,
+):
+    """Plot a radial reaction-network tree comparing two recorded states.
+
+    Nodes are grouped by species length. Each node has two concentric circles:
+    green for the earlier state and red for the later state. By default circle
+    area is proportional to concentration; use radius_mode="radius" or
+    radius_transform=... to change that mapping.
+    """
+
+    record = _as_trajectory_record(record_or_path)
+    if record.times.size == 0 or record.states.size == 0:
+        raise ValueError("trajectory record is empty")
+
+    start_time, end_time, start_state, end_state = _state_pair_from_record(
+        record,
+        time_points,
+        state_pair,
+    )
+    lengths = _species_lengths(record.species_names, species_lengths)
+    scale_reference = max(float(np.max(start_state)), float(np.max(end_state)))
+    start_radii = _node_radii(start_state, max_node_radius, radius_mode, radius_transform, scale_reference)
+    end_radii = _node_radii(end_state, max_node_radius, radius_mode, radius_transform, scale_reference)
+    node_radii = np.maximum(start_radii, end_radii)
+    positions, layer_radii = _radial_species_layout(
+        record.species_names,
+        lengths,
+        node_radii,
+        spacing_area_factor,
+    )
+    edges = _reaction_tree_edges(record, lengths)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    if show_layer_guides:
+        for length, radius in layer_radii.items():
+            if radius > 0.0:
+                ax.add_patch(
+                    Circle(
+                        (0.0, 0.0),
+                        radius,
+                        fill=False,
+                        edgecolor="#d0d0d0",
+                        linewidth=0.7,
+                        linestyle="--",
+                        zorder=0,
+                    )
+                )
+            label_x = radius + max(float(np.max(node_radii)), 0.04) * 1.4
+            ax.text(label_x, 0.0, f"L{length}", fontsize=8, color="#666666", va="center")
+
+    for left, right in edges:
+        x0, y0 = positions[int(left)]
+        x1, y1 = positions[int(right)]
+        ax.plot([x0, x1], [y0, y1], color=edge_color, linewidth=0.8, alpha=0.45, zorder=1)
+
+    for sid, name in enumerate(record.species_names):
+        x, y = positions[int(sid)]
+        circles = [
+            (float(start_radii[sid]), start_color, 2),
+            (float(end_radii[sid]), end_color, 3),
+        ]
+        for radius, color, zorder in sorted(circles, key=lambda item: item[0], reverse=True):
+            if radius <= 0.0:
+                continue
+            ax.add_patch(
+                Circle(
+                    (x, y),
+                    radius,
+                    facecolor=color,
+                    edgecolor=color,
+                    alpha=0.24,
+                    linewidth=1.2,
+                    zorder=zorder,
+                )
+            )
+        ax.text(
+            x,
+            y,
+            name,
+            ha="center",
+            va="center",
+            fontsize=8,
+            color="black",
+            alpha=float(label_alpha),
+            zorder=4,
+        )
+
+    legend_handles = [
+        Patch(facecolor=start_color, edgecolor=start_color, alpha=0.24, label=f"t={start_time:g}"),
+        Patch(facecolor=end_color, edgecolor=end_color, alpha=0.24, label=f"t={end_time:g}"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper right")
+    ax.set_title(title or "Reaction Network State Tree")
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+    _set_equal_tree_limits(ax, positions, node_radii)
+    fig.tight_layout()
+    return fig, ax
+
+
+def animate_reaction_network_state_tree(
+    record_or_path: TrajectoryRecord | PathLike,
+    dt: float,
+    *,
+    time_range: tuple[float | None, float | None] | None = None,
+    species_lengths: list[int] | np.ndarray | None = None,
+    radius_mode: str = "area",
+    radius_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+    max_node_radius: float = 0.18,
+    spacing_area_factor: float = 1.2,
+    show_previous_state: bool = True,
+    start_color: str = "#2ca02c",
+    end_color: str = "#d62728",
+    edge_color: str = "#8a8a8a",
+    show_layer_guides: bool = True,
+    label_alpha: float = 1.0,
+    frame_interval_ms: int = 200,
+    repeat: bool = False,
+    title: str | None = None,
+    save_path: PathLike | None = None,
+    writer: str | None = None,
+    dpi: int = 120,
+):
+    """Animate the radial reaction-network state tree over simulated time.
+
+    Frame times are sampled every `dt` along the trajectory time axis. Each
+    frame displays the recorded state nearest to its frame time. By default,
+    the previous frame's nearest state is shown in green and the current
+    nearest state in red.
+    """
+
+    record = _as_trajectory_record(record_or_path)
+    if record.times.size == 0 or record.states.size == 0:
+        raise ValueError("trajectory record is empty")
+
+    frame_times = _animation_frame_times(record, dt, time_range)
+    frame_indices = _nearest_record_indices(record.times, frame_times)
+    frame_states = record.states[frame_indices]
+    frame_radii = _animation_frame_radii(
+        frame_states,
+        max_node_radius,
+        radius_mode,
+        radius_transform,
+    )
+    layout_node_radii = np.max(frame_radii, axis=0) if frame_radii.size else np.zeros(record.states.shape[1])
+
+    lengths = _species_lengths(record.species_names, species_lengths)
+    positions, layer_radii = _radial_species_layout(
+        record.species_names,
+        lengths,
+        layout_node_radii,
+        spacing_area_factor,
+    )
+    edges = _reaction_tree_edges(record, lengths)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    static_artists = _draw_reaction_tree_static_layers(
+        ax,
+        record,
+        positions,
+        layer_radii,
+        layout_node_radii,
+        edges,
+        edge_color,
+        show_layer_guides,
+    )
+
+    previous_patches: list[Circle] = []
+    current_patches: list[Circle] = []
+    for sid in range(len(record.species_names)):
+        x, y = positions[int(sid)]
+        if show_previous_state:
+            previous = Circle(
+                (x, y),
+                0.0,
+                facecolor=start_color,
+                edgecolor=start_color,
+                alpha=0.18,
+                linewidth=1.1,
+                zorder=2,
+            )
+            ax.add_patch(previous)
+            previous_patches.append(previous)
+        current = Circle(
+            (x, y),
+            0.0,
+            facecolor=end_color,
+            edgecolor=end_color,
+            alpha=0.28,
+            linewidth=1.2,
+            zorder=3,
+        )
+        ax.add_patch(current)
+        current_patches.append(current)
+
+    for sid, name in enumerate(record.species_names):
+        x, y = positions[int(sid)]
+        static_artists.append(
+            ax.text(
+                x,
+                y,
+                name,
+                ha="center",
+                va="center",
+                fontsize=8,
+                color="black",
+                alpha=float(label_alpha),
+                zorder=4,
+            )
+        )
+
+    legend_handles = []
+    if show_previous_state:
+        legend_handles.append(Patch(facecolor=start_color, edgecolor=start_color, alpha=0.18, label="previous frame"))
+    legend_handles.append(Patch(facecolor=end_color, edgecolor=end_color, alpha=0.28, label="current frame"))
+    ax.legend(handles=legend_handles, loc="upper right")
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+    _set_equal_tree_limits(ax, positions, layout_node_radii)
+    fig.tight_layout()
+
+    def update(frame: int):
+        current_radii = frame_radii[int(frame)]
+        if show_previous_state:
+            previous_frame = max(int(frame) - 1, 0)
+            previous_radii = frame_radii[previous_frame]
+            for patch, radius in zip(previous_patches, previous_radii):
+                patch.set_radius(float(radius))
+        for patch, radius in zip(current_patches, current_radii):
+            patch.set_radius(float(radius))
+
+        actual_time = float(record.times[int(frame_indices[int(frame)])])
+        target_time = float(frame_times[int(frame)])
+        base_title = title or "Reaction Network State Tree"
+        ax.set_title(f"{base_title}  target t={target_time:g}, nearest record t={actual_time:g}")
+        return [*previous_patches, *current_patches, *static_artists]
+
+    animation = FuncAnimation(
+        fig,
+        update,
+        frames=frame_times.shape[0],
+        interval=int(frame_interval_ms),
+        repeat=bool(repeat),
+        blit=False,
+    )
+    update(0)
+
+    if save_path is not None:
+        output_path = Path(save_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        save_writer = writer
+        if save_writer is None and output_path.suffix.lower() == ".gif":
+            save_writer = "pillow"
+        animation.save(str(output_path), writer=save_writer, dpi=int(dpi))
+
+    return fig, ax, animation
+
+
 def plot_channel_propensity_time_series(
     record_or_path: TrajectoryRecord | PathLike,
     network: ReactionNetworkData,
@@ -469,6 +755,349 @@ def _as_trajectory_record(record_or_path: TrajectoryRecord | PathLike) -> Trajec
     if isinstance(record_or_path, TrajectoryRecord):
         return record_or_path
     return load_trajectory_record(Path(record_or_path))
+
+
+def _time_series_window(
+    record: TrajectoryRecord,
+    time_range: tuple[float | None, float | None] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if time_range is None:
+        return record.times, record.states
+    if len(time_range) != 2:
+        raise ValueError("time_range must contain exactly two values")
+
+    start, end = time_range
+    lower = float(record.times[0]) if start is None else float(start)
+    upper = float(record.times[-1]) if end is None else float(end)
+    if upper < lower:
+        raise ValueError("time_range end must be greater than or equal to start")
+
+    mask = (record.times >= lower) & (record.times <= upper)
+    if not np.any(mask):
+        raise ValueError("time_range does not include any recorded trajectory points")
+    return record.times[mask], record.states[mask]
+
+
+def _animation_frame_times(
+    record: TrajectoryRecord,
+    dt: float,
+    time_range: tuple[float | None, float | None] | None,
+) -> np.ndarray:
+    step = float(dt)
+    if step <= 0.0:
+        raise ValueError("dt must be > 0")
+
+    if time_range is None:
+        start = float(record.times[0])
+        end = float(record.times[-1])
+    else:
+        start = float(record.times[0]) if time_range[0] is None else float(time_range[0])
+        end = float(record.times[-1]) if time_range[1] is None else float(time_range[1])
+
+    record_start = float(record.times[0])
+    record_end = float(record.times[-1])
+    if start < record_start or start > record_end:
+        raise ValueError(f"time range start {start:g} is outside [{record_start:g}, {record_end:g}]")
+    if end < record_start or end > record_end:
+        raise ValueError(f"time range end {end:g} is outside [{record_start:g}, {record_end:g}]")
+    if end < start:
+        raise ValueError("time range end must be greater than or equal to start")
+    if end == start:
+        return np.asarray([start], dtype=float)
+
+    n_steps = int(np.floor((end - start) / step))
+    frame_times = start + np.arange(n_steps + 1, dtype=float) * step
+    if frame_times[-1] < end:
+        frame_times = np.append(frame_times, end)
+    return frame_times
+
+
+def _nearest_record_indices(times: np.ndarray, frame_times: np.ndarray) -> np.ndarray:
+    record_times = np.asarray(times, dtype=float)
+    targets = np.asarray(frame_times, dtype=float)
+    if record_times.ndim != 1 or targets.ndim != 1:
+        raise ValueError("times and frame_times must be one-dimensional")
+    if record_times.size == 0:
+        raise ValueError("record times are empty")
+
+    right = np.searchsorted(record_times, targets, side="left")
+    right = np.clip(right, 0, record_times.shape[0] - 1)
+    left = np.clip(right - 1, 0, record_times.shape[0] - 1)
+    choose_left = np.abs(targets - record_times[left]) <= np.abs(record_times[right] - targets)
+    return np.where(choose_left, left, right).astype(np.int64, copy=False)
+
+
+def _animation_frame_radii(
+    frame_states: np.ndarray,
+    max_node_radius: float,
+    radius_mode: str,
+    radius_transform: Callable[[np.ndarray], np.ndarray] | None,
+) -> np.ndarray:
+    states = np.asarray(frame_states, dtype=float)
+    if states.ndim != 2:
+        raise ValueError("frame states must have shape (n_frames, n_species)")
+    scale_reference = None if radius_transform is not None else float(np.max(np.maximum(states, 0.0)))
+    rows = [
+        _node_radii(state, max_node_radius, radius_mode, radius_transform, scale_reference)
+        for state in states
+    ]
+    return np.vstack(rows) if rows else np.empty_like(states, dtype=float)
+
+
+def _draw_reaction_tree_static_layers(
+    ax,
+    record: TrajectoryRecord,
+    positions: dict[int, tuple[float, float]],
+    layer_radii: dict[int, float],
+    node_radii: np.ndarray,
+    edges: list[tuple[int, int]],
+    edge_color: str,
+    show_layer_guides: bool,
+) -> list:
+    artists = []
+    if show_layer_guides:
+        for length, radius in layer_radii.items():
+            if radius > 0.0:
+                guide = Circle(
+                    (0.0, 0.0),
+                    radius,
+                    fill=False,
+                    edgecolor="#d0d0d0",
+                    linewidth=0.7,
+                    linestyle="--",
+                    zorder=0,
+                )
+                ax.add_patch(guide)
+                artists.append(guide)
+            label_x = radius + max(float(np.max(node_radii)), 0.04) * 1.4
+            artists.append(ax.text(label_x, 0.0, f"L{length}", fontsize=8, color="#666666", va="center"))
+
+    for left, right in edges:
+        x0, y0 = positions[int(left)]
+        x1, y1 = positions[int(right)]
+        line = ax.plot([x0, x1], [y0, y1], color=edge_color, linewidth=0.8, alpha=0.45, zorder=1)[0]
+        artists.append(line)
+
+    return artists
+
+
+def _state_pair_from_record(
+    record: TrajectoryRecord,
+    time_points: tuple[float | None, float | None] | None,
+    state_pair: tuple[np.ndarray, np.ndarray] | None,
+) -> tuple[float, float, np.ndarray, np.ndarray]:
+    start_time, end_time = _normalize_state_tree_time_points(record, time_points)
+    if state_pair is not None:
+        first, second = state_pair
+        return (
+            start_time,
+            end_time,
+            _clean_state_vector(first, record.states.shape[1]),
+            _clean_state_vector(second, record.states.shape[1]),
+        )
+
+    actual_start_time, start_state = _nearest_record_state(record, start_time)
+    actual_end_time, end_state = _nearest_record_state(record, end_time)
+    return actual_start_time, actual_end_time, start_state, end_state
+
+
+def _normalize_state_tree_time_points(
+    record: TrajectoryRecord,
+    time_points: tuple[float | None, float | None] | None,
+) -> tuple[float, float]:
+    if time_points is None:
+        return float(record.times[0]), float(record.times[-1])
+    if len(time_points) != 2:
+        raise ValueError("time_points must contain exactly two values")
+    start = float(record.times[0]) if time_points[0] is None else float(time_points[0])
+    end = float(record.times[-1]) if time_points[1] is None else float(time_points[1])
+    if end < start:
+        raise ValueError("the second time point must be greater than or equal to the first")
+    return start, end
+
+
+def _nearest_record_state(record: TrajectoryRecord, time_point: float) -> tuple[float, np.ndarray]:
+    target = float(time_point)
+    first = float(record.times[0])
+    last = float(record.times[-1])
+    if target < first or target > last:
+        raise ValueError(f"time point {target:g} is outside the trajectory range [{first:g}, {last:g}]")
+    index = int(np.argmin(np.abs(record.times - target)))
+    return float(record.times[index]), _clean_state_vector(record.states[index], record.states.shape[1])
+
+
+def _clean_state_vector(values: np.ndarray, n_species: int) -> np.ndarray:
+    state = np.asarray(values, dtype=float)
+    if state.shape != (int(n_species),):
+        raise ValueError(f"state vector must have shape ({int(n_species)},)")
+    if not np.all(np.isfinite(state)):
+        raise ValueError("state vector contains non-finite values")
+    return np.maximum(state, 0.0)
+
+
+def _species_lengths(species_names: list[str], species_lengths: list[int] | np.ndarray | None) -> np.ndarray:
+    if species_lengths is None:
+        return np.asarray([len(name) for name in species_names], dtype=np.int64)
+    lengths = np.asarray(species_lengths, dtype=np.int64)
+    if lengths.shape != (len(species_names),):
+        raise ValueError(f"species_lengths must have shape ({len(species_names)},)")
+    return lengths
+
+
+def _node_radii(
+    values: np.ndarray,
+    max_node_radius: float,
+    radius_mode: str,
+    radius_transform: Callable[[np.ndarray], np.ndarray] | None,
+    scale_reference: float | None = None,
+) -> np.ndarray:
+    state = np.maximum(np.asarray(values, dtype=float), 0.0)
+    if radius_transform is not None:
+        radii = np.asarray(radius_transform(state), dtype=float)
+        if radii.shape != state.shape:
+            raise ValueError("radius_transform must return one radius per species")
+        if np.any(~np.isfinite(radii)) or np.any(radii < 0.0):
+            raise ValueError("radius_transform returned invalid radii")
+        return radii
+
+    scale = float(max_node_radius)
+    if scale < 0.0:
+        raise ValueError("max_node_radius must be >= 0")
+    largest = float(scale_reference) if scale_reference is not None else float(np.max(state)) if state.size else 0.0
+    if largest <= 0.0 or scale == 0.0:
+        return np.zeros_like(state, dtype=float)
+
+    normalized = state / largest
+    mode = radius_mode.lower()
+    if mode == "area":
+        return scale * np.sqrt(normalized)
+    if mode == "radius":
+        return scale * normalized
+    raise ValueError("radius_mode must be 'area' or 'radius'")
+
+
+def _radial_species_layout(
+    species_names: list[str],
+    lengths: np.ndarray,
+    node_radii: np.ndarray,
+    spacing_area_factor: float,
+) -> tuple[dict[int, tuple[float, float]], dict[int, float]]:
+    if lengths.shape != node_radii.shape:
+        raise ValueError("lengths and node_radii must have the same shape")
+    factor = float(spacing_area_factor)
+    if factor < 0.0:
+        raise ValueError("spacing_area_factor must be >= 0")
+
+    global_max_radius = float(np.max(node_radii)) if node_radii.size else 0.0
+    min_gap = max(global_max_radius * 0.8, 0.08)
+    positions: dict[int, tuple[float, float]] = {}
+    layer_radii: dict[int, float] = {}
+    previous_radius = 0.0
+    previous_area = 0.0
+    previous_node_radius = 0.0
+
+    for layer_index, length in enumerate(sorted(int(item) for item in np.unique(lengths))):
+        layer_indices = np.flatnonzero(lengths == length).astype(np.int64, copy=False)
+        ordered = np.asarray(sorted(layer_indices, key=lambda sid: species_names[int(sid)]), dtype=np.int64)
+        layer_node_radius = float(np.max(node_radii[ordered])) if ordered.size else 0.0
+        layer_area = float(np.pi * np.sum(node_radii[ordered] ** 2))
+        circumference_radius = _minimum_layer_radius(int(ordered.size), layer_node_radius, min_gap)
+
+        if layer_index == 0:
+            layer_radius = 0.0 if ordered.size == 1 else max(circumference_radius, layer_node_radius + min_gap)
+        else:
+            area_radius = float(np.sqrt(previous_radius**2 + factor * previous_area / np.pi))
+            non_overlap_radius = previous_radius + previous_node_radius + layer_node_radius + min_gap
+            layer_radius = max(area_radius, non_overlap_radius, circumference_radius)
+
+        layer_radii[length] = layer_radius
+        if ordered.size == 1 and layer_radius == 0.0:
+            positions[int(ordered[0])] = (0.0, 0.0)
+        else:
+            angles = np.linspace(np.pi / 2.0, np.pi / 2.0 - 2.0 * np.pi, ordered.size, endpoint=False)
+            for sid, angle in zip(ordered, angles):
+                positions[int(sid)] = (float(layer_radius * np.cos(angle)), float(layer_radius * np.sin(angle)))
+
+        previous_radius = layer_radius
+        previous_area = layer_area
+        previous_node_radius = layer_node_radius
+
+    return positions, layer_radii
+
+
+def _minimum_layer_radius(n_nodes: int, node_radius: float, min_gap: float) -> float:
+    if int(n_nodes) <= 1:
+        return 0.0
+    diameter_with_gap = 2.0 * float(node_radius) + float(min_gap)
+    return max(float(n_nodes) * diameter_with_gap / (2.0 * np.pi), float(node_radius) + float(min_gap))
+
+
+def _reaction_tree_edges(record: TrajectoryRecord, lengths: np.ndarray) -> list[tuple[int, int]]:
+    n_species = len(record.species_names)
+    edges: set[tuple[int, int]] = set()
+    for item in record.run_metadata.get("channel_labels", []):
+        if not isinstance(item, dict):
+            continue
+        reactants = _metadata_species_ids(item.get("reactants", ()), n_species)
+        products = _metadata_species_ids(item.get("products", ()), n_species)
+        for reactant in reactants:
+            for product in products:
+                if reactant == product:
+                    continue
+                if abs(int(lengths[reactant]) - int(lengths[product])) != 1:
+                    continue
+                edges.add(tuple(sorted((int(reactant), int(product)))))
+
+    if not edges:
+        edges = _prefix_tree_edges(record.species_names, lengths)
+
+    return sorted(edges, key=lambda pair: (min(lengths[pair[0]], lengths[pair[1]]), pair[0], pair[1]))
+
+
+def _metadata_species_ids(values, n_species: int) -> list[int]:
+    result = []
+    for value in values or ():
+        sid = int(value)
+        if 0 <= sid < int(n_species):
+            result.append(sid)
+    return result
+
+
+def _prefix_tree_edges(species_names: list[str], lengths: np.ndarray) -> set[tuple[int, int]]:
+    name_to_idx = {name: idx for idx, name in enumerate(species_names)}
+    edges: set[tuple[int, int]] = set()
+    for sid, name in enumerate(species_names):
+        if int(lengths[sid]) <= int(np.min(lengths)):
+            continue
+        parent_names = {name[:-1], name[1:]}
+        for parent_name in parent_names:
+            parent = name_to_idx.get(parent_name)
+            if parent is None or abs(int(lengths[sid]) - int(lengths[parent])) != 1:
+                continue
+            edges.add(tuple(sorted((int(parent), int(sid)))))
+    return edges
+
+
+def _set_equal_tree_limits(
+    ax,
+    positions: dict[int, tuple[float, float]],
+    node_radii: np.ndarray,
+) -> None:
+    coords = np.asarray(list(positions.values()), dtype=float)
+    if coords.size == 0:
+        ax.set_xlim(-1.0, 1.0)
+        ax.set_ylim(-1.0, 1.0)
+        return
+    padding = max(float(np.max(node_radii)) if node_radii.size else 0.0, 0.1) * 2.5
+    x_min = float(np.min(coords[:, 0]) - padding)
+    x_max = float(np.max(coords[:, 0]) + padding)
+    y_min = float(np.min(coords[:, 1]) - padding)
+    y_max = float(np.max(coords[:, 1]) + padding)
+    half_width = max(x_max - x_min, y_max - y_min) / 2.0
+    center_x = (x_min + x_max) / 2.0
+    center_y = (y_min + y_max) / 2.0
+    ax.set_xlim(center_x - half_width, center_x + half_width)
+    ax.set_ylim(center_y - half_width, center_y + half_width)
 
 
 def _reaction_intervals_from_metadata(record: TrajectoryRecord) -> np.ndarray:

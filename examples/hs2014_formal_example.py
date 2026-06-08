@@ -19,12 +19,12 @@ from polymer_sim import (
     save_trajectory_record,
 )
 
-T_END = 1000.0
+T_END = 4.0
 SEED = 123
 MAX_STEPS = 100_000_000
 MAX_TIMES = 30.0  # Set to None to disable runtime cutoff
 K_RIGHT_ADD = 0.1
-K_NONFOOD_OUTFLOW = 0.5
+K_NONFOOD_OUTFLOW = 0.8
 FOOD_COUNT = 10.0
 CATALYSIS_MODE = "substrate_saturating"  # "linear" or "substrate_saturating"
 SATURATION_ALPHA = 0.01
