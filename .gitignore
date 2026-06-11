@@ -23,6 +23,7 @@ dist/
 
 # Generated simulation outputs
 *.npz
+*.json
 examples/*_outputs/
 examples/paired_method_outputs*/
 
