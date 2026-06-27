@@ -2,6 +2,7 @@ from polymer_sim.simulation.propensity import compute_all_propensities
 from polymer_sim.simulation.restriction import (
     BaseRestriction,
     FoodReplenishmentRestriction,
+    FoodUpperLimitRestriction,
     RestrictionContext,
     RestrictionController,
     TrimerOutflowRestriction,
@@ -26,6 +27,7 @@ __all__ = [
     "BlendedHybridStepper",
     "CLEStepper",
     "FoodReplenishmentRestriction",
+    "FoodUpperLimitRestriction",
     "HybridStepper",
     "RestrictionContext",
     "RestrictionController",

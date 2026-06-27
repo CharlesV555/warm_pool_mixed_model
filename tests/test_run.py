@@ -1,3 +1,7 @@
+import json
+import shutil
+from pathlib import Path
+
 from polymer_sim import (
     ChannelBlock,
     ExperimentRunner,
@@ -48,3 +52,41 @@ def test_hybrid_skeleton_runs():
     )
     assert result.state.t >= 0.5
     assert result.summary.n_steps >= 1
+
+
+def test_runner_can_write_timing_report():
+    network = make_network()
+    output_dir = Path("tests_runtime_timing_report")
+    shutil.rmtree(output_dir, ignore_errors=True)
+    try:
+        result = ExperimentRunner().run_one(
+            network,
+            SSAStepper(),
+            t_end=0.1,
+            seed=3,
+            timing_report=True,
+            timing_report_dir=output_dir,
+            timing_report_interval_events=1,
+            timing_report_name="timing_test",
+        )
+        paths = result.summary.metadata["timing_report_paths"]
+        json_path = output_dir / "timing_test.json"
+        plot_path = output_dir / "timing_test_events.png"
+        simulation_clock_plot_path = output_dir / "timing_test_simulation_clock.png"
+        assert paths["json"] == str(json_path)
+        assert paths["event_plot"] == str(plot_path)
+        assert paths["simulation_clock_plot"] == str(simulation_clock_plot_path)
+        assert json_path.exists()
+        assert plot_path.exists()
+        assert simulation_clock_plot_path.exists()
+
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        assert payload["seed"] == 3
+        assert payload["stepper"] == "SSAStepper"
+        assert payload["runner_setup_wall_seconds"] >= 0.0
+        assert payload["simulation_loop_wall_seconds"] >= 0.0
+        assert payload["step_wall_seconds"] >= 0.0
+        assert payload["simulation_clock_interval"] == 0.01
+        assert "simulation_clock_samples" in payload
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)

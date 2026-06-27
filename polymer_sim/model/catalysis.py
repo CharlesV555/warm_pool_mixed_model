@@ -15,6 +15,8 @@ def clear_all_catalysis(network, *, rebuild: bool = True) -> None:
     network.cat_left_split.fill(0.0)
     network.cat_right_split.fill(0.0)
     network.cat_outflow.fill(0.0)
+    if hasattr(network, "cat_inflow"):
+        network.cat_inflow.fill(0.0)
     if rebuild:
         network.rebuild_dependency_indices()
 

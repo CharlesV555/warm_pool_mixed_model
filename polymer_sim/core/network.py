@@ -44,24 +44,28 @@ class ReactionNetworkData:
     right_split_monomer: np.ndarray
     right_split_multiplicity: np.ndarray
     outflow_source: np.ndarray
+    inflow_target: np.ndarray
 
     left_add_local_id: np.ndarray
     right_add_local_id: np.ndarray
     left_split_local_id_by_source: np.ndarray
     right_split_local_id_by_source: np.ndarray
     outflow_local_id_by_source: np.ndarray
+    inflow_local_id_by_target: np.ndarray
 
     left_add_rates: np.ndarray
     right_add_rates: np.ndarray
     left_split_rates: np.ndarray
     right_split_rates: np.ndarray
     outflow_rates: np.ndarray
+    inflow_rates: np.ndarray
 
     cat_left_add: np.ndarray
     cat_right_add: np.ndarray
     cat_left_split: np.ndarray
     cat_right_split: np.ndarray
     cat_outflow: np.ndarray
+    cat_inflow: np.ndarray
 
     catalysis_mode: str
     saturation_alpha: float
@@ -87,6 +91,8 @@ class ReactionNetworkData:
         k_frag_right: float | Sequence[float] | None = None,
         k_outflow: float | Sequence[float] = 0.0,
         outflow_species_ids: Sequence[int] | np.ndarray | None = None,
+        k_inflow: float | Sequence[float] = 0.0,
+        inflow_species_ids: Sequence[int] | np.ndarray | None = None,
         catalysis_mode: str = "linear",
         saturation_alpha: float = 0.25,
     ) -> "ReactionNetworkData":
@@ -166,11 +172,20 @@ class ReactionNetworkData:
                 outflow_local_id_by_source[int(sid)] = local_id
                 outflow_source.append(int(sid))
 
+        inflow_local_id_by_target = np.full(n_species, -1, dtype=np.int64)
+        inflow_target: list[int] = []
+        if inflow_species_ids is not None:
+            for sid in np.asarray(inflow_species_ids, dtype=np.int64):
+                local_id = len(inflow_target)
+                inflow_local_id_by_target[int(sid)] = local_id
+                inflow_target.append(int(sid))
+
         left_add_target_a = np.asarray(left_add_target, dtype=np.int64)
         right_add_target_a = np.asarray(right_add_target, dtype=np.int64)
         left_split_source_a = np.asarray(left_split_source, dtype=np.int64)
         right_split_source_a = np.asarray(right_split_source, dtype=np.int64)
         outflow_source_a = np.asarray(outflow_source, dtype=np.int64)
+        inflow_target_a = np.asarray(inflow_target, dtype=np.int64)
 
         channel_sizes = {
             ChannelBlock.LEFT_ADD: len(left_add_target_a),
@@ -178,6 +193,7 @@ class ReactionNetworkData:
             ChannelBlock.LEFT_SPLIT: len(left_split_source_a),
             ChannelBlock.RIGHT_SPLIT: len(right_split_source_a),
             ChannelBlock.OUTFLOW: len(outflow_source_a),
+            ChannelBlock.INFLOW: len(inflow_target_a),
         }
         channel_offsets: dict[ChannelBlock, int] = {}
         cursor = 0
@@ -222,21 +238,25 @@ class ReactionNetworkData:
             right_split_monomer=np.asarray(right_split_monomer, dtype=np.int64),
             right_split_multiplicity=np.asarray(right_split_multiplicity, dtype=float),
             outflow_source=outflow_source_a,
+            inflow_target=inflow_target_a,
             left_add_local_id=left_add_local_id,
             right_add_local_id=right_add_local_id,
             left_split_local_id_by_source=left_split_local_id_by_source,
             right_split_local_id_by_source=right_split_local_id_by_source,
             outflow_local_id_by_source=outflow_local_id_by_source,
+            inflow_local_id_by_target=inflow_local_id_by_target,
             left_add_rates=_rates(k_poly_left, len(left_add_target_a), "k_poly_left"),
             right_add_rates=_rates(k_poly_right, len(right_add_target_a), "k_poly_right"),
             left_split_rates=_rates(k_frag_left, len(left_split_source_a), "k_frag_left"),
             right_split_rates=_rates(k_frag_right, len(right_split_source_a), "k_frag_right"),
             outflow_rates=_rates(k_outflow, len(outflow_source_a), "k_outflow"),
+            inflow_rates=_rates(k_inflow, len(inflow_target_a), "k_inflow"),
             cat_left_add=dense_catalysis_block(len(left_add_target_a), n_species),
             cat_right_add=dense_catalysis_block(len(right_add_target_a), n_species),
             cat_left_split=dense_catalysis_block(len(left_split_source_a), n_species),
             cat_right_split=dense_catalysis_block(len(right_split_source_a), n_species),
             cat_outflow=dense_catalysis_block(len(outflow_source_a), n_species),
+            cat_inflow=dense_catalysis_block(len(inflow_target_a), n_species),
             catalysis_mode=catalysis_mode,
             saturation_alpha=saturation_alpha,
             channel_block_type=channel_block_type,
@@ -289,6 +309,8 @@ class ReactionNetworkData:
             return (int(self.left_split_source[local]),)
         if block == ChannelBlock.OUTFLOW:
             return (int(self.outflow_source[local]),)
+        if block == ChannelBlock.INFLOW:
+            return ()
         return (int(self.right_split_source[local]),)
 
     def get_channel_products(self, channel_id: int) -> tuple[int, ...]:
@@ -301,6 +323,8 @@ class ReactionNetworkData:
             return (int(self.left_split_monomer[local]), int(self.left_split_rest[local]))
         if block == ChannelBlock.OUTFLOW:
             return ()
+        if block == ChannelBlock.INFLOW:
+            return (int(self.inflow_target[local]),)
         return (int(self.right_split_rest[local]), int(self.right_split_monomer[local]))
 
     def get_channel_main_species(self, channel_id: int) -> int:
@@ -313,6 +337,8 @@ class ReactionNetworkData:
             return int(self.left_split_source[local])
         if block == ChannelBlock.OUTFLOW:
             return int(self.outflow_source[local])
+        if block == ChannelBlock.INFLOW:
+            return int(self.inflow_target[local])
         return int(self.right_split_source[local])
 
     def describe_channel(self, channel_id: int) -> dict[str, object]:
@@ -358,6 +384,10 @@ class ReactionNetworkData:
         if block == ChannelBlock.OUTFLOW:
             source = int(self.outflow_source[local])
             x[source] -= a
+            return
+        if block == ChannelBlock.INFLOW:
+            target = int(self.inflow_target[local])
+            x[target] += a
             return
         source = int(self.right_split_source[local])
         rest = int(self.right_split_rest[local])
@@ -449,11 +479,15 @@ class ReactionNetworkData:
         if block == ChannelBlock.OUTFLOW:
             source = int(self.outflow_source[local])
             return float(self.outflow_rates[local] * max(float(x[source]), 0.0))
+        if block == ChannelBlock.INFLOW:
+            return float(self.inflow_rates[local])
         source = int(self.right_split_source[local])
         return float(self.right_split_rates[local] * self.right_split_multiplicity[local] * max(float(x[source]), 0.0))
 
     def compute_propensity(self, channel_id: int, state: SystemState) -> float:
         base = self.compute_base_propensity(channel_id, state)
+        if self.get_channel_block(channel_id) == ChannelBlock.INFLOW:
+            return max(float(base), 0.0)
         if base <= 0.0:
             return 0.0
         if self._uses_substrate_saturating_catalysis(channel_id) and self._substrate_capacity(channel_id, state) <= 0.0:
@@ -505,6 +539,8 @@ class ReactionNetworkData:
             return self.cat_left_split[local]
         if block == ChannelBlock.OUTFLOW:
             return self.cat_outflow[local]
+        if block == ChannelBlock.INFLOW:
+            return self.cat_inflow[local]
         return self.cat_right_split[local]
 
     def _set_catalytic_strength_no_rebuild(self, channel_id: int, catalyst_sid: int, strength: float) -> None:

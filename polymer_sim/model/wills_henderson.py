@@ -10,6 +10,18 @@ from polymer_sim.model.catalysis import clear_all_catalysis
 from polymer_sim.model.rules import build_reaction_rule_tables
 from polymer_sim.model.species import SpeciesSpace, generate_fixed_species_space
 
+"""_summary_
+这是一个用来复现2014文章所构建的反应体系。其负责实现一个只有右加聚/解聚、不超过3的化学体系，
+而催化关系也只有111催化R4、000催化R1两种。这个体系被用来作为测试和演示的最小反应体系。
+
+Raises:
+    ValueError: _description_
+    ValueError: _description_
+    ValueError: _description_
+
+Returns:
+    _type_: _description_
+"""
 
 @dataclass(slots=True)
 class WHReaction:

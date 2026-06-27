@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from matplotlib.animation import FuncAnimation
+from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Patch
 from polymer_sim.core.enums import ChannelBlock
 from polymer_sim.core.network import ReactionNetworkData
@@ -23,58 +24,180 @@ from polymer_sim.recording.summary import RunSummary, load_summary
 from polymer_sim.recording.trajectory import TrajectoryRecord, load_trajectory_record
 
 
+# def plot_time_series(
+#     record_or_path: TrajectoryRecord | PathLike,
+#     species_indices: list[int] | np.ndarray | None = None,
+#     title: str | None = None,
+#     time_range: tuple[float | None, float | None] | None = None,
+# ):
+#     """绘制单次轨迹的时间序列图。
+
+#     横轴为时间，纵轴为浓度或拷贝数。返回 `(fig, ax)`，便于调用方继续自定义样式。
+#     """
+
+#     record = _as_trajectory_record(record_or_path)
+#     if species_indices is None:
+#         indices = np.arange(record.states.shape[1], dtype=np.int64)
+#     else:
+#         indices = np.asarray(species_indices, dtype=np.int64)
+
+#     times, states = _time_series_window(record, time_range)
+
+#     fig, ax = plt.subplots(figsize=(8, 4.5))
+#     for sid in indices:
+#         ax.plot(times, states[:, sid], label=record.species_names[int(sid)])
+#     ax.set_xlabel("Time")
+#     ax.set_ylabel("Count / Concentration")
+#     ax.set_title(title or "Single Run Time Series")
+
+#     if indices.size <= 12:
+#         ax.legend(
+#             facecolor="white",      # 图例背景
+#             edgecolor="black",      # 图例边框
+#             framealpha=1.0,         # 不透明
+#             labelcolor="black"      # 图例文字颜色
+#         )
+
+#     ax.grid(True, alpha=0.3)
+#     fig.tight_layout()
+#     return fig, ax
 def plot_time_series(
     record_or_path: TrajectoryRecord | PathLike,
     species_indices: list[int] | np.ndarray | None = None,
     title: str | None = None,
     time_range: tuple[float | None, float | None] | None = None,
+    threshold: float | None = None,
+    time_lookback: float | None = None,
+    log_scale=False,
 ):
     """绘制单次轨迹的时间序列图。
-
-    横轴为时间，纵轴为浓度或拷贝数。返回 `(fig, ax)`，便于调用方继续自定义样式。
+    
+    所有物种都会被绘制，但只有满足阈值条件的物种才会出现在图例中，
+    并使用鲜艳颜色高亮显示；其他物种以浅灰色绘制。
+    
+    参数:
+        record_or_path: 轨迹数据对象或文件路径
+        species_indices: 要绘制的物种索引列表（可选）
+        title: 图表标题（可选）
+        time_range: 时间范围截取 (start, end)（可选）
+        threshold: 浓度阈值，超过该值的物种才会显示图例
+        time_lookback: 从最后时刻向前追溯的时间长度（秒）
     """
-
+    
     record = _as_trajectory_record(record_or_path)
-    if species_indices is None:
-        indices = np.arange(record.states.shape[1], dtype=np.int64)
-    else:
-        indices = np.asarray(species_indices, dtype=np.int64)
-
+    
+    # --- 1. 获取时间窗口数据 ---
     times, states = _time_series_window(record, time_range)
-
+    
+    # --- 2. 确定所有要绘制的物种索引 ---
+    if species_indices is None:
+        all_indices = np.arange(record.states.shape[1], dtype=np.int64)
+    else:
+        all_indices = np.asarray(species_indices, dtype=np.int64)
+    
+    # --- 3. 筛选满足阈值条件的物种（用于图例和高亮） ---
+    legend_indices = []
+    if threshold is not None and time_lookback is not None:
+        t_end = times[-1]
+        t_start = t_end - time_lookback
+        mask = (times >= t_start) & (times <= t_end)
+        window_states = states[mask, :]
+        
+        for sid in all_indices:
+            if np.any(window_states[:, sid] > threshold):
+                legend_indices.append(sid)
+        
+        print(f"满足条件的物种数: {len(legend_indices)}/{len(all_indices)}")
+    else:
+        # 如果没有阈值条件，所有物种都显示图例
+        legend_indices = list(all_indices)
+    
+    # --- 4. 准备颜色方案 ---
+    n_legend = len(legend_indices)
+    if n_legend > 0:
+        # 使用鲜艳的颜色映射，最多支持20种不同颜色
+        if n_legend <= 10:
+            colors = plt.cm.tab10(np.linspace(0, 1, n_legend))
+        else:
+            colors = plt.cm.tab20(np.linspace(0, 1, n_legend))
+    else:
+        colors = []
+    
+    # --- 5. 绘图 ---
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    for sid in indices:
-        ax.plot(times, states[:, sid], label=record.species_names[int(sid)])
+    
+    # 5.1 先绘制所有非图例物种（浅灰色细线）
+    non_legend_indices = [sid for sid in all_indices if sid not in legend_indices]
+    for sid in non_legend_indices:
+        ax.plot(times, states[:, sid], 
+                color='lightgray', 
+                linewidth=0.8, 
+                alpha=0.6,
+                label=None)
+    
+    # 5.2 再绘制图例物种（彩色粗线）
+    for idx, sid in enumerate(legend_indices):
+        color = colors[idx] if len(colors) > 0 else None
+        ax.plot(times, states[:, sid], 
+                label=record.species_names[int(sid)],
+                linewidth=2.5,
+                color=color,
+                alpha=0.9)
+    
+    # --- 6. 设置坐标轴与标题 ---
     ax.set_xlabel("Time")
     ax.set_ylabel("Count / Concentration")
     ax.set_title(title or "Single Run Time Series")
-
-    if indices.size <= 12:
-        ax.legend(
-            facecolor="white",      # 图例背景
-            edgecolor="black",      # 图例边框
-            framealpha=1.0,         # 不透明
-            labelcolor="black"      # 图例文字颜色
-        )
-
+    
+    # --- 6.5 log scale ---
+    if log_scale:
+        ax.set_yscale('log')
+    # --- 7. 显示图例（仅包含满足条件的物种） ---
+    if len(legend_indices) > 0:
+        if len(legend_indices) <= 12:
+            ax.legend(
+                facecolor="white",
+                edgecolor="black",
+                framealpha=1.0,
+                labelcolor="black",
+                loc='best'
+            )
+        else:
+            # 物种太多时用两列显示
+            ax.legend(
+                facecolor="white",
+                edgecolor="black",
+                framealpha=1.0,
+                labelcolor="black",
+                ncol=2,
+                fontsize='small',
+                loc='best'
+            )
+    
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     return fig, ax
-
 
 def plot_reaction_trigger_frequency(
     record_or_path: TrajectoryRecord | PathLike,
     title: str | None = None,
     top_n: int | None = None,
+    legand: bool | str | None = True,
+    species_names: list[str] | tuple[str, ...] | None = None,
 ):
     record = _as_trajectory_record(record_or_path)
-    counts = np.asarray(record.run_metadata.get("channel_trigger_counts", []), dtype=float)
+    discrete_counts = np.asarray(record.run_metadata.get("channel_trigger_counts", []), dtype=float)
     labels_meta = record.run_metadata.get("channel_labels", [])
-    if counts.size == 0:
+    if discrete_counts.size == 0:
         raise ValueError("record metadata does not contain channel_trigger_counts")
+    if discrete_counts.ndim != 1:
+        raise ValueError("channel_trigger_counts must have shape (n_channels,)")
+
+    continuous_counts = _continuous_trigger_counts(record, int(discrete_counts.shape[0]))
+    total_counts = discrete_counts + continuous_counts
 
     labels = []
-    for idx in range(counts.shape[0]):
+    for idx in range(discrete_counts.shape[0]):
         if idx < len(labels_meta):
             item = labels_meta[idx]
             reactants = item.get("reactants", ())
@@ -83,18 +206,60 @@ def plot_reaction_trigger_frequency(
         else:
             labels.append(str(idx))
 
-    order = np.arange(counts.shape[0], dtype=np.int64)
-    if top_n is not None and int(top_n) < counts.shape[0]:
-        order = np.argsort(counts)[-int(top_n) :]
-        order = order[np.argsort(counts[order])[::-1]]
+    order = np.arange(discrete_counts.shape[0], dtype=np.int64)
+    if top_n is not None and int(top_n) < discrete_counts.shape[0]:
+        order = np.argsort(total_counts)[-int(top_n) :]
+        order = order[np.argsort(total_counts[order])[::-1]]
 
+    colors = [_reaction_trigger_color(labels_meta, int(idx)) for idx in order]
+    x = np.arange(order.shape[0])
     fig, ax = plt.subplots(figsize=(10, 4.5))
-    ax.bar(np.arange(order.shape[0]), counts[order])
-    ax.set_xticks(np.arange(order.shape[0]))
-    ax.set_xticklabels([labels[int(idx)] for idx in order], rotation=45, ha="right")
-    ax.set_ylabel("Trigger Count")
-    ax.set_xlabel("Reaction Channel")
+    ax.bar(x, discrete_counts[order], color=colors, label="Discrete")
+    ax.bar(
+        x,
+        continuous_counts[order],
+        bottom=discrete_counts[order],
+        color=colors,
+        alpha=0.35,
+        hatch="//",
+        edgecolor="black",
+        linewidth=0.4,
+        label="Continuous",
+    )
+    highlighted = _highlighted_record_channels(record, labels_meta, species_names)
+    highlighted_mask = np.array([int(channel_id) in highlighted for channel_id in order], dtype=bool)
+    if np.any(highlighted_mask):
+        selected_totals = total_counts[order]
+        y_max = float(np.max(selected_totals)) if selected_totals.size else 0.0
+        marker_offset = max(y_max * 0.035, 0.05)
+        ax.scatter(
+            x[highlighted_mask],
+            selected_totals[highlighted_mask] + marker_offset,
+            marker="v",
+            s=48,
+            color="black",
+            zorder=5,
+            label="Selected species",
+        )
+        ax.set_ylim(top=max(ax.get_ylim()[1], y_max + marker_offset * 3.0))
+    if legand is not None and legand is not False:
+        ax.set_xticks(x)
+        ax.set_xticklabels([labels[int(idx)] for idx in order], rotation=45, ha="right")
+        ax.set_xlabel("Reaction Channel")
+    else:
+        ax.set_xticks([])
+    ax.set_ylabel("Activation Count")
     ax.set_title(title or "Reaction Trigger Frequency")
+    legend_handles = _reaction_trigger_legend_handles(
+        record,
+        labels_meta,
+        order,
+        highlighted,
+        legand,
+        species_names,
+    )
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="best")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     return fig, ax
@@ -1338,6 +1503,140 @@ def _format_record_channel_label(labels_meta: list[dict] | list, channel_id: int
         products = item.get("products", ())
         return f"{channel_id}: {tuple(reactants)}->{tuple(products)}"
     return str(channel_id)
+
+
+def _continuous_trigger_counts(record: TrajectoryRecord, n_channels: int) -> np.ndarray:
+    raw = record.run_metadata.get("channel_continuous_trigger_counts")
+    if raw is None:
+        return np.zeros(int(n_channels), dtype=float)
+    counts = np.asarray(raw, dtype=float)
+    if counts.size == 0:
+        return np.zeros(int(n_channels), dtype=float)
+    if counts.shape != (int(n_channels),):
+        raise ValueError("channel_continuous_trigger_counts must have shape (n_channels,)")
+    if not np.all(np.isfinite(counts)):
+        raise ValueError("channel_continuous_trigger_counts contains non-finite values")
+    return np.maximum(counts, 0.0)
+
+
+def _highlighted_record_channels(
+    record: TrajectoryRecord,
+    labels_meta: list[dict] | list,
+    species_names: list[str] | tuple[str, ...] | None,
+) -> set[int]:
+    if species_names is None:
+        return set()
+    if isinstance(species_names, str):
+        names = [species_names]
+    else:
+        names = [str(name) for name in species_names]
+    if not names:
+        return set()
+
+    name_to_idx = {name: idx for idx, name in enumerate(record.species_names)}
+    missing = [name for name in names if name not in name_to_idx]
+    if missing:
+        raise ValueError(f"unknown species name(s): {missing}")
+    target_ids = {int(name_to_idx[name]) for name in names}
+    n_species = len(record.species_names)
+
+    highlighted: set[int] = set()
+    for channel_id, item in enumerate(labels_meta):
+        if not isinstance(item, dict):
+            continue
+        reactants = _metadata_species_ids(item.get("reactants", ()), n_species)
+        products = _metadata_species_ids(item.get("products", ()), n_species)
+        if target_ids.intersection(reactants) or target_ids.intersection(products):
+            highlighted.add(int(channel_id))
+    return highlighted
+
+
+def _reaction_trigger_legend_handles(
+    record: TrajectoryRecord,
+    labels_meta: list[dict] | list,
+    order: np.ndarray,
+    highlighted_channels: set[int],
+    legand: bool | str | None,
+    species_names: list[str] | tuple[str, ...] | None,
+) -> list:
+    if legand is None or legand is False:
+        return []
+
+    if isinstance(legand, str):
+        mode = legand.lower()
+        if mode != "species_names":
+            raise ValueError("legand must be True, False, None, or 'species_names'")
+        if species_names is None:
+            raise ValueError("species_names must be provided when legand='species_names'")
+        return [
+            Line2D(
+                [0],
+                [0],
+                marker="v",
+                color="black",
+                linestyle="None",
+                markersize=7,
+                label=_format_record_channel_species_label(record, labels_meta, int(channel_id)),
+            )
+            for channel_id in order
+            if int(channel_id) in highlighted_channels
+        ]
+
+    legend_handles = [
+        Patch(facecolor="green", label="Addition"),
+        Patch(facecolor="red", label="Split"),
+        Patch(facecolor="orange", label="Outflow"),
+        Patch(facecolor="blue", label="Inflow"),
+        Patch(facecolor="white", edgecolor="black", label="Discrete"),
+        Patch(facecolor="gray", alpha=0.35, hatch="//", edgecolor="black", label="Continuous"),
+    ]
+    if species_names:
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="v",
+                color="black",
+                linestyle="None",
+                markersize=7,
+                label="Selected species",
+            )
+        )
+    return legend_handles
+
+
+def _format_record_channel_species_label(
+    record: TrajectoryRecord,
+    labels_meta: list[dict] | list,
+    channel_id: int,
+) -> str:
+    if int(channel_id) >= len(labels_meta):
+        return str(channel_id)
+    item = labels_meta[int(channel_id)]
+    if not isinstance(item, dict):
+        return str(channel_id)
+
+    n_species = len(record.species_names)
+    reactants = _metadata_species_ids(item.get("reactants", ()), n_species)
+    products = _metadata_species_ids(item.get("products", ()), n_species)
+    reactant_text = "+".join(record.species_names[int(sid)] for sid in reactants) or "none"
+    product_text = "+".join(record.species_names[int(sid)] for sid in products) or "out"
+    return f"{int(channel_id)}: {reactant_text}->{product_text}"
+
+
+def _reaction_trigger_color(labels_meta: list[dict] | list, channel_id: int) -> str:
+    if channel_id >= len(labels_meta):
+        return "gray"
+    block_type = str(labels_meta[channel_id].get("block_type", "")).upper()
+    if block_type in {ChannelBlock.LEFT_ADD.name, ChannelBlock.RIGHT_ADD.name}:
+        return "green"
+    if block_type in {ChannelBlock.LEFT_SPLIT.name, ChannelBlock.RIGHT_SPLIT.name}:
+        return "red"
+    if block_type == ChannelBlock.OUTFLOW.name:
+        return "orange"
+    if block_type == ChannelBlock.INFLOW.name:
+        return "blue"
+    return "gray"
 
 
 def _select_channels(

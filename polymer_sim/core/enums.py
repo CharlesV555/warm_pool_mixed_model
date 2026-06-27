@@ -7,6 +7,7 @@ class ChannelBlock(IntEnum):
     LEFT_SPLIT = 2
     RIGHT_SPLIT = 3
     OUTFLOW = 4
+    INFLOW = 5
 
 
 BLOCK_ORDER = (
@@ -15,6 +16,7 @@ BLOCK_ORDER = (
     ChannelBlock.LEFT_SPLIT,
     ChannelBlock.RIGHT_SPLIT,
     ChannelBlock.OUTFLOW,
+    ChannelBlock.INFLOW,
 )
 
 
@@ -24,4 +26,5 @@ BLOCK_NAMES = {
     ChannelBlock.LEFT_SPLIT: "LEFT_SPLIT",
     ChannelBlock.RIGHT_SPLIT: "RIGHT_SPLIT",
     ChannelBlock.OUTFLOW: "OUTFLOW",
+    ChannelBlock.INFLOW: "INFLOW",
 }

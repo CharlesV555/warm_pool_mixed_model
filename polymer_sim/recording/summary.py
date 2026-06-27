@@ -308,7 +308,9 @@ class SummaryRecorder(BaseRecorder):
         self._n_steps = int(step_count)
         self._n_events = int(event_count)
         if metadata:
-            self._metadata.update(metadata)
+            step_metadata = dict(metadata)
+            step_metadata.pop("continuous_channel_abs_increments", None)
+            self._metadata.update(step_metadata)
         if self.include_event_times and event_time is not None:
             self._event_times.append(float(event_time))
 

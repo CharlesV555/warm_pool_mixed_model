@@ -15,6 +15,7 @@ from polymer_sim import (
     BlendedHybridStepper,
     ChannelBlock,
     ExperimentRunner,
+    FoodUpperLimitRestriction,
     ReactionNetworkData,
     TrajectoryRecorder,
     build_reaction_rule_tables,
@@ -22,23 +23,30 @@ from polymer_sim import (
     generate_fixed_species_space,
     save_trajectory_record,
 )
-from polymer_sim.simulation.restriction import build_restriction
 
 
 MAX_LEN = 5
 ALPHABET = ("0", "1")
-T_END = 0.2
+T_END = 20.0
 SEED = 123
 MAX_STEPS = 100_000_000
-MAX_TIMES = 60.0
+MAX_TIMES = 120.0
 
-BACKGROUND_RATE = 0.1
+BACKGROUND_RATE = 0.01
 CATALYTIC_STRENGTH = 1.0
-K_NONFOOD_OUTFLOW = 0.8
+K_NONFOOD_OUTFLOW = 1.5
 CATALYSIS_MODE = "linear"
 SATURATION_ALPHA = 0.01
-FOOD_COUNT = 100.0
-INITIAL_COUNTS = {"0": FOOD_COUNT, "1": FOOD_COUNT}
+INITIAL_FOOD_COUNT = 100.0
+FOOD_INFLOW_RATE = 5000.0
+# Per-food-species upper bound enforced after each simulation step. INFLOW
+# remains a formal reaction channel; this cap only prevents the food inventory
+# from accumulating above the configured system concentration.
+FOOD_MAX_COUNT = 100.0
+INITIAL_COUNTS = {
+    name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
+    for name in ALPHABET
+}
 
 K_LEFT_ADD = BACKGROUND_RATE
 K_RIGHT_ADD = BACKGROUND_RATE
@@ -50,8 +58,8 @@ CROSS_CATALYSIS_RULES = {
     "00000": "1",
 }
 
-BLENDED_I1 = 10.0
-BLENDED_I2 = 30.0
+BLENDED_I1 = 110.0
+BLENDED_I2 = 150.0
 BLENDED_DT_CLE = 0.0001
 BLENDED_DT_MACRO = 0.01
 
@@ -78,6 +86,12 @@ def build_cross_catalysis_network() -> tuple[ReactionNetworkData, dict]:
             for sid, name in enumerate(space.species_names)
             if name not in ALPHABET
         ],
+        k_inflow=FOOD_INFLOW_RATE,
+        inflow_species_ids=[
+            sid
+            for sid, name in enumerate(space.species_names)
+            if name in ALPHABET
+        ],
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
     )
@@ -88,6 +102,7 @@ def build_cross_catalysis_network() -> tuple[ReactionNetworkData, dict]:
 def assign_cross_terminal_catalysis(network: ReactionNetworkData) -> dict:
     clear_all_catalysis(network, rebuild=False)
     channels_by_catalyst: dict[str, list[int]] = {}
+    primary_channels_by_catalyst: dict[str, list[int]] = {}
 
     for catalyst_name, added_monomer_name in CROSS_CATALYSIS_RULES.items():
         catalyst_sid = network.species_idx(catalyst_name)
@@ -103,16 +118,24 @@ def assign_cross_terminal_catalysis(network: ReactionNetworkData) -> dict:
                 catalyst_sid=catalyst_sid,
                 strength=CATALYTIC_STRENGTH,
                 rebuild=False,
-                mirror_reverse=False,
+                mirror_reverse=True,
             )
-        channels_by_catalyst[catalyst_name] = [int(channel_id) for channel_id in catalyzed_channels]
+        primary_channels = [int(channel_id) for channel_id in catalyzed_channels]
+        mirrored_channels = [
+            int(reverse_channel_id)
+            for channel_id in primary_channels
+            for reverse_channel_id in network.get_reverse_channel_ids(channel_id)
+        ]
+        primary_channels_by_catalyst[catalyst_name] = primary_channels
+        channels_by_catalyst[catalyst_name] = sorted(set(primary_channels + mirrored_channels))
 
     network.rebuild_dependency_indices()
     return {
         "method": "cross_terminal_matched_addition",
         "rules": dict(CROSS_CATALYSIS_RULES),
         "strength": CATALYTIC_STRENGTH,
-        "mirror_reverse": False,
+        "mirror_reverse": True,
+        "primary_channels_by_catalyst": primary_channels_by_catalyst,
         "channels_by_catalyst": channels_by_catalyst,
     }
 
@@ -161,6 +184,17 @@ def catalyst_species_names(network: ReactionNetworkData) -> list[str]:
     ]
 
 
+def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUpperLimitRestriction:
+    # This restriction only caps food from above. It does not replenish food
+    # when reactions consume it, so the actual input remains the INFLOW channel.
+    return FoodUpperLimitRestriction(
+        {
+            network.species_idx(name): FOOD_MAX_COUNT
+            for name in ALPHABET
+        }
+    )
+
+
 def json_ready(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -189,7 +223,10 @@ def example_parameters() -> dict:
         "k_left_split": K_LEFT_SPLIT,
         "k_right_split": K_RIGHT_SPLIT,
         "k_nonfood_outflow": K_NONFOOD_OUTFLOW,
-        "food_count": FOOD_COUNT,
+        "initial_food_count": INITIAL_FOOD_COUNT,
+        "effective_initial_counts": dict(INITIAL_COUNTS),
+        "food_inflow_rate": FOOD_INFLOW_RATE,
+        "food_max_count": FOOD_MAX_COUNT,
         "catalysis_mode": CATALYSIS_MODE,
         "saturation_alpha": SATURATION_ALPHA,
         "catalytic_strength": CATALYTIC_STRENGTH,
@@ -218,11 +255,7 @@ def print_run_summary(run_result, trajectory_record) -> None:
 
 def main() -> None:
     network, catalysis_result = build_cross_catalysis_network()
-    restriction = build_restriction(
-        network,
-        food_species=ALPHABET,
-        food_count=FOOD_COUNT,
-    )
+    restriction = build_food_upper_limit_restriction(network)
     stepper = BlendedHybridStepper(
         BlendedHybridConfig(
             i1=BLENDED_I1,
@@ -239,6 +272,11 @@ def main() -> None:
     print(f"n_species={network.n_species}, n_channels={network.n_channels}")
     print(f"catalysis_mode={network.catalysis_mode}, saturation_alpha={network.saturation_alpha}")
     print(f"background_rate={BACKGROUND_RATE}, catalytic_strength={CATALYTIC_STRENGTH}")
+    print(
+        f"initial_food_count={INITIAL_FOOD_COUNT}, "
+        f"food_inflow_rate={FOOD_INFLOW_RATE}, "
+        f"food_max_count={FOOD_MAX_COUNT}"
+    )
     print(f"catalyst species={catalyst_species_names(network)}")
     print(f"catalyzed channels={catalyzed_channel_count(network)}")
 

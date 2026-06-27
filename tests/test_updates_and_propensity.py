@@ -73,6 +73,27 @@ def test_right_split_update():
     assert state.x[network.species_idx("A")] == 1
 
 
+def test_inflow_update_and_fixed_propensity():
+    network = make_network(k_inflow=3.5, inflow_species_ids=[0])
+    target = network.species_idx("A")
+    local = int(network.inflow_local_id_by_target[target])
+    channel = network.channel_id(ChannelBlock.INFLOW, local)
+    x = np.zeros(network.n_species)
+    state = SystemState.from_x0(x)
+
+    assert network.get_channel_reactants(channel) == ()
+    assert network.get_channel_products(channel) == (target,)
+    assert network.compute_base_propensity(channel, state) == 3.5
+
+    state.x[target] = 100.0
+    state.x[network.species_idx("B")] = 2.0
+    assert network.compute_base_propensity(channel, state) == 3.5
+    network.set_catalytic_strength(channel, catalyst_sid=network.species_idx("B"), strength=10.0)
+    assert network.compute_propensity(channel, state) == 3.5
+    network.apply_channel_update(state, channel)
+    assert state.x[target] == 101.0
+
+
 def test_propensity_without_and_with_catalysis():
     network = make_network(k_poly=2.0)
     a = network.species_idx("A")

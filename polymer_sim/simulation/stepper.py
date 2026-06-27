@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 
+from polymer_sim.core.enums import ChannelBlock
 from polymer_sim.core.network import ReactionNetworkData
 from polymer_sim.core.state import SystemState
 from polymer_sim.partition.strategies import BlendingStrategy, FixedPartitionStrategy, NoBlendingStrategy, PartitionStrategy
@@ -155,15 +156,26 @@ class CLEStepper(BaseStepper):
         if channels.size == 0:
             state.t += float(dt)
             state.step_count += 1
-            return StepResult(advanced_time=float(dt), event_occurred=False, details={"mode": "cle_empty"})
+            return StepResult(
+                advanced_time=float(dt),
+                event_occurred=False,
+                details={
+                    "mode": "cle_empty",
+                    "continuous_channel_abs_increments": np.zeros(context.network.n_channels, dtype=float),
+                },
+            )
 
-        self._apply_cle_increment(state, dt, context, channels)
+        continuous_abs = self._apply_cle_increment(state, dt, context, channels)
         state.t += float(dt)
         state.step_count += 1
         return StepResult(
             advanced_time=float(dt),
             event_occurred=False,
-            details={"mode": "cle", "n_fast_channels": int(channels.size)},
+            details={
+                "mode": "cle",
+                "n_fast_channels": int(channels.size),
+                "continuous_channel_abs_increments": continuous_abs,
+            },
         )
 
     def _selected_fast_channels(self, state: SystemState, context: StepperContext) -> np.ndarray:
@@ -179,17 +191,20 @@ class CLEStepper(BaseStepper):
         dt: float,
         context: StepperContext,
         channels: np.ndarray,
-    ) -> None:
+    ) -> np.ndarray:
         network = context.network
         rng = context.rng
+        continuous_abs = np.zeros(network.n_channels, dtype=float)
         for channel_id in channels:
             a = network.compute_propensity(int(channel_id), state)
             mean = a * float(dt)
             if mean <= 0.0:
                 continue
             amount = mean + np.sqrt(mean) * float(rng.normal())
+            continuous_abs[int(channel_id)] += abs(float(amount))
             network.apply_channel_delta(state.x, int(channel_id), amount)
         np.maximum(state.x, 0.0, out=state.x)
+        return continuous_abs
 
 
 class HybridStepper(BaseStepper):
@@ -216,26 +231,34 @@ class HybridStepper(BaseStepper):
         slow_channels = partition.slow_channels
         slow_total = float(np.sum(propensities[slow_channels])) if slow_channels.size else 0.0
         if slow_total <= 0.0:
-            self._advance_fast(state, dt, context, partition.fast_channels)
+            continuous_abs = self._advance_fast(state, dt, context, partition.fast_channels)
             return StepResult(
                 advanced_time=float(dt),
                 event_occurred=False,
                 propensity_sum=0.0,
-                details={"mode": "hybrid", "n_fast_channels": int(partition.fast_channels.size)},
+                details={
+                    "mode": "hybrid",
+                    "n_fast_channels": int(partition.fast_channels.size),
+                    "continuous_channel_abs_increments": continuous_abs,
+                },
             )
 
         tau = float(context.rng.exponential(1.0 / slow_total))
         if tau > dt:
-            self._advance_fast(state, dt, context, partition.fast_channels)
+            continuous_abs = self._advance_fast(state, dt, context, partition.fast_channels)
             return StepResult(
                 advanced_time=float(dt),
                 event_occurred=False,
                 propensity_sum=slow_total,
                 tau=tau,
-                details={"mode": "hybrid", "n_fast_channels": int(partition.fast_channels.size)},
+                details={
+                    "mode": "hybrid",
+                    "n_fast_channels": int(partition.fast_channels.size),
+                    "continuous_channel_abs_increments": continuous_abs,
+                },
             )
 
-        self._advance_fast(state, tau, context, partition.fast_channels)
+        continuous_abs = self._advance_fast(state, tau, context, partition.fast_channels)
         post_propensities = network.compute_all_propensities(state)
         post_slow_total = float(np.sum(post_propensities[slow_channels]))
         if post_slow_total <= 0.0:
@@ -244,7 +267,11 @@ class HybridStepper(BaseStepper):
                 event_occurred=False,
                 propensity_sum=0.0,
                 tau=tau,
-                details={"mode": "hybrid", "n_fast_channels": int(partition.fast_channels.size)},
+                details={
+                    "mode": "hybrid",
+                    "n_fast_channels": int(partition.fast_channels.size),
+                    "continuous_channel_abs_increments": continuous_abs,
+                },
             )
 
         chosen = _sample_channel(slow_channels, post_propensities[slow_channels], post_slow_total, context.rng)
@@ -260,6 +287,7 @@ class HybridStepper(BaseStepper):
             "mode": "hybrid",
             "n_fast_channels": int(partition.fast_channels.size),
             "weights_shape": tuple(weights.shape),
+            "continuous_channel_abs_increments": continuous_abs,
             },
         )
 
@@ -269,11 +297,13 @@ class HybridStepper(BaseStepper):
         dt: float,
         context: StepperContext,
         fast_channels: np.ndarray,
-    ) -> None:
+    ) -> np.ndarray:
+        continuous_abs = np.zeros(context.network.n_channels, dtype=float)
         if fast_channels.size:
-            self._cle._apply_cle_increment(state, dt, context, fast_channels)
+            continuous_abs = self._cle._apply_cle_increment(state, dt, context, fast_channels)
         state.t += float(dt)
         state.step_count += 1
+        return continuous_abs
 
 
 class BlendedHybridStepper(BaseStepper):
@@ -282,6 +312,7 @@ class BlendedHybridStepper(BaseStepper):
         self._nu_cache: dict[int, np.ndarray] = {}
         self._last_n_clipped = 0
         self._last_total_cle_propensity = 0.0
+        self._last_continuous_channel_abs_increments = np.empty(0, dtype=float)
         self._reaction_interval_dt: float | None = None
 
     def step(self, state: SystemState, dt: float, context: StepperContext) -> StepResult:
@@ -328,6 +359,7 @@ class BlendedHybridStepper(BaseStepper):
                 "n_clipped": self._last_n_clipped,
                 "stepper_dt": duration,
                 "reaction_interval_dt": self._reaction_interval_dt,
+                "continuous_channel_abs_increments": self._last_continuous_channel_abs_increments.copy(),
             },
         )
 
@@ -444,6 +476,7 @@ class BlendedHybridStepper(BaseStepper):
                     "stepper_dt": tau,
                     "reaction_interval_dt": self._reaction_interval_dt,
                     "invalid_jump_skipped": not applied,
+                    "continuous_channel_abs_increments": self._last_continuous_channel_abs_increments.copy(),
                 },
             )
 
@@ -465,6 +498,7 @@ class BlendedHybridStepper(BaseStepper):
                 "n_clipped": self._last_n_clipped,
                 "stepper_dt": duration,
                 "reaction_interval_dt": self._reaction_interval_dt,
+                "continuous_channel_abs_increments": self._last_continuous_channel_abs_increments.copy(),
             },
         )
 
@@ -479,6 +513,7 @@ class BlendedHybridStepper(BaseStepper):
         if dt <= 0.0:
             self._last_n_clipped = 0
             self._last_total_cle_propensity = 0.0
+            self._last_continuous_channel_abs_increments = np.zeros(network.n_channels, dtype=float)
             return self._float_nonnegative(x_float)
 
         x0 = self._float_nonnegative(x_float)
@@ -489,6 +524,7 @@ class BlendedHybridStepper(BaseStepper):
 
         means = prop_cle * float(dt)
         amounts = means + np.sqrt(np.maximum(means, 0.0)) * rng.normal(size=network.n_channels)
+        self._last_continuous_channel_abs_increments = np.abs(amounts).astype(float, copy=False)
         increment = amounts @ self._stoichiometry_matrix(network)
         x_new = x0 + increment
         if not np.all(np.isfinite(x_new)):
@@ -505,6 +541,9 @@ class BlendedHybridStepper(BaseStepper):
     def _channel_betas(self, network: ReactionNetworkData, x: np.ndarray) -> np.ndarray:
         beta = np.zeros(network.n_channels, dtype=float)
         for channel_id in range(network.n_channels):
+            if network.get_channel_block(channel_id) == ChannelBlock.INFLOW:
+                beta[channel_id] = 1.0
+                continue
             relevant_species = _channel_relevant_species(network, channel_id)
             if not relevant_species:
                 beta[channel_id] = 0.0

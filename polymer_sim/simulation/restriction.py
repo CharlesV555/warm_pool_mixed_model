@@ -67,6 +67,38 @@ class FoodReplenishmentRestriction(BaseRestriction):
             state.x[sid] = float(target)
 
 
+class FoodUpperLimitRestriction(BaseRestriction):
+    def __init__(self, max_counts: dict[int, float]):
+        self.max_counts = {int(sid): float(value) for sid, value in max_counts.items()}
+        if any(not np.isfinite(value) or value < 0.0 for value in self.max_counts.values()):
+            raise ValueError("food upper limits must be finite values >= 0")
+        self._species_names: list[str] | None = None
+
+    def apply(
+        self,
+        state: SystemState,
+        dt: float,
+        context: RestrictionContext,
+        step_result: StepResult,
+    ) -> None:
+        if self._species_names is None:
+            self._species_names = [
+                context.network.species_names[int(sid)]
+                for sid in self.max_counts
+            ]
+        for sid, maximum in self.max_counts.items():
+            state.x[int(sid)] = min(float(state.x[int(sid)]), float(maximum))
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "food_upper_limits": {
+                "species_ids": [int(sid) for sid in self.max_counts],
+                "species_names": list(self._species_names or []),
+                "max_counts": [float(value) for value in self.max_counts.values()],
+            }
+        }
+
+
 class TrimerOutflowRestriction(BaseRestriction):
     def __init__(
         self,

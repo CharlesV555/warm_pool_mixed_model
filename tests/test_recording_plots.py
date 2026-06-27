@@ -2,15 +2,22 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import numpy as np
+
 from polymer_sim import (
+    BlendedHybridConfig,
+    BlendedHybridStepper,
     ChannelBlock,
     ExperimentRunner,
+    ReactionNetworkData,
     SSAStepper,
     TrajectoryRecorder,
     animate_reaction_network_state_tree,
     assign_paper_minimal_catalysis,
+    build_reaction_rule_tables,
     build_restriction,
     build_n3_wh_network,
+    generate_fixed_species_space,
     plot_channel_propensity_time_series,
     plot_reaction_interval_bar,
     plot_reaction_interval_wave,
@@ -65,7 +72,9 @@ def test_plot_functions_run_on_record():
         restriction=build_restriction(network, food_count=10.0),
     )
     record = recorder.finalize()
-    fig1, ax1 = plot_reaction_trigger_frequency(record)
+    fig1, ax1 = plot_reaction_trigger_frequency(record, species_names=["000"])
+    fig1b, ax1b = plot_reaction_trigger_frequency(record, species_names=["000"], legand="species_names")
+    fig1c, ax1c = plot_reaction_trigger_frequency(record, species_names=["000"], legand=None)
     fig2, axes2 = plot_species_with_outflow(
         record,
         species_indices=[
@@ -97,6 +106,12 @@ def test_plot_functions_run_on_record():
     )
     fig9, ax9 = plot_time_series(record, species_indices=[0, 1], time_range=(0.1, 0.3))
     assert fig1 is not None and ax1 is not None
+    assert len(ax1.collections) >= 1
+    assert fig1b is not None and ax1b is not None
+    assert ax1b.get_legend() is not None
+    assert any("000" in text.get_text() for text in ax1b.get_legend().get_texts())
+    assert fig1c is not None and ax1c is not None
+    assert ax1c.get_legend() is None
     assert fig2 is not None and axes2 is not None
     assert fig3 is not None and ax3 is not None
     assert fig4 is not None and ax4 is not None
@@ -109,3 +124,43 @@ def test_plot_functions_run_on_record():
         xdata = line.get_xdata()
         assert xdata.min() >= 0.1
         assert xdata.max() <= 0.3
+
+
+def test_reaction_trigger_frequency_stacks_continuous_counts():
+    space = generate_fixed_species_space(
+        ["A"],
+        max_len=2,
+        initial_counts={"AA": 100.0},
+    )
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_poly_left=0.0,
+        k_poly_right=0.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+        k_outflow=2.0,
+        outflow_species_ids=[space.idx("AA")],
+    )
+    recorder = TrajectoryRecorder()
+    ExperimentRunner().run_one(
+        network,
+        BlendedHybridStepper(BlendedHybridConfig(i1=-2.0, i2=-1.0, dt_cle=0.01, dt_macro=0.01)),
+        t_end=0.03,
+        seed=12,
+        recorder=recorder,
+        max_steps=10,
+    )
+    record = recorder.finalize()
+    outflow_channel = network.channel_id(
+        ChannelBlock.OUTFLOW,
+        int(network.outflow_local_id_by_source[network.species_idx("AA")]),
+    )
+    discrete_counts = np.asarray(record.run_metadata["channel_trigger_counts"], dtype=float)
+    continuous_counts = np.asarray(record.run_metadata["channel_continuous_trigger_counts"], dtype=float)
+
+    assert discrete_counts[outflow_channel] == 0.0
+    assert continuous_counts[outflow_channel] > 0.0
+    fig, ax = plot_reaction_trigger_frequency(record, top_n=1)
+    assert fig is not None and ax is not None

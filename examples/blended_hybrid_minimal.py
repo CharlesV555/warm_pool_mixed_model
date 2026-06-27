@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from time import perf_counter
 import sys
 from pathlib import Path
 
@@ -26,13 +26,15 @@ from polymer_sim.simulation.restriction import build_restriction
 
 # Keep the same reaction network, catalysis assignment, rates, outflow, and
 # restriction as catalyst_run.py, but use a short horizon for this smoke test.
-T_END = min(catalyst_run.T_END, 0.2)
+# If catalyst_run.py is switched from fixed food replenishment to formal INFLOW
+# plus FoodUpperLimitRestriction, mirror that restriction choice here.
+T_END = 2.0
 SEED = catalyst_run.SEED
 MAX_STEPS = catalyst_run.MAX_STEPS
-MAX_TIMES = min(catalyst_run.MAX_TIMES, 60.0)
+MAX_TIMES = 300.0
 BLENDED_I1 = 10.0
 BLENDED_I2 = 30.0
-BLENDED_DT_CLE = 0.00001
+BLENDED_DT_CLE = 0.0001
 BLENDED_DT_MACRO = 0.01
 OUTPUT_PATH = EXAMPLES_DIR / "blended_hybrid_minimal_trajectory.npz"
 
@@ -44,6 +46,9 @@ def main() -> None:
         food_species=catalyst_run.ALPHABET,
         food_count=catalyst_run.FOOD_COUNT,
     )
+    # Current behavior: this inherits catalyst_run.py's fixed food
+    # replenishment. For finite food inflow, build the network with INFLOW
+    # channels and replace this with FoodUpperLimitRestriction.
     stepper = BlendedHybridStepper(
         BlendedHybridConfig(
             i1=BLENDED_I1,
@@ -55,6 +60,9 @@ def main() -> None:
         )
     )
     recorder = TrajectoryRecorder()
+    t0 = perf_counter()
+
+    build_elapsed = perf_counter() - t0
     result = ExperimentRunner().run_one(
         network,
         stepper,
@@ -64,6 +72,11 @@ def main() -> None:
         restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
+        timing_report=True,
+        timing_report_dir="timing_reports",
+        network_build_elapsed_seconds=build_elapsed,
+        # timing_report_interval_events=1000,
+        # timing_report_sim_interval=0.01,
     )
     record = recorder.finalize()
     record.run_metadata["example_parameters"] = catalyst_run.example_parameters()

@@ -28,6 +28,10 @@ def build_network() -> ReactionNetworkData:
         max_len=3,
         initial_counts={"A": 40, "B": 30},
     )
+    # This minimal smoke example has no external food reservoir. To test a
+    # finite food reservoir here, add formal INFLOW channels in
+    # ReactionNetworkData.from_species_space(...) and pass
+    # FoodUpperLimitRestriction to ExperimentRunner.run_one(...).
     tables = build_reaction_rule_tables(space)
     network = ReactionNetworkData.from_species_space(
         space,

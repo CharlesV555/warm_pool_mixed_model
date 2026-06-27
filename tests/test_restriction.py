@@ -3,6 +3,7 @@ import numpy as np
 from polymer_sim import (
     ExperimentRunner,
     FoodReplenishmentRestriction,
+    FoodUpperLimitRestriction,
     RestrictionController,
     SSAStepper,
     TrajectoryRecorder,
@@ -34,6 +35,31 @@ def test_food_replenishment_sets_food_back_to_target():
     )
     assert state.x[network.species_idx("0")] == 10.0
     assert state.x[network.species_idx("1")] == 10.0
+
+
+def test_food_upper_limit_caps_food_without_replenishing():
+    network = build_n3_wh_network(initial_counts={"0": 10.0, "1": 10.0})
+    zero_sid = network.species_idx("0")
+    one_sid = network.species_idx("1")
+    restriction = FoodUpperLimitRestriction(
+        {
+            zero_sid: 10.0,
+            one_sid: 10.0,
+        }
+    )
+    state = SystemState.from_x0(network.x0)
+    state.x[zero_sid] = 15.0
+    state.x[one_sid] = 4.0
+    restriction.apply(
+        state,
+        0.1,
+        RestrictionContext(network=network, rng=np.random.default_rng(1)),
+        StepResult(advanced_time=0.1, event_occurred=False),
+    )
+
+    assert state.x[zero_sid] == 10.0
+    assert state.x[one_sid] == 4.0
+    assert restriction.metadata()["food_upper_limits"]["max_counts"] == [10.0, 10.0]
 
 
 def test_trimer_outflow_removes_trimers():

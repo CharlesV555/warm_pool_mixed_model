@@ -26,6 +26,11 @@ MAX_TIMES = 30.0  # Set to None to disable runtime cutoff
 K_RIGHT_ADD = 0.1
 K_NONFOOD_OUTFLOW = 0.8
 FOOD_COUNT = 10.0
+# Optional finite-reservoir variant:
+# - add formal INFLOW channels with fixed FOOD_INFLOW_RATE
+# - use FoodUpperLimitRestriction to cap food at FOOD_MAX_COUNT
+# - do not use build_restriction(), because it restores food to FOOD_COUNT
+#   rather than only enforcing an upper bound.
 CATALYSIS_MODE = "substrate_saturating"  # "linear" or "substrate_saturating"
 SATURATION_ALPHA = 0.01
 
@@ -144,6 +149,9 @@ def main() -> None:
         food_species=("0", "1"),
         food_count=FOOD_COUNT,
     )
+    # Current behavior: food is reset to FOOD_COUNT after every step.
+    # To model finite inflow, replace this with FoodUpperLimitRestriction
+    # after adding INFLOW channels to the network builder.
     run_result = runner.run_one(
         network,
         stepper,

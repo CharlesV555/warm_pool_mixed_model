@@ -28,6 +28,11 @@ MAX_TIMES = 30.0  # Set to None to disable runtime cutoff
 K_RIGHT_ADD = 0.1
 K_NONFOOD_OUTFLOW = 0.5
 FOOD_COUNT = 100.0
+# Optional finite-reservoir variant:
+# - add formal INFLOW channels in ReactionNetworkData.from_species_space(...)
+# - add FOOD_INFLOW_RATE and FOOD_MAX_COUNT hyperparameters
+# - pass FoodUpperLimitRestriction({network.species_idx(name): FOOD_MAX_COUNT, ...})
+#   to ExperimentRunner.run_one(...).
 CATALYSIS_MODE = "substrate_saturating"  # "linear" or "substrate_saturating"
 SATURATION_ALPHA = 0.01
 INITIAL_COUNTS = {"A": FOOD_COUNT, "B": FOOD_COUNT}
@@ -100,6 +105,9 @@ def main() -> None:
         recorder=recorder,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
+        # restriction=FoodUpperLimitRestriction(...),
+        # Use this comment-only hook when food is modeled as formal INFLOW
+        # and should be capped without being replenished to a fixed count.
     )
 
     trajectory_record = recorder.finalize()

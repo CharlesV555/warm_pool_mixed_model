@@ -25,7 +25,14 @@ from polymer_sim.recording.plot_single_run import (
 )
 from polymer_sim.recording.plot_summary import plot_summary_pipeline
 from polymer_sim.recording.summary import RunSummary, SummaryRecorder, load_summary, save_summary
-from polymer_sim.recording.timing import TimingRecorder, TimingSummary, load_timing_summary, save_timing_summary
+from polymer_sim.recording.timing import (
+    RunTimingReport,
+    TimingRecorder,
+    TimingSummary,
+    load_timing_summary,
+    save_run_timing_report,
+    save_timing_summary,
+)
 from polymer_sim.recording.trajectory import (
     TrajectoryRecord,
     TrajectoryRecorder,
@@ -39,6 +46,7 @@ __all__ = [
     "BaseRunSummary",
     "BaseTrajectoryRecord",
     "RunSummary",
+    "RunTimingReport",
     "SummaryRecorder",
     "TimingRecorder",
     "TimingSummary",
@@ -60,6 +68,7 @@ __all__ = [
     "plot_species_with_outflow",
     "plot_time_series",
     "save_summary",
+    "save_run_timing_report",
     "save_timing_summary",
     "save_trajectory_record",
 ]

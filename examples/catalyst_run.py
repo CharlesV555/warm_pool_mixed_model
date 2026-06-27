@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from time import perf_counter
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,15 +29,20 @@ from polymer_sim import (
 MAX_LEN = 5
 ALPHABET = ("A", "B")
 T_END = 0.2
-SEED = 123
+SEED = 124
 MAX_STEPS = 100_000_000
 MAX_TIMES = 60.0  # Set to None to disable runtime cutoff
-K_LEFT_ADD = 0.1
-K_RIGHT_ADD = 0.1
-K_LEFT_SPLIT = 0.1
-K_RIGHT_SPLIT = 0.1
+K_LEFT_ADD = 0.01
+K_RIGHT_ADD = 0.01
+K_LEFT_SPLIT = 0.01
+K_RIGHT_SPLIT = 0.01
 K_NONFOOD_OUTFLOW = 0.5
 FOOD_COUNT = 100.0
+# Optional finite-reservoir variant:
+# - add formal INFLOW channels in ReactionNetworkData.from_species_space(...)
+# - add FOOD_INFLOW_RATE and FOOD_MAX_COUNT hyperparameters
+# - pass FoodUpperLimitRestriction({network.species_idx(name): FOOD_MAX_COUNT, ...})
+#   to ExperimentRunner.run_one(...) instead of build_restriction(...).
 CATALYSIS_MODE = "substrate_saturating"  # "linear" or "substrate_saturating"
 SATURATION_ALPHA = 0.01
 CATALYST_SEED = 2026
@@ -186,6 +192,13 @@ def main() -> None:
         food_species=ALPHABET,
         food_count=FOOD_COUNT,
     )
+    # Current behavior: build_restriction() resets food species to FOOD_COUNT
+    # after each step. To make food a finite inflow with an adjustable cap,
+    # replace this restriction with FoodUpperLimitRestriction and add INFLOW
+    # channels when building the network.
+    t0 = perf_counter()
+    build_elapsed = perf_counter() - t0
+
     result = ExperimentRunner().run_one(
         network,
         SSAStepper(),
@@ -195,6 +208,9 @@ def main() -> None:
         max_steps=MAX_STEPS,
         restriction=restriction,
         max_runtime_seconds=MAX_TIMES,
+        timing_report=True,
+        timing_report_dir="timing_reports",
+        network_build_elapsed_seconds=build_elapsed,
     )
 
     trajectory_record = recorder.finalize()

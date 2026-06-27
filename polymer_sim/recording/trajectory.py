@@ -61,6 +61,7 @@ class TrajectoryRecorder(BaseRecorder):
         self._states: list[np.ndarray] = []
         self._metadata: dict = {}
         self._channel_trigger_counts: np.ndarray | None = None
+        self._channel_continuous_trigger_counts: np.ndarray | None = None
         self._channel_event_times: list[float] = []
         self._channel_event_ids: list[int] = []
         self._reaction_intervals: list[float] = []
@@ -79,6 +80,9 @@ class TrajectoryRecorder(BaseRecorder):
         n_channels = self._metadata.get("n_channels")
         self._channel_trigger_counts = (
             np.zeros(int(n_channels), dtype=np.int64) if n_channels is not None else None
+        )
+        self._channel_continuous_trigger_counts = (
+            np.zeros(int(n_channels), dtype=float) if n_channels is not None else None
         )
         self._channel_event_times = []
         self._channel_event_ids = []
@@ -113,10 +117,19 @@ class TrajectoryRecorder(BaseRecorder):
     ) -> None:
         self._times.append(float(time))
         self._states.append(np.asarray(state, dtype=float).copy())
-        channel_id = metadata.get("channel_id") if metadata else None
+        step_metadata = dict(metadata or {})
+        continuous_increments = step_metadata.pop("continuous_channel_abs_increments", None)
+        if continuous_increments is not None and self._channel_continuous_trigger_counts is not None:
+            increments = np.asarray(continuous_increments, dtype=float)
+            if increments.shape != self._channel_continuous_trigger_counts.shape:
+                raise ValueError("continuous_channel_abs_increments shape does not match n_channels")
+            if not np.all(np.isfinite(increments)):
+                raise ValueError("continuous_channel_abs_increments contains non-finite values")
+            self._channel_continuous_trigger_counts += np.maximum(increments, 0.0)
+        channel_id = step_metadata.get("channel_id")
         is_reaction_event = channel_id is not None or event_time is not None
-        if metadata:
-            self._metadata.update(metadata)
+        if step_metadata:
+            self._metadata.update(step_metadata)
         if is_reaction_event:
             event_timestamp = float(event_time if event_time is not None else time)
             if channel_id is not None and self._channel_trigger_counts is not None:
@@ -129,8 +142,8 @@ class TrajectoryRecorder(BaseRecorder):
             self._last_reaction_event_time = event_timestamp
         if self._tracked_outflow_species:
             outflow_row = [0.0 for _ in self._tracked_outflow_species]
-            if metadata:
-                channel_id = metadata.get("channel_id")
+            if step_metadata:
+                channel_id = step_metadata.get("channel_id")
                 if channel_id is not None and int(channel_id) in self._tracked_outflow_channel_to_col:
                     outflow_row[self._tracked_outflow_channel_to_col[int(channel_id)]] = 1.0
             self._tracked_outflow_times.append(float(time))
@@ -141,6 +154,8 @@ class TrajectoryRecorder(BaseRecorder):
     def finalize(self) -> TrajectoryRecord:
         if self._channel_trigger_counts is not None:
             self._metadata["channel_trigger_counts"] = self._channel_trigger_counts.tolist()
+        if self._channel_continuous_trigger_counts is not None:
+            self._metadata["channel_continuous_trigger_counts"] = self._channel_continuous_trigger_counts.tolist()
         self._metadata["channel_event_times"] = list(self._channel_event_times)
         self._metadata["channel_event_ids"] = list(self._channel_event_ids)
         self._metadata["reaction_intervals"] = list(self._reaction_intervals)
