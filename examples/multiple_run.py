@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from polymer_sim.recording.distribution_comparison import compare_species_distributions
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = PROJECT_ROOT / "examples"
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -20,15 +22,15 @@ N_RUNS = 100
 BASE_SEED = 20260524
 T_END = 0.2
 MAX_STEPS = 10_000_000
-MAX_RUNTIME_SECONDS = 1800.0
+MAX_RUNTIME_SECONDS = 60.0
 
 OUTPUT_DIR = EXAMPLES_DIR / "method_run_outputs"
 SAVE_TRAJECTORIES = True
 
-# Food handling is defined in multiple_run_core.build_shared_objects(), which
-# currently inherits catalyst_run.py's fixed replenishment restriction. If you
-# switch catalyst_run.py to formal INFLOW plus FoodUpperLimitRestriction, update
-# that shared-object builder so all methods use the same finite-reservoir cap.
+# Food handling is defined in multiple_run_core.build_shared_objects(). It
+# currently uses catalyst_run.py's formal INFLOW channels plus
+# FoodUpperLimitRestriction, so all methods compare the same capped
+# finite-reservoir model.
 
 COMPUTE_STRATEGY = ComputeStrategy(
     backend="process",  # "process", "thread", or "serial"
@@ -43,10 +45,10 @@ STEPPER_DT = None
 CLE_FAST_CHANNEL_IDS = None
 HYBRID_FAST_CHANNEL_IDS: tuple[int, ...] | str = ()
 
-BLENDED_I1 = 10.0
-BLENDED_I2 = 30.0
+BLENDED_I1 = 110.0
+BLENDED_I2 = 150.0
 BLENDED_DT_CLE = 0.01
-BLENDED_DT_MACRO = None
+BLENDED_DT_MACRO = 0.0001
 BLENDED_USE_REACTION_INTERVAL_DT = True
 BLENDED_REACTION_INTERVAL_UPDATE_STEPS = 100
 
@@ -115,6 +117,16 @@ def run_paired_ssa_blended_test(
 
 def main() -> None:
     run()
+    from polymer_sim.recording.distribution_comparison import compare_species_distributions
+
+    result = compare_species_distributions(
+        "examples/method_run_outputs/paired_method_metadata.json",
+        species=["1", "11","111","1111","11111","0", "00","000","0000","00000"],
+        time_range=(0.0, 1.0),
+        n_time_points=20,
+        groups=["ssa", "blended"],
+        output_dir="examples/distribution_comparison",
+    )
 
 
 if __name__ == "__main__":

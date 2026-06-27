@@ -8,12 +8,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from polymer_sim import (
     ExperimentRunner,
+    FoodUpperLimitRestriction,
     SSAStepper,
     TrajectoryRecorder,
     assign_paper_minimal_catalysis,
     build_n3_wh_network,
     build_n3_wh_reactions,
-    build_restriction,
     compute_max_raf,
     enumerate_irr_rafs,
     save_trajectory_record,
@@ -25,12 +25,13 @@ MAX_STEPS = 100_000_000
 MAX_TIMES = 30.0  # Set to None to disable runtime cutoff
 K_RIGHT_ADD = 0.1
 K_NONFOOD_OUTFLOW = 0.8
-FOOD_COUNT = 10.0
-# Optional finite-reservoir variant:
-# - add formal INFLOW channels with fixed FOOD_INFLOW_RATE
-# - use FoodUpperLimitRestriction to cap food at FOOD_MAX_COUNT
-# - do not use build_restriction(), because it restores food to FOOD_COUNT
-#   rather than only enforcing an upper bound.
+INITIAL_FOOD_COUNT = 10.0
+FOOD_INFLOW_RATE = 100.0
+FOOD_MAX_COUNT = 10.0
+INITIAL_COUNTS = {
+    "0": min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT),
+    "1": min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT),
+}
 CATALYSIS_MODE = "substrate_saturating"  # "linear" or "substrate_saturating"
 SATURATION_ALPHA = 0.01
 
@@ -53,6 +54,15 @@ def print_static_raf_result(max_raf, irr_rafs) -> None:
     for idx, subset in enumerate(irr_rafs):
         labels = ", ".join(reaction.reaction_id for reaction in subset)
         print(f"  irrRAF {idx}: {labels}")
+
+
+def build_food_upper_limit_restriction(network) -> FoodUpperLimitRestriction:
+    return FoodUpperLimitRestriction(
+        {
+            network.species_idx("0"): FOOD_MAX_COUNT,
+            network.species_idx("1"): FOOD_MAX_COUNT,
+        }
+    )
 
 
 def print_run_summary(run_result, trajectory_record) -> None:
@@ -95,9 +105,10 @@ def main() -> None:
     # If you want a different chemistry or a different fixed species space,
     # change the builder here first.
     network = build_n3_wh_network(
-        initial_counts={"0": 10.0, "1": 10.0},
+        initial_counts=INITIAL_COUNTS,
         k_right_add=K_RIGHT_ADD,
         k_nonfood_outflow=K_NONFOOD_OUTFLOW,
+        k_food_inflow=FOOD_INFLOW_RATE,
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
     )
@@ -132,26 +143,16 @@ def main() -> None:
     # to change is the ExperimentRunner.run_one(...) call below.
     #
     # Restriction entry point:
-    # Food replenishment is attached here through a single explicit controller
-    # object. Non-food species outflow is represented as formal OUTFLOW
-    # channels in the network, so it competes with ligation directly inside SSA.
-    # If you want a different external constraint,
-    # change build_restriction() or pass a different restriction object
-    # to runner.run_one(...).
+    # Food input is represented by formal INFLOW channels in the network.
+    # The restriction below only caps food from above; it does not replenish
+    # food to a fixed count.
     #
     # Runtime cutoff entry point:
     # If MAX_TIMES is not None, runner will stop when wall-clock runtime reaches
     # that limit, even if t_end has not been reached yet.
     runner = ExperimentRunner()
     recorder = TrajectoryRecorder()
-    restriction = build_restriction(
-        network,
-        food_species=("0", "1"),
-        food_count=FOOD_COUNT,
-    )
-    # Current behavior: food is reset to FOOD_COUNT after every step.
-    # To model finite inflow, replace this with FoodUpperLimitRestriction
-    # after adding INFLOW channels to the network builder.
+    restriction = build_food_upper_limit_restriction(network)
     run_result = runner.run_one(
         network,
         stepper,
@@ -173,7 +174,7 @@ def main() -> None:
 
     print_run_summary(run_result, trajectory_record)
     print(f"  trajectory saved to: {output_path}")
-    print("  hs2014 model enabled: formal OUTFLOW channels + food replenishment restriction")
+    print("  hs2014 model enabled: formal OUTFLOW/INFLOW channels + food upper-limit restriction")
 
 
 if __name__ == "__main__":

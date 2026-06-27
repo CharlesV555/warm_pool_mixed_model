@@ -31,13 +31,9 @@ from polymer_sim import (
     TrajectoryRecorder,
     save_trajectory_record,
 )
-from polymer_sim.simulation.restriction import build_restriction
 
-# Food handling note:
-# This batch runner currently inherits catalyst_run.py's fixed food
-# replenishment through build_restriction(). If catalyst_run.py is changed to
-# formal INFLOW channels plus FoodUpperLimitRestriction, update
-# build_shared_objects() below so every method compares the same capped
+# Food handling is inherited from catalyst_run.py: formal INFLOW channels plus
+# FoodUpperLimitRestriction. This keeps every method on the same capped
 # finite-reservoir model.
 
 @dataclass(slots=True)
@@ -192,14 +188,7 @@ def normalize_methods(methods: str | Sequence[str]) -> tuple[str, ...]:
 
 def build_shared_objects() -> tuple[ReactionNetworkData, dict, BaseRestriction]:
     network, catalysis_result = catalyst_run.build_random_catalyst_network()
-    restriction = build_restriction(
-        network,
-        food_species=catalyst_run.ALPHABET,
-        food_count=catalyst_run.FOOD_COUNT,
-    )
-    # Current behavior: reset food to catalyst_run.FOOD_COUNT after each step.
-    # Finite inflow option: build INFLOW channels in catalyst_run.py and replace
-    # this with FoodUpperLimitRestriction using catalyst_run.FOOD_MAX_COUNT.
+    restriction = catalyst_run.build_food_upper_limit_restriction(network)
     return network, catalysis_result, restriction
 
 
@@ -462,10 +451,12 @@ def metadata_payload(
             "catalysis_assignment": catalyst_run.json_ready(catalysis_result),
             "catalyst_species_names": catalyst_run.catalyst_species_names(network),
             "restriction": {
+                "type": "FoodUpperLimitRestriction",
                 "food_species": list(catalyst_run.ALPHABET),
-                "food_count": float(catalyst_run.FOOD_COUNT),
-                # If using FoodUpperLimitRestriction, record food_max_count here
-                # instead of food_count so downstream analysis sees cap semantics.
+                "initial_food_count": float(catalyst_run.INITIAL_FOOD_COUNT),
+                "effective_initial_counts": dict(catalyst_run.INITIAL_COUNTS),
+                "food_inflow_rate": float(catalyst_run.FOOD_INFLOW_RATE),
+                "food_max_count": float(catalyst_run.FOOD_MAX_COUNT),
             },
             "blended_config": {
                 "i1": float(config.blended_i1),

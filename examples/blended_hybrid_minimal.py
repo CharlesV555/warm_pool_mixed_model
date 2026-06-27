@@ -21,13 +21,11 @@ from polymer_sim import (
     TrajectoryRecorder,
     save_trajectory_record,
 )
-from polymer_sim.simulation.restriction import build_restriction
 
 
 # Keep the same reaction network, catalysis assignment, rates, outflow, and
-# restriction as catalyst_run.py, but use a short horizon for this smoke test.
-# If catalyst_run.py is switched from fixed food replenishment to formal INFLOW
-# plus FoodUpperLimitRestriction, mirror that restriction choice here.
+# formal INFLOW/food-cap restriction as catalyst_run.py, but use a short
+# horizon for this smoke test.
 T_END = 2.0
 SEED = catalyst_run.SEED
 MAX_STEPS = catalyst_run.MAX_STEPS
@@ -41,14 +39,7 @@ OUTPUT_PATH = EXAMPLES_DIR / "blended_hybrid_minimal_trajectory.npz"
 
 def main() -> None:
     network, catalysis_result = catalyst_run.build_random_catalyst_network()
-    restriction = build_restriction(
-        network,
-        food_species=catalyst_run.ALPHABET,
-        food_count=catalyst_run.FOOD_COUNT,
-    )
-    # Current behavior: this inherits catalyst_run.py's fixed food
-    # replenishment. For finite food inflow, build the network with INFLOW
-    # channels and replace this with FoodUpperLimitRestriction.
+    restriction = catalyst_run.build_food_upper_limit_restriction(network)
     stepper = BlendedHybridStepper(
         BlendedHybridConfig(
             i1=BLENDED_I1,

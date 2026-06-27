@@ -9,13 +9,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
-from polymer_sim.simulation.restriction import build_restriction
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from polymer_sim import (
     ExperimentRunner,
+    FoodUpperLimitRestriction,
     ReactionNetworkData,
     SSAStepper,
     TrajectoryRecorder,
@@ -37,12 +37,9 @@ K_RIGHT_ADD = 0.01
 K_LEFT_SPLIT = 0.01
 K_RIGHT_SPLIT = 0.01
 K_NONFOOD_OUTFLOW = 0.5
-FOOD_COUNT = 100.0
-# Optional finite-reservoir variant:
-# - add formal INFLOW channels in ReactionNetworkData.from_species_space(...)
-# - add FOOD_INFLOW_RATE and FOOD_MAX_COUNT hyperparameters
-# - pass FoodUpperLimitRestriction({network.species_idx(name): FOOD_MAX_COUNT, ...})
-#   to ExperimentRunner.run_one(...) instead of build_restriction(...).
+INITIAL_FOOD_COUNT = 100.0
+FOOD_INFLOW_RATE = 5000.0
+FOOD_MAX_COUNT = 100.0
 CATALYSIS_MODE = "substrate_saturating"  # "linear" or "substrate_saturating"
 SATURATION_ALPHA = 0.01
 CATALYST_SEED = 2026
@@ -50,7 +47,10 @@ CATALYST_ASSIGNMENT_MODE = "single_longest_all_channels"
 N_RANDOM_CATALYSTS = 16
 CATALYST_LOG_MEAN = 0.0
 CATALYST_LOG_SIGMA = 1.0
-INITIAL_COUNTS = {"A": FOOD_COUNT, "B": FOOD_COUNT}
+INITIAL_COUNTS = {
+    name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
+    for name in ALPHABET
+}
 OUTPUT_FILENAME = "catalyst_run_trajectory.npz"
 
 
@@ -73,6 +73,12 @@ def build_random_catalyst_network() -> tuple[ReactionNetworkData, dict]:
             sid
             for sid, name in enumerate(space.species_names)
             if name not in ALPHABET
+        ],
+        k_inflow=FOOD_INFLOW_RATE,
+        inflow_species_ids=[
+            sid
+            for sid, name in enumerate(space.species_names)
+            if name in ALPHABET
         ],
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
@@ -122,6 +128,15 @@ def catalyst_species_names(network: ReactionNetworkData) -> list[str]:
     ]
 
 
+def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUpperLimitRestriction:
+    return FoodUpperLimitRestriction(
+        {
+            network.species_idx(name): FOOD_MAX_COUNT
+            for name in ALPHABET
+        }
+    )
+
+
 def json_ready(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -149,7 +164,10 @@ def example_parameters() -> dict:
         "k_left_split": K_LEFT_SPLIT,
         "k_right_split": K_RIGHT_SPLIT,
         "k_nonfood_outflow": K_NONFOOD_OUTFLOW,
-        "food_count": FOOD_COUNT,
+        "initial_food_count": INITIAL_FOOD_COUNT,
+        "effective_initial_counts": dict(INITIAL_COUNTS),
+        "food_inflow_rate": FOOD_INFLOW_RATE,
+        "food_max_count": FOOD_MAX_COUNT,
         "catalysis_mode": CATALYSIS_MODE,
         "saturation_alpha": SATURATION_ALPHA,
         "catalyst_seed": CATALYST_SEED,
@@ -183,19 +201,16 @@ def main() -> None:
     print(f"n_species={network.n_species}, n_channels={network.n_channels}")
     print(f"catalysis_mode={network.catalysis_mode}, saturation_alpha={network.saturation_alpha}")
     print(f"catalyst_assignment_mode={CATALYST_ASSIGNMENT_MODE}")
+    print(
+        f"initial_food_count={INITIAL_FOOD_COUNT}, "
+        f"food_inflow_rate={FOOD_INFLOW_RATE}, "
+        f"food_max_count={FOOD_MAX_COUNT}"
+    )
     print(f"catalyst species={catalyst_species_names(network)}")
     print(f"catalyzed channels={catalyzed_channel_count(network)}")
 
     recorder = TrajectoryRecorder()
-    restriction = build_restriction(
-        network,
-        food_species=ALPHABET,
-        food_count=FOOD_COUNT,
-    )
-    # Current behavior: build_restriction() resets food species to FOOD_COUNT
-    # after each step. To make food a finite inflow with an adjustable cap,
-    # replace this restriction with FoodUpperLimitRestriction and add INFLOW
-    # channels when building the network.
+    restriction = build_food_upper_limit_restriction(network)
     t0 = perf_counter()
     build_elapsed = perf_counter() - t0
 
