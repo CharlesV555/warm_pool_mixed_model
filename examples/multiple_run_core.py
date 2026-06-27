@@ -49,7 +49,7 @@ class MultipleRunConfig:
     methods: str | Sequence[str] = ("ssa", "blended")
     n_runs: int = 10
     base_seed: int = 20260524
-    t_end: float = 0.2
+    t_end: float | None = 0.2
     max_steps: int = 10_000_000
     max_runtime_seconds: float | None = 1800.0
     output_dir: Path | str = EXAMPLES_DIR / "method_run_outputs"
@@ -84,7 +84,7 @@ def run_methods(
     *,
     n_runs: int = 10,
     base_seed: int = 20260524,
-    t_end: float = 0.2,
+    t_end: float | None = 0.2,
     max_steps: int = 10_000_000,
     max_runtime_seconds: float | None = 1800.0,
     output_dir: Path | str = EXAMPLES_DIR / "method_run_outputs",
@@ -114,7 +114,7 @@ def run_methods(
         methods=methods,
         n_runs=int(n_runs),
         base_seed=int(base_seed),
-        t_end=float(t_end),
+        t_end=None if t_end is None else float(t_end),
         max_steps=int(max_steps),
         max_runtime_seconds=max_runtime_seconds,
         output_dir=output_dir,
@@ -219,7 +219,7 @@ def build_tasks(
                     "mode": str(method),
                     "seed": int(seed),
                     "base_seed": int(config.base_seed),
-                    "t_end": float(config.t_end),
+                    "t_end": _json_float_or_none(config.t_end),
                     "max_steps": int(config.max_steps),
                     "max_runtime_seconds": config.max_runtime_seconds,
                     "save_trajectories": bool(config.save_trajectories),
@@ -296,7 +296,7 @@ def _run_one_task(task: dict[str, object]) -> dict[str, object]:
     result = ExperimentRunner().run_one(
         network,
         stepper,
-        t_end=float(task["t_end"]),
+        t_end=_runner_t_end(task["t_end"]),
         seed=int(task["seed"]),
         dt=dt,
         recorder=recorder,
@@ -325,7 +325,7 @@ def _run_one_task(task: dict[str, object]) -> dict[str, object]:
         "seed": int(task["seed"]),
         "pair_seed": int(task["seed"]),
         "base_seed": int(task["base_seed"]),
-        "requested_t_end": float(task["t_end"]),
+        "requested_t_end": _json_float_or_none(task["t_end"]),
         "simulation_final_time": float(summary.final_time),
         "wall_runtime_seconds": float(wall_runtime),
         "n_steps": int(summary.n_steps),
@@ -356,7 +356,7 @@ def _trajectory_metadata(
         "seed": int(task["seed"]),
         "pair_seed": int(task["seed"]),
         "base_seed": int(task["base_seed"]),
-        "requested_t_end": float(task["t_end"]),
+        "requested_t_end": _json_float_or_none(task["t_end"]),
         "max_steps": int(task["max_steps"]),
         "max_runtime_seconds": task["max_runtime_seconds"],
         "wall_runtime_seconds": float(wall_runtime),
@@ -419,6 +419,15 @@ def _fixed_partition(network: ReactionNetworkData, fast_channel_ids):
     return FixedPartitionStrategy(fast_channel_ids)
 
 
+def _runner_t_end(value: object) -> float:
+    # T_END=None means "run until max_runtime_seconds or max_steps".
+    return float("inf") if value is None else float(value)
+
+
+def _json_float_or_none(value: object) -> float | None:
+    return None if value is None else float(value)
+
+
 def metadata_payload(
     *,
     config: MultipleRunConfig,
@@ -438,7 +447,7 @@ def metadata_payload(
             "n_runs": int(config.n_runs),
             "base_seed": int(config.base_seed),
             "run_seeds": [int(seed) for seed in seeds],
-            "requested_t_end": float(config.t_end),
+            "requested_t_end": _json_float_or_none(config.t_end),
             "max_steps": int(config.max_steps),
             "max_runtime_seconds": None if config.max_runtime_seconds is None else float(config.max_runtime_seconds),
             "save_trajectories": bool(config.save_trajectories),
@@ -483,6 +492,7 @@ def print_run_summary(payload: dict[str, object], metadata_path: Path, trajector
         f"backend={shared['compute_strategy']['backend']}, "
         f"workers={shared['compute_strategy']['n_workers']}"
     )
+    print(f"  requested_t_end={shared['requested_t_end']}, max_runtime_seconds={shared['max_runtime_seconds']}")
     print(
         f"  simulation_final_time: min={final_times.min():.4f}, "
         f"mean={final_times.mean():.4f}, max={final_times.max():.4f}"
@@ -492,6 +502,20 @@ def print_run_summary(payload: dict[str, object], metadata_path: Path, trajector
         f"mean={wall_times.mean():.3f}, max={wall_times.max():.3f}"
     )
     print(f"  n_events: min={n_events.min():.0f}, mean={n_events.mean():.2f}, max={n_events.max():.0f}")
+    print("  by method:")
+    for method in shared["methods"]:
+        selected = [item for item in runs if item["mode"] == method]
+        if not selected:
+            continue
+        method_final_times = np.asarray([float(item["simulation_final_time"]) for item in selected], dtype=float)
+        method_wall_times = np.asarray([float(item["wall_runtime_seconds"]) for item in selected], dtype=float)
+        method_events = np.asarray([int(item["n_events"]) for item in selected], dtype=float)
+        print(
+            f"    {method}: "
+            f"simulation_time_mean={method_final_times.mean():.6g}, "
+            f"wall_time_mean={method_wall_times.mean():.3f}, "
+            f"events_mean={method_events.mean():.2f}"
+        )
     if shared["save_trajectories"]:
         print(f"  trajectories saved under: {trajectory_dir}")
     print(f"  metadata saved to: {metadata_path}")

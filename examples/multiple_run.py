@@ -3,8 +3,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from polymer_sim.recording.distribution_comparison import compare_species_distributions
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = PROJECT_ROOT / "examples"
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -20,7 +18,10 @@ from multiple_run_core import MultipleRunConfig, run_config, run_methods
 METHODS = ("ssa", "blended")
 N_RUNS = 100
 BASE_SEED = 20260524
-T_END = 0.2
+# Set to None to compare computational efficiency at a fixed wall-clock budget.
+# Runs then stop by MAX_RUNTIME_SECONDS or MAX_STEPS, and the reported
+# simulation_final_time shows how far each method advanced.
+T_END = None
 MAX_STEPS = 10_000_000
 MAX_RUNTIME_SECONDS = 60.0
 
@@ -117,16 +118,6 @@ def run_paired_ssa_blended_test(
 
 def main() -> None:
     run()
-    from polymer_sim.recording.distribution_comparison import compare_species_distributions
-
-    result = compare_species_distributions(
-        "examples/method_run_outputs/paired_method_metadata.json",
-        species=["1", "11","111","1111","11111","0", "00","000","0000","00000"],
-        time_range=(0.0, 1.0),
-        n_time_points=20,
-        groups=["ssa", "blended"],
-        output_dir="examples/distribution_comparison",
-    )
 
 
 if __name__ == "__main__":
