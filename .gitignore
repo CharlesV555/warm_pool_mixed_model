@@ -30,3 +30,6 @@ examples/paired_method_outputs*/
 # Local logs and temporary files
 *.log
 *.tmp
+
+# output files from running scripts
+examples/output/
