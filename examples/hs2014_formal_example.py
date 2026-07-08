@@ -19,15 +19,15 @@ from polymer_sim import (
     save_trajectory_record,
 )
 
-T_END = 4.0
+T_END = 30.0
 SEED = 123
 MAX_STEPS = 100_000_000
 MAX_TIMES = 30.0  # Set to None to disable runtime cutoff
 K_RIGHT_ADD = 0.1
 K_NONFOOD_OUTFLOW = 0.8
 INITIAL_FOOD_COUNT = 10.0
-FOOD_INFLOW_RATE = 100.0
-FOOD_MAX_COUNT = 10.0
+FOOD_INFLOW_RATE = 1000.0
+FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 INITIAL_COUNTS = {
     "0": min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT),
     "1": min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT),
@@ -59,8 +59,8 @@ def print_static_raf_result(max_raf, irr_rafs) -> None:
 def build_food_upper_limit_restriction(network) -> FoodUpperLimitRestriction:
     return FoodUpperLimitRestriction(
         {
-            network.species_idx("0"): FOOD_MAX_COUNT,
-            network.species_idx("1"): FOOD_MAX_COUNT,
+            network.species_idx("0"): INITIAL_FOOD_COUNT,
+            network.species_idx("1"): INITIAL_FOOD_COUNT,
         }
     )
 

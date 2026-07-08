@@ -26,7 +26,7 @@ from polymer_sim import (
 ALPHABET = ("A", "B")
 INITIAL_FOOD_COUNT = 100.0
 FOOD_INFLOW_RATE = 5000.0
-FOOD_MAX_COUNT = 100.0
+FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 INITIAL_COUNTS = {
     name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
     for name in ALPHABET
@@ -67,7 +67,7 @@ def build_network() -> ReactionNetworkData:
 def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUpperLimitRestriction:
     return FoodUpperLimitRestriction(
         {
-            network.species_idx(name): FOOD_MAX_COUNT
+            network.species_idx(name): INITIAL_FOOD_COUNT
             for name in ALPHABET
         }
     )

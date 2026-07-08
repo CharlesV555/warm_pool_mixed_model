@@ -11,9 +11,10 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
-from pathlib import Path
 import json
+from pathlib import Path
 import sys
 from typing import Iterable
 
@@ -105,6 +106,35 @@ class BatchRunItem:
     ) -> dict[str, object]:
         return BatchRunSelection([self]).mol_num(time_points, print_output=print_output)
 
+    def dt_compare(
+        self,
+        *,
+        method: str | None = "blended",
+        ax=None,
+        cmap: str = "viridis",
+        annotate: bool = True,
+        annotation_format: str = ".4g",
+        title: str | None = None,
+        save_output: bool = True,
+        output_dir: PathLike | None = None,
+        figure_filename: str = "dt_compare_heatmap.png",
+        table_filename: str = "dt_compare_report.csv",
+        dpi: int = 200,
+    ):
+        return BatchRunSelection([self]).dt_compare(
+            method=method,
+            ax=ax,
+            cmap=cmap,
+            annotate=annotate,
+            annotation_format=annotation_format,
+            title=title,
+            save_output=save_output,
+            output_dir=output_dir,
+            figure_filename=figure_filename,
+            table_filename=table_filename,
+            dpi=dpi,
+        )
+
 
 @dataclass(slots=True)
 class BatchRunSelection:
@@ -190,6 +220,38 @@ class BatchRunSelection:
             print(_format_molecule_number_payload(payload))
         return payload
 
+    def dt_compare(
+        self,
+        *,
+        method: str | None = "blended",
+        ax=None,
+        cmap: str = "viridis",
+        annotate: bool = True,
+        annotation_format: str = ".4g",
+        title: str | None = None,
+        save_output: bool = True,
+        output_dir: PathLike | None = None,
+        figure_filename: str = "dt_compare_heatmap.png",
+        table_filename: str = "dt_compare_report.csv",
+        dpi: int = 200,
+    ):
+        """Plot mean simulation time over the blended dt_cle x dt_macro grid."""
+
+        selected_items = self.items if method is None else _filter_items(self.items, mode=method)
+        return _plot_dt_compare(
+            selected_items,
+            ax=ax,
+            cmap=cmap,
+            annotate=annotate,
+            annotation_format=annotation_format,
+            title=title,
+            save_output=save_output,
+            output_dir=output_dir,
+            figure_filename=figure_filename,
+            table_filename=table_filename,
+            dpi=dpi,
+        )
+
 
 @dataclass(slots=True)
 class BatchSummary:
@@ -254,6 +316,44 @@ class BatchSummary:
             filtered = _filter_items(self.runs, mode=method)
             selected = filtered if indices is None else _selection_to_list(_select_items(filtered, indices))
         return BatchRunSelection(selected).mol_num(time_points, print_output=print_output)
+
+    def dt_compare(
+        self,
+        indices: Iterable[int] | slice | int | None = None,
+        *,
+        method: str | None = "blended",
+        ax=None,
+        cmap: str = "viridis",
+        annotate: bool = True,
+        annotation_format: str = ".4g",
+        title: str | None = None,
+        save_output: bool = True,
+        output_dir: PathLike | None = None,
+        figure_filename: str = "dt_compare_heatmap.png",
+        table_filename: str = "dt_compare_report.csv",
+        dpi: int = 200,
+    ):
+        if method is None:
+            # No method filter: indices refer to the original file order.
+            selected = self.runs if indices is None else _selection_to_list(_select_items(self.runs, indices))
+        else:
+            # With a method filter: first filter by mode, then apply indices in
+            # the filtered order, matching scale(...).
+            filtered = _filter_items(self.runs, mode=method)
+            selected = filtered if indices is None else _selection_to_list(_select_items(filtered, indices))
+        return BatchRunSelection(selected).dt_compare(
+            method=None,
+            ax=ax,
+            cmap=cmap,
+            annotate=annotate,
+            annotation_format=annotation_format,
+            title=title,
+            save_output=save_output,
+            output_dir=output_dir,
+            figure_filename=figure_filename,
+            table_filename=table_filename,
+            dpi=dpi,
+        )
 
     def overview(self) -> str:
         times = np.asarray([item.simulation_time for item in self.runs], dtype=float)
@@ -553,6 +653,185 @@ def _load_molecule_numbers(item: BatchRunItem, time_points: np.ndarray) -> np.nd
     indices = np.searchsorted(times, time_points, side="right") - 1
     indices = np.clip(indices, 0, times.size - 1)
     return np.asarray(total_molecules[indices], dtype=float)
+
+
+def _plot_dt_compare(
+    items: list[BatchRunItem],
+    *,
+    ax=None,
+    cmap: str = "viridis",
+    annotate: bool = True,
+    annotation_format: str = ".4g",
+    title: str | None = None,
+    save_output: bool = True,
+    output_dir: PathLike | None = None,
+    figure_filename: str = "dt_compare_heatmap.png",
+    table_filename: str = "dt_compare_report.csv",
+    dpi: int = 200,
+):
+    payload = _dt_compare_payload(items)
+
+    import matplotlib.pyplot as plt
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=_dt_compare_figsize(payload))
+    else:
+        fig = ax.figure
+
+    values = np.asarray(payload["mean_simulation_time"], dtype=float)
+    image = ax.imshow(values, origin="lower", aspect="auto", cmap=cmap)
+    ax.set_xticks(np.arange(len(payload["dt_macro_values"])))
+    ax.set_xticklabels([_format_dt_value(value) for value in payload["dt_macro_values"]])
+    ax.set_yticks(np.arange(len(payload["dt_cle_values"])))
+    ax.set_yticklabels([_format_dt_value(value) for value in payload["dt_cle_values"]])
+    ax.set_xlabel("dt_macro")
+    ax.set_ylabel("dt_cle")
+    ax.set_title(title or "Mean simulation time by blended dt")
+    colorbar = fig.colorbar(image, ax=ax)
+    colorbar.set_label("mean simulation_final_time")
+
+    if annotate:
+        counts = np.asarray(payload["count"], dtype=int)
+        for row in range(values.shape[0]):
+            for col in range(values.shape[1]):
+                value = values[row, col]
+                if not np.isfinite(value):
+                    continue
+                text = format(float(value), annotation_format)
+                if counts[row, col] > 1:
+                    text = f"{text}\nn={int(counts[row, col])}"
+                ax.text(col, row, text, ha="center", va="center", color="white", fontsize=8)
+
+    fig.tight_layout()
+    if save_output:
+        _write_dt_compare_outputs(
+            payload,
+            fig,
+            items,
+            output_dir=output_dir,
+            figure_filename=figure_filename,
+            table_filename=table_filename,
+            dpi=dpi,
+        )
+    return fig, ax, payload
+
+
+def _dt_compare_payload(items: list[BatchRunItem]) -> dict[str, object]:
+    grouped: dict[tuple[float, float | None], list[BatchRunItem]] = {}
+    for item in items:
+        dt_cle = item.data.get("blended_dt_cle")
+        dt_macro = item.data.get("blended_dt_macro")
+        if dt_cle is None:
+            continue
+        key = (float(dt_cle), None if dt_macro is None else float(dt_macro))
+        grouped.setdefault(key, []).append(item)
+
+    if not grouped:
+        raise ValueError("selected runs do not contain blended_dt_cle/blended_dt_macro metadata")
+
+    dt_cle_values = sorted({key[0] for key in grouped})
+    dt_macro_values = sorted({key[1] for key in grouped}, key=_optional_float_sort_key)
+    row_by_dt_cle = {value: index for index, value in enumerate(dt_cle_values)}
+    col_by_dt_macro = {value: index for index, value in enumerate(dt_macro_values)}
+
+    values = np.full((len(dt_cle_values), len(dt_macro_values)), np.nan, dtype=float)
+    counts = np.zeros(values.shape, dtype=int)
+    run_indices: list[list[list[int]]] = [[[] for _ in dt_macro_values] for _ in dt_cle_values]
+    for (dt_cle, dt_macro), group_items in grouped.items():
+        row = row_by_dt_cle[dt_cle]
+        col = col_by_dt_macro[dt_macro]
+        times = np.asarray([item.simulation_time for item in group_items], dtype=float)
+        values[row, col] = float(np.mean(times))
+        counts[row, col] = int(times.size)
+        run_indices[row][col] = [int(item.index) for item in group_items]
+
+    return {
+        "dt_cle_values": [float(value) for value in dt_cle_values],
+        "dt_macro_values": [None if value is None else float(value) for value in dt_macro_values],
+        "mean_simulation_time": values,
+        "count": counts,
+        "run_indices": run_indices,
+    }
+
+
+def _optional_float_sort_key(value: float | None) -> tuple[int, float]:
+    return (1, 0.0) if value is None else (0, float(value))
+
+
+def _format_dt_value(value: float | None) -> str:
+    return "None" if value is None else f"{float(value):.6g}"
+
+
+def _dt_compare_figsize(payload: dict[str, object]) -> tuple[float, float]:
+    n_cols = len(payload["dt_macro_values"])
+    n_rows = len(payload["dt_cle_values"])
+    return (max(5.0, 1.35 * n_cols + 2.5), max(4.0, 0.95 * n_rows + 2.0))
+
+
+def _write_dt_compare_outputs(
+    payload: dict[str, object],
+    fig,
+    items: list[BatchRunItem],
+    *,
+    output_dir: PathLike | None,
+    figure_filename: str,
+    table_filename: str,
+    dpi: int,
+) -> None:
+    output_path = _dt_compare_output_dir(items, output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    figure_path = output_path / str(figure_filename)
+    table_path = output_path / str(table_filename)
+
+    fig.savefig(figure_path, dpi=int(dpi), bbox_inches="tight")
+    _write_dt_compare_csv(payload, table_path)
+    payload["output_dir"] = str(output_path)
+    payload["figure_path"] = str(figure_path)
+    payload["table_path"] = str(table_path)
+
+
+def _dt_compare_output_dir(items: list[BatchRunItem], output_dir: PathLike | None) -> Path:
+    if output_dir is not None:
+        return Path(output_dir)
+    source_paths = [item.source_path for item in items if item.source_path is not None]
+    if not source_paths:
+        raise ValueError("output_dir must be provided when selected runs do not come from a loaded JSON file")
+    return Path(source_paths[0]).parent / "output"
+
+
+def _write_dt_compare_csv(payload: dict[str, object], table_path: Path) -> None:
+    values = np.asarray(payload["mean_simulation_time"], dtype=float)
+    counts = np.asarray(payload["count"], dtype=int)
+    dt_cle_values = payload["dt_cle_values"]
+    dt_macro_values = payload["dt_macro_values"]
+    run_indices = payload["run_indices"]
+    with table_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "dt_cle",
+                "dt_macro",
+                "mean_simulation_time",
+                "n_runs",
+                "run_indices",
+            ],
+        )
+        writer.writeheader()
+        for row, dt_cle in enumerate(dt_cle_values):
+            for col, dt_macro in enumerate(dt_macro_values):
+                value = values[row, col]
+                count = int(counts[row, col])
+                if not np.isfinite(value) or count <= 0:
+                    continue
+                writer.writerow(
+                    {
+                        "dt_cle": _format_dt_value(dt_cle),
+                        "dt_macro": _format_dt_value(dt_macro),
+                        "mean_simulation_time": f"{float(value):.12g}",
+                        "n_runs": count,
+                        "run_indices": ";".join(str(int(index)) for index in run_indices[row][col]),
+                    }
+                )
 
 
 def _resolve_trajectory_path(item: BatchRunItem) -> Path:

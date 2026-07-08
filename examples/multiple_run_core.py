@@ -69,8 +69,8 @@ class MultipleRunConfig:
 
     blended_i1: float = 10.0
     blended_i2: float = 30.0
-    blended_dt_cle: float = 0.01
-    blended_dt_macro: float | None = None
+    blended_dt_cle: float | Sequence[float] = 0.01
+    blended_dt_macro: float | Sequence[float | None] | None = None
     blended_use_reaction_interval_dt: bool = True
     blended_reaction_interval_update_steps: int = 100
 
@@ -91,8 +91,8 @@ def run_methods(
     save_trajectories: bool = True,
     compute_strategy: ComputeStrategy | None = None,
     stepper_dt: float | None = None,
-    blended_dt_cle: float = 0.01,
-    blended_dt_macro: float | None = None,
+    blended_dt_cle: float | Sequence[float] = 0.01,
+    blended_dt_macro: float | Sequence[float | None] | None = None,
     blended_use_reaction_interval_dt: bool = True,
     blended_reaction_interval_update_steps: int = 100,
     blended_i1: float = 10.0,
@@ -108,6 +108,10 @@ def run_methods(
     ``run_methods(["ssa", "blended"], n_runs=10)``
         Run a comparison.  For each ``run_order``, SSA and blended receive the
         same random seed while different run orders receive independent seeds.
+
+    ``run_methods("blended", blended_dt_cle=[1e-4, 1e-3], blended_dt_macro=[1e-3, 1e-2])``
+        Run every ``dt_cle x dt_macro`` pair satisfying ``dt_macro >= dt_cle``.
+        Set ``blended_use_reaction_interval_dt=False`` for a fixed-dt sweep.
     """
 
     config = MultipleRunConfig(
@@ -121,7 +125,7 @@ def run_methods(
         save_trajectories=bool(save_trajectories),
         compute_strategy=compute_strategy or MultipleRunConfig().compute_strategy,
         stepper_dt=stepper_dt,
-        blended_dt_cle=float(blended_dt_cle),
+        blended_dt_cle=blended_dt_cle,
         blended_dt_macro=blended_dt_macro,
         blended_use_reaction_interval_dt=bool(blended_use_reaction_interval_dt),
         blended_reaction_interval_update_steps=int(blended_reaction_interval_update_steps),
@@ -138,6 +142,7 @@ def run_config(config: MultipleRunConfig) -> dict[str, object]:
     if int(config.n_runs) <= 0:
         raise ValueError("n_runs must be > 0")
 
+    blended_dt_pairs = build_blended_dt_pairs(config) if "blended" in methods else []
     network, catalysis_result, restriction = build_shared_objects()
     seeds = make_run_seeds(config.base_seed, config.n_runs)
     output_dir = Path(config.output_dir)
@@ -146,14 +151,21 @@ def run_config(config: MultipleRunConfig) -> dict[str, object]:
     if config.save_trajectories:
         trajectory_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = build_tasks(config, methods, seeds, trajectory_dir)
+    tasks = build_tasks(config, methods, seeds, trajectory_dir, blended_dt_pairs)
     strategy = resolve_compute_strategy(config.compute_strategy, task_count=len(tasks))
     apply_cpu_affinity(strategy)
 
     started_at = perf_counter()
     run_records = run_tasks(network, restriction, tasks, strategy)
     total_wall_runtime = perf_counter() - started_at
-    run_records = sorted(run_records, key=lambda item: (int(item["run_order"]), int(item["method_order"])))
+    run_records = sorted(
+        run_records,
+        key=lambda item: (
+            int(item["run_order"]),
+            int(item["method_order"]),
+            _sort_optional_int(item.get("blended_dt_pair_order")),
+        ),
+    )
 
     payload = metadata_payload(
         config=config,
@@ -161,6 +173,7 @@ def run_config(config: MultipleRunConfig) -> dict[str, object]:
         network=network,
         catalysis_result=catalysis_result,
         seeds=seeds,
+        blended_dt_pairs=blended_dt_pairs,
         run_records=run_records,
         compute_strategy=strategy,
         total_wall_runtime_seconds=total_wall_runtime,
@@ -202,41 +215,172 @@ def make_run_seeds(base_seed: int, n_runs: int) -> list[int]:
     ]
 
 
+def build_blended_dt_pairs(config: MultipleRunConfig) -> list[dict[str, object]]:
+    dt_cle_values = _normalize_positive_float_values(config.blended_dt_cle, "blended_dt_cle")
+    dt_macro_values = _normalize_optional_positive_float_values(config.blended_dt_macro, "blended_dt_macro")
+    pairs: list[dict[str, object]] = []
+    for cle_order, dt_cle in enumerate(dt_cle_values):
+        for macro_order, dt_macro in enumerate(dt_macro_values):
+            if dt_macro is not None and dt_macro < dt_cle:
+                continue
+            pairs.append(
+                {
+                    "blended_dt_pair_order": len(pairs),
+                    "blended_dt_cle_order": int(cle_order),
+                    "blended_dt_macro_order": int(macro_order),
+                    "blended_dt_cle": float(dt_cle),
+                    "blended_dt_macro": None if dt_macro is None else float(dt_macro),
+                    "blended_dt_label": _blended_dt_label(dt_cle, dt_macro),
+                }
+            )
+    if not pairs:
+        raise ValueError("no valid blended dt pairs; require dt_macro >= dt_cle")
+    if len(pairs) > 1 and bool(config.blended_use_reaction_interval_dt):
+        raise ValueError(
+            "fixed blended dt sweep requires blended_use_reaction_interval_dt=False; "
+            "otherwise reaction-interval dt overrides dt_cle/dt_macro"
+        )
+    return pairs
+
+
+def _normalize_positive_float_values(value: float | Sequence[float], name: str) -> tuple[float, ...]:
+    values = _as_sequence(value)
+    normalized = tuple(float(item) for item in values)
+    if not normalized:
+        raise ValueError(f"{name} must contain at least one value")
+    if any(item <= 0.0 for item in normalized):
+        raise ValueError(f"{name} values must be > 0")
+    return normalized
+
+
+def _normalize_optional_positive_float_values(
+    value: float | Sequence[float | None] | None,
+    name: str,
+) -> tuple[float | None, ...]:
+    if value is None:
+        return (None,)
+    values = _as_sequence(value)
+    normalized = tuple(None if item is None else float(item) for item in values)
+    if not normalized:
+        raise ValueError(f"{name} must contain at least one value")
+    numeric = [item for item in normalized if item is not None]
+    if any(item <= 0.0 for item in numeric):
+        raise ValueError(f"{name} values must be > 0 when provided")
+    return normalized
+
+
+def _as_sequence(value):
+    if isinstance(value, (str, bytes)):
+        raise TypeError("dt values must be numeric scalars or numeric sequences")
+    if isinstance(value, Sequence):
+        return tuple(value)
+    return (value,)
+
+
+def _blended_dt_label(dt_cle: float, dt_macro: float | None) -> str:
+    macro = "auto" if dt_macro is None else _dt_label_number(dt_macro)
+    return f"dtcle_{_dt_label_number(dt_cle)}_dtmacro_{macro}"
+
+
+def _dt_label_number(value: float) -> str:
+    return f"{float(value):.12g}".replace("+", "").replace("-", "m").replace(".", "p")
+
+
+def _sort_optional_int(value: object) -> int:
+    return -1 if value is None else int(value)
+
+
 def build_tasks(
     config: MultipleRunConfig,
     methods: Sequence[str],
     seeds: Sequence[int],
     trajectory_dir: Path,
+    blended_dt_pairs: Sequence[dict[str, object]],
 ) -> list[dict[str, object]]:
     tasks: list[dict[str, object]] = []
+    use_blended_dt_labels = len(blended_dt_pairs) > 1
     for run_order, seed in enumerate(seeds):
         for method_order, method in enumerate(methods):
+            if method == "blended":
+                for pair in blended_dt_pairs:
+                    tasks.append(
+                        _task_record(
+                            config,
+                            method=str(method),
+                            run_order=run_order,
+                            method_order=method_order,
+                            seed=seed,
+                            trajectory_dir=trajectory_dir,
+                            blended_dt_pair=pair,
+                            use_blended_dt_label=use_blended_dt_labels,
+                        )
+                    )
+                continue
             tasks.append(
-                {
-                    "run_order": int(run_order),
-                    "pair_order": int(run_order),  # compatibility with older paired metadata readers
-                    "method_order": int(method_order),
-                    "mode": str(method),
-                    "seed": int(seed),
-                    "base_seed": int(config.base_seed),
-                    "t_end": _json_float_or_none(config.t_end),
-                    "max_steps": int(config.max_steps),
-                    "max_runtime_seconds": config.max_runtime_seconds,
-                    "save_trajectories": bool(config.save_trajectories),
-                    "trajectory_dir": str(trajectory_dir),
-                    "trajectory_name": f"{method}_{int(run_order):03d}.npz",
-                    "stepper_dt": config.stepper_dt,
-                    "cle_fast_channel_ids": config.cle_fast_channel_ids,
-                    "hybrid_fast_channel_ids": config.hybrid_fast_channel_ids,
-                    "blended_i1": float(config.blended_i1),
-                    "blended_i2": float(config.blended_i2),
-                    "blended_dt_cle": float(config.blended_dt_cle),
-                    "blended_dt_macro": config.blended_dt_macro,
-                    "blended_use_reaction_interval_dt": bool(config.blended_use_reaction_interval_dt),
-                    "blended_reaction_interval_update_steps": int(config.blended_reaction_interval_update_steps),
-                }
+                _task_record(
+                    config,
+                    method=str(method),
+                    run_order=run_order,
+                    method_order=method_order,
+                    seed=seed,
+                    trajectory_dir=trajectory_dir,
+                    blended_dt_pair=None,
+                    use_blended_dt_label=False,
+                )
             )
     return tasks
+
+
+def _task_record(
+    config: MultipleRunConfig,
+    *,
+    method: str,
+    run_order: int,
+    method_order: int,
+    seed: int,
+    trajectory_dir: Path,
+    blended_dt_pair: dict[str, object] | None,
+    use_blended_dt_label: bool,
+) -> dict[str, object]:
+    dt_label = None if blended_dt_pair is None else str(blended_dt_pair["blended_dt_label"])
+    trajectory_name = (
+        f"{method}_{dt_label}_{int(run_order):03d}.npz"
+        if use_blended_dt_label and dt_label is not None
+        else f"{method}_{int(run_order):03d}.npz"
+    )
+    return {
+        "run_order": int(run_order),
+        "pair_order": int(run_order),  # compatibility with older paired metadata readers
+        "method_order": int(method_order),
+        "mode": str(method),
+        "seed": int(seed),
+        "base_seed": int(config.base_seed),
+        "t_end": _json_float_or_none(config.t_end),
+        "max_steps": int(config.max_steps),
+        "max_runtime_seconds": config.max_runtime_seconds,
+        "save_trajectories": bool(config.save_trajectories),
+        "trajectory_dir": str(trajectory_dir),
+        "trajectory_name": trajectory_name,
+        "stepper_dt": config.stepper_dt,
+        "cle_fast_channel_ids": config.cle_fast_channel_ids,
+        "hybrid_fast_channel_ids": config.hybrid_fast_channel_ids,
+        "blended_i1": float(config.blended_i1),
+        "blended_i2": float(config.blended_i2),
+        "blended_dt_pair_order": None
+        if blended_dt_pair is None
+        else int(blended_dt_pair["blended_dt_pair_order"]),
+        "blended_dt_cle_order": None
+        if blended_dt_pair is None
+        else int(blended_dt_pair["blended_dt_cle_order"]),
+        "blended_dt_macro_order": None
+        if blended_dt_pair is None
+        else int(blended_dt_pair["blended_dt_macro_order"]),
+        "blended_dt_cle": None if blended_dt_pair is None else float(blended_dt_pair["blended_dt_cle"]),
+        "blended_dt_macro": None if blended_dt_pair is None else blended_dt_pair["blended_dt_macro"],
+        "blended_dt_label": dt_label,
+        "blended_use_reaction_interval_dt": bool(config.blended_use_reaction_interval_dt),
+        "blended_reaction_interval_update_steps": int(config.blended_reaction_interval_update_steps),
+    }
 
 
 def run_tasks(
@@ -322,6 +466,12 @@ def _run_one_task(task: dict[str, object]) -> dict[str, object]:
         "method_order": int(task["method_order"]),
         "mode": method,
         "stepper_method": method,
+        "blended_dt_pair_order": _json_int_or_none(task["blended_dt_pair_order"]),
+        "blended_dt_cle_order": _json_int_or_none(task["blended_dt_cle_order"]),
+        "blended_dt_macro_order": _json_int_or_none(task["blended_dt_macro_order"]),
+        "blended_dt_cle": _json_float_or_none(task["blended_dt_cle"]),
+        "blended_dt_macro": _json_float_or_none(task["blended_dt_macro"]),
+        "blended_dt_label": task["blended_dt_label"],
         "seed": int(task["seed"]),
         "pair_seed": int(task["seed"]),
         "base_seed": int(task["base_seed"]),
@@ -353,6 +503,12 @@ def _trajectory_metadata(
         "method_order": int(task["method_order"]),
         "mode": method,
         "stepper_method": method,
+        "blended_dt_pair_order": _json_int_or_none(task["blended_dt_pair_order"]),
+        "blended_dt_cle_order": _json_int_or_none(task["blended_dt_cle_order"]),
+        "blended_dt_macro_order": _json_int_or_none(task["blended_dt_macro_order"]),
+        "blended_dt_cle": _json_float_or_none(task["blended_dt_cle"]),
+        "blended_dt_macro": _json_float_or_none(task["blended_dt_macro"]),
+        "blended_dt_label": task["blended_dt_label"],
         "seed": int(task["seed"]),
         "pair_seed": int(task["seed"]),
         "base_seed": int(task["base_seed"]),
@@ -373,7 +529,7 @@ def make_stepper(
     hybrid_fast_channel_ids,
     blended_i1: float,
     blended_i2: float,
-    blended_dt_cle: float,
+    blended_dt_cle: float | None,
     blended_dt_macro: float | None,
     blended_use_reaction_interval_dt: bool,
     blended_reaction_interval_update_steps: int,
@@ -388,6 +544,8 @@ def make_stepper(
         dt = _require_dt(name, stepper_dt)
         return HybridStepper(), _fixed_partition(network, hybrid_fast_channel_ids), dt
     if name == "blended":
+        if blended_dt_cle is None:
+            raise ValueError("blended_dt_cle must be set for blended tasks")
         config = BlendedHybridConfig(
             i1=blended_i1,
             i2=blended_i2,
@@ -428,6 +586,10 @@ def _json_float_or_none(value: object) -> float | None:
     return None if value is None else float(value)
 
 
+def _json_int_or_none(value: object) -> int | None:
+    return None if value is None else int(value)
+
+
 def metadata_payload(
     *,
     config: MultipleRunConfig,
@@ -435,6 +597,7 @@ def metadata_payload(
     network: ReactionNetworkData,
     catalysis_result: dict,
     seeds: Sequence[int],
+    blended_dt_pairs: Sequence[dict[str, object]],
     run_records: Sequence[dict[str, object]],
     compute_strategy: ComputeStrategy,
     total_wall_runtime_seconds: float,
@@ -470,8 +633,14 @@ def metadata_payload(
             "blended_config": {
                 "i1": float(config.blended_i1),
                 "i2": float(config.blended_i2),
-                "dt_cle": float(config.blended_dt_cle),
-                "dt_macro": None if config.blended_dt_macro is None else float(config.blended_dt_macro),
+                "requested_dt_cle_values": list(
+                    _normalize_positive_float_values(config.blended_dt_cle, "blended_dt_cle")
+                ),
+                "requested_dt_macro_values": list(
+                    _normalize_optional_positive_float_values(config.blended_dt_macro, "blended_dt_macro")
+                ),
+                "dt_pair_filter": "dt_macro is None or dt_macro >= dt_cle",
+                "dt_pairs": [dict(pair) for pair in blended_dt_pairs],
                 "use_reaction_interval_dt": bool(config.blended_use_reaction_interval_dt),
                 "reaction_interval_update_steps": int(config.blended_reaction_interval_update_steps),
             },
@@ -516,6 +685,25 @@ def print_run_summary(payload: dict[str, object], metadata_path: Path, trajector
             f"wall_time_mean={method_wall_times.mean():.3f}, "
             f"events_mean={method_events.mean():.2f}"
         )
+    blended_runs = [item for item in runs if item["mode"] == "blended" and item.get("blended_dt_pair_order") is not None]
+    if blended_runs:
+        print("  by blended dt pair:")
+        pair_orders = sorted({int(item["blended_dt_pair_order"]) for item in blended_runs})
+        for pair_order in pair_orders:
+            selected = [item for item in blended_runs if int(item["blended_dt_pair_order"]) == pair_order]
+            if not selected:
+                continue
+            pair_final_times = np.asarray([float(item["simulation_final_time"]) for item in selected], dtype=float)
+            pair_wall_times = np.asarray([float(item["wall_runtime_seconds"]) for item in selected], dtype=float)
+            pair_events = np.asarray([int(item["n_events"]) for item in selected], dtype=float)
+            dt_cle = selected[0]["blended_dt_cle"]
+            dt_macro = selected[0]["blended_dt_macro"]
+            print(
+                f"    dt_cle={dt_cle}, dt_macro={dt_macro}: "
+                f"simulation_time_mean={pair_final_times.mean():.6g}, "
+                f"wall_time_mean={pair_wall_times.mean():.3f}, "
+                f"events_mean={pair_events.mean():.2f}"
+            )
     if shared["save_trajectories"]:
         print(f"  trajectories saved under: {trajectory_dir}")
     print(f"  metadata saved to: {metadata_path}")

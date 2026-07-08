@@ -115,7 +115,7 @@ def test_blended_hybrid_splits_outflow_channels_like_reactions():
     assert nu[outflow_channel, source] == -1.0
 
 
-def test_blended_hybrid_keeps_inflow_discrete():
+def test_blended_hybrid_keeps_inflow_continuous():
     space = generate_fixed_species_space(
         ["A"],
         max_len=1,
@@ -139,8 +139,130 @@ def test_blended_hybrid_keeps_inflow_discrete():
 
     assert network.get_channel_block(inflow_channel) == ChannelBlock.INFLOW
     assert propensities[inflow_channel] == 5.0
-    assert beta[inflow_channel] == 1.0
+    assert beta[inflow_channel] == 0.0
+    assert beta[inflow_channel] * propensities[inflow_channel] == 0.0
+    assert (1.0 - beta[inflow_channel]) * propensities[inflow_channel] == 5.0
     assert nu[inflow_channel, target] == 1.0
+
+
+def test_blended_hybrid_rounds_changed_low_count_species_after_cle():
+    space = generate_fixed_species_space(
+        ["A"],
+        max_len=1,
+        initial_counts={"A": 0.0},
+    )
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_poly_left=0.0,
+        k_poly_right=0.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+        k_inflow=40.0,
+        inflow_species_ids=[space.idx("A")],
+    )
+    target = network.species_idx("A")
+    state = SystemState.from_x0(network.x0)
+    stepper = BlendedHybridStepper(BlendedHybridConfig(i1=10.0, i2=30.0, dt_cle=0.1))
+
+    result = stepper.step(
+        state,
+        1.0,
+        StepperContext(network=network, rng=np.random.default_rng(0)),
+    )
+
+    assert result.details["mode"] == "cle"
+    assert result.details["n_low_count_rounded"] == 1
+    assert state.x[target] <= 10.0
+    assert state.x[target] == np.rint(state.x[target])
+
+
+def test_blended_hybrid_can_keep_low_count_cle_values_continuous():
+    space = generate_fixed_species_space(
+        ["A"],
+        max_len=1,
+        initial_counts={"A": 0.0},
+    )
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_poly_left=0.0,
+        k_poly_right=0.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+        k_inflow=40.0,
+        inflow_species_ids=[space.idx("A")],
+    )
+    target = network.species_idx("A")
+    state = SystemState.from_x0(network.x0)
+    stepper = BlendedHybridStepper(
+        BlendedHybridConfig(i1=10.0, i2=30.0, dt_cle=0.1, round_low_counts_after_cle=False)
+    )
+
+    result = stepper.step(
+        state,
+        1.0,
+        StepperContext(network=network, rng=np.random.default_rng(0)),
+    )
+
+    assert result.details["mode"] == "cle"
+    assert result.details["n_low_count_rounded"] == 0
+    assert state.x[target] <= 10.0
+    assert not np.isclose(state.x[target], np.rint(state.x[target]))
+
+
+def test_blended_hybrid_beta_considers_products_by_default():
+    space = generate_fixed_species_space(
+        ["A", "B"],
+        max_len=2,
+        initial_counts={"A": 100.0, "B": 100.0, "AB": 0.0},
+    )
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_poly_left=1.0,
+        k_poly_right=1.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+    )
+    source = network.species_idx("A")
+    monomer = network.species_idx("B")
+    product = network.species_idx("AB")
+    channel = network.channel_id(ChannelBlock.RIGHT_ADD, int(network.right_add_local_id[source, monomer]))
+    state = SystemState.from_x0(network.x0)
+    stepper = BlendedHybridStepper(BlendedHybridConfig(i1=10.0, i2=30.0, dt_cle=0.01))
+
+    beta = stepper._channel_betas(network, state.x)
+
+    assert network.get_channel_products(channel) == (product,)
+    assert state.x[source] > 30.0
+    assert state.x[monomer] > 30.0
+    assert state.x[product] == 0.0
+    assert beta[channel] == 1.0
+
+
+def test_blended_hybrid_beta_can_use_reactants_only():
+    space = generate_fixed_species_space(
+        ["A", "B"],
+        max_len=2,
+        initial_counts={"A": 100.0, "B": 100.0, "AB": 0.0},
+    )
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(space, tables)
+    source = network.species_idx("A")
+    monomer = network.species_idx("B")
+    channel = network.channel_id(ChannelBlock.RIGHT_ADD, int(network.right_add_local_id[source, monomer]))
+    state = SystemState.from_x0(network.x0)
+    stepper = BlendedHybridStepper(
+        BlendedHybridConfig(i1=10.0, i2=30.0, dt_cle=0.01, beta_species_mode="reactants")
+    )
+
+    beta = stepper._channel_betas(network, state.x)
+
+    assert beta[channel] == 0.0
 
 
 def test_blended_hybrid_runner_compatibility():

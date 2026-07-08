@@ -28,7 +28,7 @@ K_RIGHT_ADD = 0.1
 K_NONFOOD_OUTFLOW = 0.5
 INITIAL_FOOD_COUNT = 100.0
 FOOD_INFLOW_RATE = 5000.0
-FOOD_MAX_COUNT = 100.0
+FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 CATALYSIS_MODE = "substrate_saturating"  # "linear" or "substrate_saturating"
 SATURATION_ALPHA = 0.01
 INITIAL_COUNTS = {
@@ -74,7 +74,7 @@ def build_without_catalyst_network() -> ReactionNetworkData:
 def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUpperLimitRestriction:
     return FoodUpperLimitRestriction(
         {
-            network.species_idx(name): FOOD_MAX_COUNT
+            network.species_idx(name): INITIAL_FOOD_COUNT
             for name in ALPHABET
         }
     )

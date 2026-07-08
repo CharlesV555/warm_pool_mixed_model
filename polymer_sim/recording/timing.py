@@ -104,6 +104,24 @@ def save_timing_summary(path: PathLike, summary: TimingSummary) -> None:
     path_obj.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
+# def save_run_timing_report(
+#     output_dir: PathLike,
+#     report: RunTimingReport,
+#     *,
+#     name: str | None = None,
+# ) -> dict[str, Path]:
+#     output_path = Path(output_dir)
+#     output_path.mkdir(parents=True, exist_ok=True)
+#     stem = _unique_stem(output_path, name or f"timing_seed_{report.seed}")
+#     json_path = output_path / f"{stem}.json"
+#     plot_path = output_path / f"{stem}_events.png"
+#     simulation_clock_plot_path = output_path / f"{stem}_simulation_clock.png"
+#     payload = _run_timing_report_payload(report)
+#     json_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+#     _save_event_timing_plot(plot_path, report)
+#     _save_simulation_clock_plot(simulation_clock_plot_path, report)
+#     return {"json": json_path, "event_plot": plot_path, "simulation_clock_plot": simulation_clock_plot_path}
+
 def save_run_timing_report(
     output_dir: PathLike,
     report: RunTimingReport,
@@ -112,17 +130,53 @@ def save_run_timing_report(
 ) -> dict[str, Path]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    stem = _unique_stem(output_path, name or f"timing_seed_{report.seed}")
+    
+    # 生成唯一的文件名前缀（只在 output_path 中检查）
+    base_name = name or f"timing_seed_{report.seed}"
+    stem = _unique_stem(output_path, base_name)
+    
     json_path = output_path / f"{stem}.json"
     plot_path = output_path / f"{stem}_events.png"
     simulation_clock_plot_path = output_path / f"{stem}_simulation_clock.png"
+    
     payload = _run_timing_report_payload(report)
     json_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
     _save_event_timing_plot(plot_path, report)
     _save_simulation_clock_plot(simulation_clock_plot_path, report)
+    
     return {"json": json_path, "event_plot": plot_path, "simulation_clock_plot": simulation_clock_plot_path}
 
-
+def _unique_stem(directory: Path, base_stem: str) -> str:
+    """
+    在指定的 directory 中生成唯一的文件名前缀。
+    会检查三个相关文件：.json, _events.png, _simulation_clock.png
+    """
+    
+    def files_exist(stem: str) -> bool:
+        """检查三个相关文件是否在 directory 中存在"""
+        json_file = directory / f"{stem}.json"
+        events_file = directory / f"{stem}_events.png"
+        clock_file = directory / f"{stem}_simulation_clock.png"
+        return json_file.exists() or events_file.exists() or clock_file.exists()
+    
+    # 检查基础名称是否可用
+    if not files_exist(base_stem):
+        return base_stem
+    
+    # 如果基础名称已被占用，尝试添加序号
+    counter = 1
+    while True:
+        candidate = f"{base_stem}_{counter}"
+        if not files_exist(candidate):
+            return candidate
+        counter += 1
+        
+        # 安全保护
+        if counter > 9999:
+            import time
+            return f"{base_stem}_{int(time.time() * 1000)}"
+        
+        
 def _run_timing_report_payload(report: RunTimingReport) -> dict[str, object]:
     network_build_note = None
     if report.network_build_wall_seconds is None:

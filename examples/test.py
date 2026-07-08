@@ -12,6 +12,7 @@ Edit the configuration block below, then run:
 """
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -94,22 +95,88 @@ def validate_species(payload: dict, species) -> None:
     print(f"  available species example: {names[:10]}")
 
 
+def effective_time_config(payload: dict) -> tuple[object, tuple[float, float] | None]:
+    """Return time sampling settings adjusted to the selected data length."""
+
+    max_time = selected_sample_max_time(payload, GROUPS)
+    if max_time is None:
+        print("[time selection]")
+        print("  metadata has no finite final simulation time; using configured time settings unchanged")
+        return TIME_POINTS, TIME_RANGE
+
+    print("[time selection]")
+    print(f"  actual max sample time among selected groups: {max_time:.6g}")
+
+    if TIME_POINTS is not None:
+        requested_points = list(TIME_POINTS)
+        requested_max = max(float(value) for value in requested_points) if requested_points else None
+        if requested_max is not None and requested_max > max_time:
+            print(
+                "  requested explicit time_points exceed actual max sample time; "
+                "late samples will be missing unless OUTSIDE='hold'"
+            )
+        return TIME_POINTS, TIME_RANGE
+
+    if TIME_RANGE is None:
+        return TIME_POINTS, TIME_RANGE
+
+    start, stop = (float(TIME_RANGE[0]), float(TIME_RANGE[1]))
+    if stop > max_time:
+        print(f"  requested time_range stop {stop:.6g} exceeds actual max; using {max_time:.6g}")
+        stop = max_time
+    if stop <= start:
+        print(f"  adjusted stop {stop:.6g} is not greater than start {start:.6g}; using start=0")
+        start = 0.0
+    effective_range = (start, stop)
+    print(f"  effective time_range: {effective_range}")
+    return None, effective_range
+
+
+def selected_sample_max_time(payload: dict, groups) -> float | None:
+    """Read the maximum final simulation clock from selected metadata rows."""
+
+    wanted = None if groups is None else {str(group).lower() for group in groups}
+    values = []
+    for row in payload.get("runs", []):
+        if not isinstance(row, dict):
+            continue
+        mode = str(row.get("mode", row.get("stepper_method", "unknown"))).lower()
+        if wanted is not None and mode not in wanted:
+            continue
+        value = _finite_row_time(row)
+        if value is not None:
+            values.append(value)
+    return None if not values else float(max(values))
+
+
+def _finite_row_time(row: dict) -> float | None:
+    for key in ("simulation_final_time", "final_time", "t_final", "time"):
+        try:
+            value = float(row[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
 def main() -> None:
     payload = load_metadata_overview(METADATA_PATH)
     validate_species(payload, SPECIES)
+    effective_time_points, effective_time_range = effective_time_config(payload)
 
     print("[distribution comparison]")
     print(f"  groups: {list(GROUPS)}")
-    print(f"  time_points: {TIME_POINTS}")
-    print(f"  time_range: {TIME_RANGE}")
+    print(f"  time_points: {effective_time_points}")
+    print(f"  time_range: {effective_time_range}")
     print(f"  n_time_points: {N_TIME_POINTS}")
     print(f"  output_dir: {OUTPUT_DIR}")
 
     result = compare_species_distributions(
         METADATA_PATH,
         species=SPECIES,
-        time_points=TIME_POINTS,
-        time_range=TIME_RANGE,
+        time_points=effective_time_points,
+        time_range=effective_time_range,
         n_time_points=N_TIME_POINTS,
         groups=GROUPS,
         output_dir=OUTPUT_DIR,
@@ -122,6 +189,7 @@ def main() -> None:
     print(f"  temp manifest: {result.extraction.manifest_path}")
     print(f"  within-group plots: {len(result.within_group_plots)}")
     print(f"  comparison plots: {len(result.comparison_plots)}")
+    print(f"  valid-sample frequency plots: {len(result.frequency_plots)}")
     print(f"  statistics csv: {result.statistics_csv}")
     print(f"  statistics json: {result.statistics_json}")
     print(f"  non-significant ratio: {result.non_significant_ratio}")

@@ -40,7 +40,8 @@ class BlendedHybridConfig:
     beta_tol: float = 1e-12
     round_mode: str = "nearest"
     clip_negative: bool = True
-    beta_species_mode: str = "reactants"
+    beta_species_mode: str = "reactants_products"
+    round_low_counts_after_cle: bool = True
     use_reaction_interval_dt: bool = False
     reaction_interval_update_steps: int = 100
     reaction_interval_scale: float = 1.0
@@ -51,6 +52,8 @@ class BlendedHybridConfig:
         self.dt_cle = float(self.dt_cle)
         self.dt_macro = None if self.dt_macro is None else float(self.dt_macro)
         self.beta_tol = float(self.beta_tol)
+        self.beta_species_mode = str(self.beta_species_mode).lower()
+        self.round_low_counts_after_cle = bool(self.round_low_counts_after_cle)
         self.reaction_interval_update_steps = int(self.reaction_interval_update_steps)
         self.reaction_interval_scale = float(self.reaction_interval_scale)
         if self.i1 >= self.i2:
@@ -63,8 +66,8 @@ class BlendedHybridConfig:
             raise ValueError("beta_tol must be >= 0")
         if self.round_mode not in {"nearest", "floor", "ceil"}:
             raise ValueError("round_mode must be 'nearest', 'floor', or 'ceil'")
-        if self.beta_species_mode != "reactants":
-            raise ValueError("beta_species_mode currently only supports 'reactants'")
+        if self.beta_species_mode not in {"reactants", "products", "reactants_products"}:
+            raise ValueError("beta_species_mode must be 'reactants', 'products', or 'reactants_products'")
         if self.reaction_interval_update_steps <= 0:
             raise ValueError("reaction_interval_update_steps must be > 0")
         if self.reaction_interval_scale <= 0.0:
@@ -311,6 +314,7 @@ class BlendedHybridStepper(BaseStepper):
         self.config = config or BlendedHybridConfig()
         self._nu_cache: dict[int, np.ndarray] = {}
         self._last_n_clipped = 0
+        self._last_n_low_count_rounded = 0
         self._last_total_cle_propensity = 0.0
         self._last_continuous_channel_abs_increments = np.empty(0, dtype=float)
         self._reaction_interval_dt: float | None = None
@@ -357,6 +361,7 @@ class BlendedHybridStepper(BaseStepper):
                 "total_jump_propensity": 0.0,
                 "total_cle_propensity": self._last_total_cle_propensity,
                 "n_clipped": self._last_n_clipped,
+                "n_low_count_rounded": self._last_n_low_count_rounded,
                 "stepper_dt": duration,
                 "reaction_interval_dt": self._reaction_interval_dt,
                 "continuous_channel_abs_increments": self._last_continuous_channel_abs_increments.copy(),
@@ -387,6 +392,7 @@ class BlendedHybridStepper(BaseStepper):
             "total_jump_propensity": total,
             "total_cle_propensity": 0.0,
             "n_clipped": 0,
+            "n_low_count_rounded": 0,
             "stepper_dt": duration,
             "reaction_interval_dt": self._reaction_interval_dt,
         }
@@ -473,6 +479,7 @@ class BlendedHybridStepper(BaseStepper):
                     "total_jump_propensity": total_jump,
                     "total_cle_propensity": self._last_total_cle_propensity,
                     "n_clipped": self._last_n_clipped,
+                    "n_low_count_rounded": self._last_n_low_count_rounded,
                     "stepper_dt": tau,
                     "reaction_interval_dt": self._reaction_interval_dt,
                     "invalid_jump_skipped": not applied,
@@ -496,6 +503,7 @@ class BlendedHybridStepper(BaseStepper):
                 "total_jump_propensity": total_jump,
                 "total_cle_propensity": self._last_total_cle_propensity,
                 "n_clipped": self._last_n_clipped,
+                "n_low_count_rounded": self._last_n_low_count_rounded,
                 "stepper_dt": duration,
                 "reaction_interval_dt": self._reaction_interval_dt,
                 "continuous_channel_abs_increments": self._last_continuous_channel_abs_increments.copy(),
@@ -512,10 +520,12 @@ class BlendedHybridStepper(BaseStepper):
     ) -> np.ndarray:
         if dt <= 0.0:
             self._last_n_clipped = 0
+            self._last_n_low_count_rounded = 0
             self._last_total_cle_propensity = 0.0
             self._last_continuous_channel_abs_increments = np.zeros(network.n_channels, dtype=float)
             return self._float_nonnegative(x_float)
 
+        self._last_n_low_count_rounded = 0
         x0 = self._float_nonnegative(x_float)
         prop = self._propensities_for_x(network, x0, 0.0)
         prop = self._clean_propensities(prop, "CLE propensities")
@@ -536,15 +546,17 @@ class BlendedHybridStepper(BaseStepper):
             if not self.config.clip_negative:
                 raise ValueError("CLE increment produced negative state values")
             x_new = np.maximum(x_new, 0.0)
+        if self.config.round_low_counts_after_cle:
+            x_new = self._round_low_count_changed_species(x_new, increment)
         return x_new
 
     def _channel_betas(self, network: ReactionNetworkData, x: np.ndarray) -> np.ndarray:
         beta = np.zeros(network.n_channels, dtype=float)
         for channel_id in range(network.n_channels):
             if network.get_channel_block(channel_id) == ChannelBlock.INFLOW:
-                beta[channel_id] = 1.0
+                beta[channel_id] = 0.0
                 continue
-            relevant_species = _channel_relevant_species(network, channel_id)
+            relevant_species = _channel_relevant_species(network, channel_id, self.config.beta_species_mode)
             if not relevant_species:
                 beta[channel_id] = 0.0
                 continue
@@ -584,6 +596,18 @@ class BlendedHybridStepper(BaseStepper):
         if not np.all(np.isfinite(values)):
             raise ValueError("state contains NaN or inf values")
         return np.maximum(values, 0.0)
+
+    def _round_low_count_changed_species(self, x: np.ndarray, increment: np.ndarray) -> np.ndarray:
+        values = np.asarray(x, dtype=float)
+        changed = np.abs(np.asarray(increment, dtype=float)) > self.config.beta_tol
+        low_count = values <= self.config.i1 + self.config.beta_tol
+        should_round = changed & low_count
+        self._last_n_low_count_rounded = int(np.count_nonzero(should_round))
+        if not np.any(should_round):
+            return values
+        rounded = values.copy()
+        rounded[should_round] = self._rounded_nonnegative(rounded[should_round])
+        return rounded
 
     def _propensities_for_x(self, network: ReactionNetworkData, x: np.ndarray, t: float) -> np.ndarray:
         return network.compute_all_propensities(SystemState(t=float(t), x=np.asarray(x, dtype=float)))
@@ -652,8 +676,16 @@ def _species_beta(x: float, i1: float, i2: float) -> float:
     return float((float(i2) - value) / (float(i2) - float(i1)))
 
 
-def _channel_relevant_species(network: ReactionNetworkData, channel_id: int) -> list[int]:
-    return [int(sid) for sid in network.get_channel_reactants(int(channel_id))]
+def _channel_relevant_species(network: ReactionNetworkData, channel_id: int, mode: str = "reactants_products") -> list[int]:
+    if mode == "reactants":
+        species = network.get_channel_reactants(int(channel_id))
+    elif mode == "products":
+        species = network.get_channel_products(int(channel_id))
+    elif mode == "reactants_products":
+        species = (*network.get_channel_reactants(int(channel_id)), *network.get_channel_products(int(channel_id)))
+    else:
+        raise ValueError("mode must be 'reactants', 'products', or 'reactants_products'")
+    return [int(sid) for sid in sorted(set(int(sid) for sid in species))]
 
 
 def _sample_channel(

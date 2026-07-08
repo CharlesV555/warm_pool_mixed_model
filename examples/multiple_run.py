@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import numpy as np
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +17,7 @@ from multiple_run_core import MultipleRunConfig, run_config, run_methods
 # - Single-method run: METHODS = "ssa" or ("ssa",)
 # - Method comparison: METHODS = ("ssa", "blended")
 METHODS = ("ssa", "blended")
-N_RUNS = 100
+N_RUNS = 2
 BASE_SEED = 20260524
 # Set to None to compare computational efficiency at a fixed wall-clock budget.
 # Runs then stop by MAX_RUNTIME_SECONDS or MAX_STEPS, and the reported
@@ -48,9 +49,15 @@ HYBRID_FAST_CHANNEL_IDS: tuple[int, ...] | str = ()
 
 BLENDED_I1 = 110.0
 BLENDED_I2 = 150.0
-BLENDED_DT_CLE = 0.01
-BLENDED_DT_MACRO = 0.0001
-BLENDED_USE_REACTION_INTERVAL_DT = True
+# Scalars are still accepted.  Tuples/lists run the Cartesian product
+# dt_cle x dt_macro after filtering out pairs with dt_macro < dt_cle.
+
+
+BLENDED_DT_CLE = np.logspace(-4, -2, num=6).tolist()          # 10个点，从1e-4到1e-2
+BLENDED_DT_MACRO = np.logspace(-3, -2, num=6).tolist()        # 10个点，从1e-3到1e-2
+# blended_dt_cle: float | Sequence[float] = 0.01
+# blended_dt_macro: float | Sequence[float | None] | None = None
+BLENDED_USE_REACTION_INTERVAL_DT = False
 BLENDED_REACTION_INTERVAL_UPDATE_STEPS = 100
 
 

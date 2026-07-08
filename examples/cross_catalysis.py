@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 
@@ -16,6 +17,7 @@ from polymer_sim import (
     ChannelBlock,
     ExperimentRunner,
     FoodUpperLimitRestriction,
+    SSAStepper,
     ReactionNetworkData,
     TrajectoryRecorder,
     build_reaction_rule_tables,
@@ -27,22 +29,22 @@ from polymer_sim import (
 
 MAX_LEN = 5
 ALPHABET = ("0", "1")
-T_END = 20.0
+T_END = 200.0
 SEED = 123
 MAX_STEPS = 100_000_000
-MAX_TIMES = 120.0
+MAX_TIMES = 60.0
 
-BACKGROUND_RATE = 0.01
+BACKGROUND_RATE = 0.001
 CATALYTIC_STRENGTH = 1.0
 K_NONFOOD_OUTFLOW = 1.5
 CATALYSIS_MODE = "linear"
 SATURATION_ALPHA = 0.01
-INITIAL_FOOD_COUNT = 100.0
-FOOD_INFLOW_RATE = 5000.0
+INITIAL_FOOD_COUNT = 1000.0
+FOOD_INFLOW_RATE = 50000.0
 # Per-food-species upper bound enforced after each simulation step. INFLOW
 # remains a formal reaction channel; this cap only prevents the food inventory
 # from accumulating above the configured system concentration.
-FOOD_MAX_COUNT = 100.0
+FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 INITIAL_COUNTS = {
     name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
     for name in ALPHABET
@@ -60,7 +62,7 @@ CROSS_CATALYSIS_RULES = {
 
 BLENDED_I1 = 110.0
 BLENDED_I2 = 150.0
-BLENDED_DT_CLE = 0.0001
+BLENDED_DT_CLE = 0.001
 BLENDED_DT_MACRO = 0.01
 
 OUTPUT_PATH = EXAMPLES_DIR / "cross_catalysis_trajectory.npz"
@@ -189,7 +191,7 @@ def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUppe
     # when reactions consume it, so the actual input remains the INFLOW channel.
     return FoodUpperLimitRestriction(
         {
-            network.species_idx(name): FOOD_MAX_COUNT
+            network.species_idx(name): INITIAL_FOOD_COUNT
             for name in ALPHABET
         }
     )
@@ -264,9 +266,10 @@ def main() -> None:
             dt_macro=BLENDED_DT_MACRO,
             use_reaction_interval_dt=False,
             reaction_interval_update_steps=1,
+            beta_species_mode="reactants",
         )
     )
-
+    # stepper = SSAStepper()
     print("Cross-catalysis reaction system")
     print(f"alphabet={ALPHABET}, max_len={MAX_LEN}")
     print(f"n_species={network.n_species}, n_channels={network.n_channels}")
@@ -281,6 +284,9 @@ def main() -> None:
     print(f"catalyzed channels={catalyzed_channel_count(network)}")
 
     recorder = TrajectoryRecorder()
+    t0 = perf_counter()
+
+    build_elapsed = perf_counter() - t0
     result = ExperimentRunner().run_one(
         network,
         stepper,
@@ -290,6 +296,9 @@ def main() -> None:
         restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
+        timing_report=True,
+        timing_report_dir="timing_reports",
+        network_build_elapsed_seconds=build_elapsed,
     )
 
     trajectory_record = recorder.finalize()

@@ -98,6 +98,7 @@ class DistributionComparisonResult:
     extraction: DistributionExtraction
     within_group_plots: list[Path]
     comparison_plots: list[Path]
+    frequency_plots: list[Path]
     statistics_csv: Path | None
     statistics_json: Path | None
     non_significant_ratio: float | None
@@ -193,10 +194,17 @@ def compare_species_distributions(
         dpi=dpi,
         print_memory=print_memory,
     )
+    frequency_plots = plot_valid_sample_count_bars(
+        extraction,
+        output_dir=out_dir / "sample_count_frequency",
+        dpi=dpi,
+        print_memory=print_memory,
+    )
     return DistributionComparisonResult(
         extraction=extraction,
         within_group_plots=within_plots,
         comparison_plots=comparison_plots,
+        frequency_plots=frequency_plots,
         statistics_csv=statistics_csv,
         statistics_json=statistics_json,
         non_significant_ratio=ratio,
@@ -401,7 +409,7 @@ def plot_within_group_distributions(
             ax.grid(True, axis="y", alpha=0.3)
             fig.tight_layout()
             path = out_dir / f"{_safe_label(group)}_{_safe_label(species_name)}_distribution.png"
-            fig.savefig(path, dpi=int(dpi))
+            fig.savefig(path, dpi=int(dpi), bbox_inches="tight")
             plt.close(fig)
             print(f"[distribution] wrote within-group plot: {path}")
             plot_paths.append(path)
@@ -536,10 +544,82 @@ def plot_group_comparison_box_scatter(
         ax.legend(loc="best")
         fig.tight_layout()
         path = out_dir / f"{_safe_label(species_name)}_group_comparison.png"
-        fig.savefig(path, dpi=int(dpi))
+        fig.savefig(path, dpi=int(dpi), bbox_inches="tight")
         plt.close(fig)
         print(f"[distribution] wrote comparison plot: {path}")
         plot_paths.append(path)
+    return plot_paths
+
+
+def plot_valid_sample_count_bars(
+    extraction: DistributionExtraction,
+    *,
+    output_dir: PathLike,
+    dpi: int = 150,
+    print_memory: bool = True,
+) -> list[Path]:
+    """Plot stacked frequency bars for valid samples at each time point.
+
+    The input is the temporary sample files produced by
+    ``extract_species_time_samples(...)``.  For each selected species, every bar
+    is one requested simulation time point, and each stacked segment is the
+    number of finite samples from one group at that time point.  If future batch
+    data adds more grouping dimensions, update ``extraction.groups`` generation
+    or call ``compare_species_distributions(..., group_key=...)``.
+    """
+
+    groups = sorted(extraction.groups)
+    if not groups:
+        return []
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    positions = np.arange(len(extraction.time_points), dtype=float)
+    plot_paths: list[Path] = []
+
+    for species_pos, species_name in enumerate(extraction.species_names):
+        matrices = {
+            group: _load_group_matrix(extraction.groups[group], species_pos)
+            for group in groups
+        }
+        counts = {
+            group: _sample_counts_by_time(matrix, len(extraction.time_points))
+            for group, matrix in matrices.items()
+        }
+        _print_memory(
+            f"[memory] plotting valid-sample frequency species={species_name}",
+            print_memory=print_memory,
+            arrays=list(matrices.values()),
+        )
+
+        fig, ax = plt.subplots(figsize=_comparison_figsize(extraction.time_points, groups))
+        bottom = np.zeros(len(extraction.time_points), dtype=float)
+        colors = plt.cm.tab10(np.linspace(0, 1, max(len(groups), 1)))
+        for group, color in zip(groups, colors):
+            group_counts = counts[group].astype(float)
+            ax.bar(positions, group_counts, bottom=bottom, width=0.72, label=group, color=color, alpha=0.82)
+            bottom += group_counts
+
+        ymax = float(np.max(bottom)) if bottom.size else 0.0
+        offset = max(0.25, ymax * 0.02)
+        for position, total in zip(positions, bottom):
+            ax.text(float(position), float(total + offset), str(int(total)), ha="center", va="bottom", fontsize=8)
+
+        ax.set_title(f"Valid sample frequency by time: {species_name}")
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Valid sample count")
+        ax.set_xticks(positions)
+        ax.set_xticklabels([_format_time(value) for value in extraction.time_points], rotation=45, ha="right")
+        ax.set_ylim(top=max(1.0, ymax + offset * 4.0))
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        path = out_dir / f"{_safe_label(species_name)}_valid_sample_frequency.png"
+        fig.savefig(path, dpi=int(dpi), bbox_inches="tight")
+        plt.close(fig)
+        print(f"[distribution] wrote valid-sample frequency plot: {path}")
+        plot_paths.append(path)
+
     return plot_paths
 
 
@@ -733,6 +813,15 @@ def _finite_column(matrix: np.ndarray, time_index: int) -> np.ndarray:
     return values[np.isfinite(values)]
 
 
+def _sample_counts_by_time(matrix: np.ndarray, n_time_points: int) -> np.ndarray:
+    if matrix.size == 0:
+        return np.zeros(int(n_time_points), dtype=np.int64)
+    return np.asarray(
+        [_finite_column(matrix, time_index).size for time_index in range(int(n_time_points))],
+        dtype=np.int64,
+    )
+
+
 def _rank_sum_test(values_a: np.ndarray, values_b: np.ndarray) -> tuple[float, float, str]:
     x = np.asarray(values_a, dtype=float)
     y = np.asarray(values_b, dtype=float)
@@ -802,6 +891,7 @@ def _box_scatter_by_time(ax, matrix: np.ndarray, time_points: np.ndarray) -> Non
         ax.scatter(np.full(values.size, position) + jitter, values, s=15, alpha=0.65, color="black")
     ax.set_xticks(positions)
     ax.set_xticklabels([_format_time(value) for value in time_points], rotation=45, ha="right")
+    _annotate_axis_counts(ax, positions, [f"n={values.size}" for values in data])
 
 
 def _comparison_box_scatter(
@@ -834,6 +924,32 @@ def _comparison_box_scatter(
             )
     ax.set_xticks(base_positions)
     ax.set_xticklabels([_format_time(value) for value in time_points], rotation=45, ha="right")
+    count_labels = []
+    for time_index in range(len(time_points)):
+        group_counts = [f"{group}={_finite_column(matrices[group], time_index).size}" for group in groups]
+        count_labels.append("n " + " ".join(group_counts))
+    _annotate_axis_counts(ax, base_positions, count_labels, y=-0.24, fontsize=7)
+
+
+def _annotate_axis_counts(
+    ax,
+    positions: np.ndarray,
+    labels: Sequence[str],
+    *,
+    y: float = -0.18,
+    fontsize: int = 8,
+) -> None:
+    for position, label in zip(positions, labels):
+        ax.text(
+            float(position),
+            float(y),
+            str(label),
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=fontsize,
+            clip_on=False,
+        )
 
 
 def _safe_boxplot(ax, data: Sequence[np.ndarray], positions: np.ndarray, *, width: float, color, label: str | None = None) -> None:
@@ -921,4 +1037,3 @@ def _print_memory(
     rss = _rss_mb()
     rss_text = "rss=unavailable" if rss is None else f"rss={rss:.2f} MB"
     print(f"{message}: loaded_arrays={loaded_mb:.2f} MB temp_arrays={array_mb:.2f} MB {rss_text}")
-
