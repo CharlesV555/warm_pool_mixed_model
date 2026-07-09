@@ -17,7 +17,6 @@ from polymer_sim import (
     ChannelBlock,
     ExperimentRunner,
     FoodUpperLimitRestriction,
-    SSAStepper,
     ReactionNetworkData,
     TrajectoryRecorder,
     build_reaction_rule_tables,
@@ -27,23 +26,19 @@ from polymer_sim import (
 )
 
 
-MAX_LEN = 5
-ALPHABET = ("0", "1")
+MAX_LEN = 3
+ALPHABET = ("A", "B")
 T_END = 200.0
 SEED = 123
 MAX_STEPS = 100_000_000
-MAX_TIMES = 600.0
+MAX_TIMES = 60.0
 
 BACKGROUND_RATE = 0.001
-CATALYTIC_STRENGTH = 1.0
-K_NONFOOD_OUTFLOW = 1.5
+K_NONFOOD_OUTFLOW = 1.0
 CATALYSIS_MODE = "linear"
 SATURATION_ALPHA = 0.01
-INITIAL_FOOD_COUNT = 1000.0
-FOOD_INFLOW_RATE = 50000.0
-# Per-food-species upper bound enforced after each simulation step. INFLOW
-# remains a formal reaction channel; this cap only prevents the food inventory
-# from accumulating above the configured system concentration.
+INITIAL_FOOD_COUNT = 50.0
+FOOD_INFLOW_RATE = 500.0
 FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 INITIAL_COUNTS = {
     name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
@@ -55,20 +50,22 @@ K_RIGHT_ADD = BACKGROUND_RATE
 K_LEFT_SPLIT = BACKGROUND_RATE
 K_RIGHT_SPLIT = BACKGROUND_RATE
 
-CROSS_CATALYSIS_RULES = {
-    "11111": "0",
-    "00000": "1",
-}
+A_CATALYST_NAME = "A" * MAX_LEN
+B_CATALYST_NAME = "B" * MAX_LEN
+A_PROMOTES_B_STRENGTH = 10.0
+A_SELF_PROMOTION_STRENGTH = 2.0
+B_INHIBITS_A_STRENGTH = 1000.0 # 促进裂解
+MIRROR_REVERSE = True
 
 BLENDED_I1 = 110.0
 BLENDED_I2 = 150.0
 BLENDED_DT_CLE = 0.003981
 BLENDED_DT_MACRO = 0.01
 
-OUTPUT_PATH = EXAMPLES_DIR / "cross_catalysis_trajectory.npz"
+OUTPUT_PATH = EXAMPLES_DIR / "oscillator_trajectory.npz"
 
 
-def build_cross_catalysis_network() -> tuple[ReactionNetworkData, dict]:
+def build_oscillator_network() -> tuple[ReactionNetworkData, dict]:
     space = generate_fixed_species_space(
         ALPHABET,
         max_len=MAX_LEN,
@@ -97,75 +94,138 @@ def build_cross_catalysis_network() -> tuple[ReactionNetworkData, dict]:
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
     )
-    catalysis_result = assign_cross_terminal_catalysis(network)
+    catalysis_result = assign_oscillator_catalysis(network)
     return network, catalysis_result
 
 
-def assign_cross_terminal_catalysis(network: ReactionNetworkData) -> dict:
+def assign_oscillator_catalysis(network: ReactionNetworkData) -> dict:
     clear_all_catalysis(network, rebuild=False)
-    channels_by_catalyst: dict[str, list[int]] = {}
-    primary_channels_by_catalyst: dict[str, list[int]] = {}
+    a_catalyst_sid = network.species_idx(A_CATALYST_NAME)
+    b_catalyst_sid = network.species_idx(B_CATALYST_NAME)
+    a_growth_channels = _homopolymer_growth_channels(network, "A")
+    b_growth_channels = _homopolymer_growth_channels(network, "B", max_target_len=MAX_LEN - 1)
+    a_n_split_channels = _source_split_channels(network, A_CATALYST_NAME)
 
-    for catalyst_name, added_monomer_name in CROSS_CATALYSIS_RULES.items():
-        catalyst_sid = network.species_idx(catalyst_name)
-        added_monomer_sid = network.species_idx(added_monomer_name)
-        catalyzed_channels = _terminal_matched_addition_channels(
-            network,
-            added_monomer_sid,
-            added_monomer_name,
-        )
-        for channel_id in catalyzed_channels:
+    assignments = [
+        {
+            "name": "A_n_promotes_B_series_growth",
+            "catalyst": A_CATALYST_NAME,
+            "target": "B1..B{n-1}",
+            "catalyst_sid": a_catalyst_sid,
+            "strength": A_PROMOTES_B_STRENGTH,
+            "channels": b_growth_channels,
+        },
+        {
+            "name": "B_n_promotes_A_n_depolymerization/inhibits_A_n_growth",
+            "catalyst": B_CATALYST_NAME,
+            "target": A_CATALYST_NAME,
+            "catalyst_sid": b_catalyst_sid,
+            "strength": B_INHIBITS_A_STRENGTH,
+            "channels": a_n_split_channels,
+        },
+        {
+            "name": "A_n_self_promotes_A_series_growth",
+            "catalyst": A_CATALYST_NAME,
+            "target": "A1..An",
+            "catalyst_sid": a_catalyst_sid,
+            "strength": A_SELF_PROMOTION_STRENGTH,
+            "channels": a_growth_channels,
+        },
+    ]
+
+    result_assignments = []
+    for assignment in assignments:
+        primary_channels = [int(channel_id) for channel_id in assignment["channels"]]
+        for channel_id in primary_channels:
             network.set_catalytic_strength(
-                int(channel_id),
-                catalyst_sid=catalyst_sid,
-                strength=CATALYTIC_STRENGTH,
+                channel_id,
+                catalyst_sid=int(assignment["catalyst_sid"]),
+                strength=float(assignment["strength"]),
                 rebuild=False,
-                mirror_reverse=True,
+                mirror_reverse=MIRROR_REVERSE,
             )
-        primary_channels = [int(channel_id) for channel_id in catalyzed_channels]
         mirrored_channels = [
             int(reverse_channel_id)
             for channel_id in primary_channels
             for reverse_channel_id in network.get_reverse_channel_ids(channel_id)
-        ]
-        primary_channels_by_catalyst[catalyst_name] = primary_channels
-        channels_by_catalyst[catalyst_name] = sorted(set(primary_channels + mirrored_channels))
+        ] if MIRROR_REVERSE else []
+        result_assignments.append(
+            {
+                "name": assignment["name"],
+                "catalyst": assignment["catalyst"],
+                "target": assignment["target"],
+                "strength": float(assignment["strength"]),
+                "primary_channels": primary_channels,
+                "mirrored_channels": sorted(set(mirrored_channels)),
+                "all_channels": sorted(set(primary_channels + mirrored_channels)),
+            }
+        )
 
     network.rebuild_dependency_indices()
     return {
-        "method": "cross_terminal_matched_addition",
-        "rules": dict(CROSS_CATALYSIS_RULES),
-        "strength": CATALYTIC_STRENGTH,
-        "mirror_reverse": True,
-        "primary_channels_by_catalyst": primary_channels_by_catalyst,
-        "channels_by_catalyst": channels_by_catalyst,
+        "method": "longest_chain_oscillator",
+        "a_catalyst": A_CATALYST_NAME,
+        "b_catalyst": B_CATALYST_NAME,
+        "mirror_reverse": MIRROR_REVERSE,
+        "assignments": result_assignments,
     }
 
 
-def _terminal_matched_addition_channels(
+def _homopolymer_growth_channels(
     network: ReactionNetworkData,
-    added_monomer_sid: int,
-    added_monomer_name: str,
+    monomer_name: str,
+    *,
+    max_target_len: int = MAX_LEN,
 ) -> np.ndarray:
+    monomer_sid = network.species_idx(monomer_name)
     channels: list[int] = []
+    for local_id, monomer in enumerate(network.left_add_monomer):
+        if int(monomer) != monomer_sid:
+            continue
+        source_sid = int(network.left_add_species[int(local_id)])
+        target_sid = int(network.left_add_target[int(local_id)])
+        if _is_homopolymer_extension(network, source_sid, target_sid, monomer_name, max_target_len=max_target_len):
+            channels.append(network.channel_id(ChannelBlock.LEFT_ADD, int(local_id)))
 
-    for local_id, monomer_sid in enumerate(network.left_add_monomer):
-        if int(monomer_sid) != int(added_monomer_sid):
+    for local_id, monomer in enumerate(network.right_add_monomer):
+        if int(monomer) != monomer_sid:
             continue
-        polymer_sid = int(network.left_add_species[int(local_id)])
-        if not network.species_names[polymer_sid].startswith(added_monomer_name):
-            continue
-        channels.append(network.channel_id(ChannelBlock.LEFT_ADD, int(local_id)))
+        source_sid = int(network.right_add_species[int(local_id)])
+        target_sid = int(network.right_add_target[int(local_id)])
+        if _is_homopolymer_extension(network, source_sid, target_sid, monomer_name, max_target_len=max_target_len):
+            channels.append(network.channel_id(ChannelBlock.RIGHT_ADD, int(local_id)))
 
-    for local_id, monomer_sid in enumerate(network.right_add_monomer):
-        if int(monomer_sid) != int(added_monomer_sid):
-            continue
-        polymer_sid = int(network.right_add_species[int(local_id)])
-        if not network.species_names[polymer_sid].endswith(added_monomer_name):
-            continue
-        channels.append(network.channel_id(ChannelBlock.RIGHT_ADD, int(local_id)))
+    return np.asarray(sorted(set(channels)), dtype=np.int64)
 
-    return np.asarray(channels, dtype=np.int64)
+
+def _source_split_channels(network: ReactionNetworkData, source_name: str) -> np.ndarray:
+    source_sid = network.species_idx(source_name)
+    channels: list[int] = []
+    for local_id, source in enumerate(network.left_split_source):
+        if int(source) == source_sid:
+            channels.append(network.channel_id(ChannelBlock.LEFT_SPLIT, int(local_id)))
+    for local_id, source in enumerate(network.right_split_source):
+        if int(source) == source_sid:
+            channels.append(network.channel_id(ChannelBlock.RIGHT_SPLIT, int(local_id)))
+    return np.asarray(sorted(set(channels)), dtype=np.int64)
+
+
+def _is_homopolymer_extension(
+    network: ReactionNetworkData,
+    source_sid: int,
+    target_sid: int,
+    monomer_name: str,
+    *,
+    max_target_len: int = MAX_LEN,
+) -> bool:
+    source = network.species_names[int(source_sid)]
+    target = network.species_names[int(target_sid)]
+    return (
+        source == monomer_name * len(source)
+        and target == monomer_name * len(target)
+        and len(target) == len(source) + 1
+        and len(target) <= int(max_target_len)
+    )
 
 
 def catalyzed_channel_count(network: ReactionNetworkData) -> int:
@@ -187,8 +247,6 @@ def catalyst_species_names(network: ReactionNetworkData) -> list[str]:
 
 
 def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUpperLimitRestriction:
-    # This restriction only caps food from above. It does not replenish food
-    # when reactions consume it, so the actual input remains the INFLOW channel.
     return FoodUpperLimitRestriction(
         {
             network.species_idx(name): INITIAL_FOOD_COUNT
@@ -231,8 +289,12 @@ def example_parameters() -> dict:
         "food_max_count": FOOD_MAX_COUNT,
         "catalysis_mode": CATALYSIS_MODE,
         "saturation_alpha": SATURATION_ALPHA,
-        "catalytic_strength": CATALYTIC_STRENGTH,
-        "cross_catalysis_rules": dict(CROSS_CATALYSIS_RULES),
+        "a_catalyst": A_CATALYST_NAME,
+        "b_catalyst": B_CATALYST_NAME,
+        "a_promotes_b_strength": A_PROMOTES_B_STRENGTH,
+        "a_self_promotion_strength": A_SELF_PROMOTION_STRENGTH,
+        "b_inhibits_a_strength": B_INHIBITS_A_STRENGTH,
+        "mirror_reverse": MIRROR_REVERSE,
         "blended_i1": BLENDED_I1,
         "blended_i2": BLENDED_I2,
         "blended_dt_cle": BLENDED_DT_CLE,
@@ -241,7 +303,7 @@ def example_parameters() -> dict:
 
 
 def print_run_summary(run_result, trajectory_record) -> None:
-    print("\nBlended hybrid summary:")
+    print("\nOscillator blended hybrid summary:")
     print(
         f"t={run_result.summary.final_time:.4f}, "
         f"steps={run_result.summary.n_steps}, "
@@ -256,7 +318,7 @@ def print_run_summary(run_result, trajectory_record) -> None:
 
 
 def main() -> None:
-    network, catalysis_result = build_cross_catalysis_network()
+    network, catalysis_result = build_oscillator_network()
     restriction = build_food_upper_limit_restriction(network)
     stepper = BlendedHybridStepper(
         BlendedHybridConfig(
@@ -269,23 +331,15 @@ def main() -> None:
             beta_species_mode="reactants",
         )
     )
-    # stepper = SSAStepper()
-    print("Cross-catalysis reaction system")
+    print("Oscillator reaction system")
     print(f"alphabet={ALPHABET}, max_len={MAX_LEN}")
     print(f"n_species={network.n_species}, n_channels={network.n_channels}")
     print(f"catalysis_mode={network.catalysis_mode}, saturation_alpha={network.saturation_alpha}")
-    print(f"background_rate={BACKGROUND_RATE}, catalytic_strength={CATALYTIC_STRENGTH}")
-    print(
-        f"initial_food_count={INITIAL_FOOD_COUNT}, "
-        f"food_inflow_rate={FOOD_INFLOW_RATE}, "
-        f"food_max_count={FOOD_MAX_COUNT}"
-    )
     print(f"catalyst species={catalyst_species_names(network)}")
     print(f"catalyzed channels={catalyzed_channel_count(network)}")
 
     recorder = TrajectoryRecorder()
     t0 = perf_counter()
-
     build_elapsed = perf_counter() - t0
     result = ExperimentRunner().run_one(
         network,
@@ -296,9 +350,7 @@ def main() -> None:
         restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
-        # timing_report=True,
-        # timing_report_dir="timing_reports",
-        # network_build_elapsed_seconds=build_elapsed,
+        network_build_elapsed_seconds=build_elapsed,
     )
 
     trajectory_record = recorder.finalize()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -53,6 +54,7 @@ class MultipleRunConfig:
     max_steps: int = 10_000_000
     max_runtime_seconds: float | None = 1800.0
     output_dir: Path | str = EXAMPLES_DIR / "method_run_outputs"
+    network_source: str = "random"
     trajectory_dir_name: str = "trajectories"
     metadata_filename: str = "method_run_metadata.json"
     save_trajectories: bool = True
@@ -88,6 +90,7 @@ def run_methods(
     max_steps: int = 10_000_000,
     max_runtime_seconds: float | None = 1800.0,
     output_dir: Path | str = EXAMPLES_DIR / "method_run_outputs",
+    network_source: str = "random",
     save_trajectories: bool = True,
     compute_strategy: ComputeStrategy | None = None,
     stepper_dt: float | None = None,
@@ -112,6 +115,11 @@ def run_methods(
     ``run_methods("blended", blended_dt_cle=[1e-4, 1e-3], blended_dt_macro=[1e-3, 1e-2])``
         Run every ``dt_cle x dt_macro`` pair satisfying ``dt_macro >= dt_cle``.
         Set ``blended_use_reaction_interval_dt=False`` for a fixed-dt sweep.
+
+    ``run_methods(["ssa", "blended"], network_source="oscillator")``
+        Use examples/oscillator.py instead of the default random catalyst
+        network.  Built-in sources are ``"random"``, ``"oscillator"``, and
+        ``"cross_catalysis"``.
     """
 
     config = MultipleRunConfig(
@@ -122,6 +130,7 @@ def run_methods(
         max_steps=int(max_steps),
         max_runtime_seconds=max_runtime_seconds,
         output_dir=output_dir,
+        network_source=str(network_source),
         save_trajectories=bool(save_trajectories),
         compute_strategy=compute_strategy or MultipleRunConfig().compute_strategy,
         stepper_dt=stepper_dt,
@@ -143,7 +152,7 @@ def run_config(config: MultipleRunConfig) -> dict[str, object]:
         raise ValueError("n_runs must be > 0")
 
     blended_dt_pairs = build_blended_dt_pairs(config) if "blended" in methods else []
-    network, catalysis_result, restriction = build_shared_objects()
+    network, catalysis_result, restriction, network_metadata = build_shared_objects(config.network_source)
     seeds = make_run_seeds(config.base_seed, config.n_runs)
     output_dir = Path(config.output_dir)
     trajectory_dir = output_dir / config.trajectory_dir_name
@@ -172,6 +181,7 @@ def run_config(config: MultipleRunConfig) -> dict[str, object]:
         methods=methods,
         network=network,
         catalysis_result=catalysis_result,
+        network_metadata=network_metadata,
         seeds=seeds,
         blended_dt_pairs=blended_dt_pairs,
         run_records=run_records,
@@ -199,10 +209,68 @@ def normalize_methods(methods: str | Sequence[str]) -> tuple[str, ...]:
     return normalized
 
 
-def build_shared_objects() -> tuple[ReactionNetworkData, dict, BaseRestriction]:
-    network, catalysis_result = catalyst_run.build_random_catalyst_network()
-    restriction = catalyst_run.build_food_upper_limit_restriction(network)
-    return network, catalysis_result, restriction
+def build_shared_objects(network_source: str = "random") -> tuple[ReactionNetworkData, dict, BaseRestriction, dict]:
+    source_key, module_name, builder_name = _network_source_spec(network_source)
+    module = importlib.import_module(module_name)
+    builder = getattr(module, builder_name)
+    network, catalysis_result = builder()
+    restriction = module.build_food_upper_limit_restriction(network)
+    metadata = _network_source_metadata(source_key, module, network, catalysis_result)
+    return network, catalysis_result, restriction, metadata
+
+
+def _network_source_spec(network_source: str) -> tuple[str, str, str]:
+    key = str(network_source).lower()
+    aliases = {
+        "random": ("random", "catalyst_run", "build_random_catalyst_network"),
+        "random_catalyst": ("random", "catalyst_run", "build_random_catalyst_network"),
+        "catalyst_run": ("random", "catalyst_run", "build_random_catalyst_network"),
+        "oscillator": ("oscillator", "oscillator", "build_oscillator_network"),
+        "cross": ("cross_catalysis", "cross_catalysis", "build_cross_catalysis_network"),
+        "cross_catalysis": ("cross_catalysis", "cross_catalysis", "build_cross_catalysis_network"),
+    }
+    if key not in aliases:
+        raise ValueError(
+            "network_source must be one of "
+            "'random', 'oscillator', or 'cross_catalysis'"
+        )
+    return aliases[key]
+
+
+def _network_source_metadata(
+    source_key: str,
+    module,
+    network: ReactionNetworkData,
+    catalysis_result: dict,
+) -> dict[str, object]:
+    json_ready = getattr(module, "json_ready", catalyst_run.json_ready)
+    example_parameters = getattr(module, "example_parameters", lambda: {})()
+    catalyst_species_names = getattr(module, "catalyst_species_names", lambda _: [])(network)
+    return {
+        "network_source": str(source_key),
+        "example_parameters": json_ready(example_parameters),
+        "catalysis_assignment": json_ready(catalysis_result),
+        "catalyst_species_names": json_ready(catalyst_species_names),
+        "restriction": _restriction_metadata_from_module(module),
+    }
+
+
+def _restriction_metadata_from_module(module) -> dict[str, object]:
+    return {
+        "type": "FoodUpperLimitRestriction",
+        "food_species": list(getattr(module, "ALPHABET", ())),
+        "initial_food_count": _optional_float_attr(module, "INITIAL_FOOD_COUNT"),
+        "effective_initial_counts": dict(getattr(module, "INITIAL_COUNTS", {})),
+        "food_inflow_rate": _optional_float_attr(module, "FOOD_INFLOW_RATE"),
+        "food_max_count": _optional_float_attr(module, "FOOD_MAX_COUNT"),
+    }
+
+
+def _optional_float_attr(module, name: str) -> float | None:
+    if not hasattr(module, name):
+        return None
+    value = getattr(module, name)
+    return None if value is None else float(value)
 
 
 def make_run_seeds(base_seed: int, n_runs: int) -> list[int]:
@@ -596,6 +664,7 @@ def metadata_payload(
     methods: Sequence[str],
     network: ReactionNetworkData,
     catalysis_result: dict,
+    network_metadata: dict,
     seeds: Sequence[int],
     blended_dt_pairs: Sequence[dict[str, object]],
     run_records: Sequence[dict[str, object]],
@@ -606,6 +675,7 @@ def metadata_payload(
         "experiment": "multi_method_run",
         "generated_by": "examples.multiple_run_core.run_methods",
         "shared": {
+            "network_source": network_metadata.get("network_source", "random"),
             "methods": list(methods),
             "n_runs": int(config.n_runs),
             "base_seed": int(config.base_seed),
@@ -619,17 +689,10 @@ def metadata_payload(
             "n_species": int(network.n_species),
             "n_channels": int(network.n_channels),
             "species_names": list(network.species_names),
-            "example_parameters": catalyst_run.example_parameters(),
-            "catalysis_assignment": catalyst_run.json_ready(catalysis_result),
-            "catalyst_species_names": catalyst_run.catalyst_species_names(network),
-            "restriction": {
-                "type": "FoodUpperLimitRestriction",
-                "food_species": list(catalyst_run.ALPHABET),
-                "initial_food_count": float(catalyst_run.INITIAL_FOOD_COUNT),
-                "effective_initial_counts": dict(catalyst_run.INITIAL_COUNTS),
-                "food_inflow_rate": float(catalyst_run.FOOD_INFLOW_RATE),
-                "food_max_count": float(catalyst_run.FOOD_MAX_COUNT),
-            },
+            "example_parameters": network_metadata.get("example_parameters", {}),
+            "catalysis_assignment": network_metadata.get("catalysis_assignment", catalysis_result),
+            "catalyst_species_names": network_metadata.get("catalyst_species_names", []),
+            "restriction": network_metadata.get("restriction", {}),
             "blended_config": {
                 "i1": float(config.blended_i1),
                 "i2": float(config.blended_i2),

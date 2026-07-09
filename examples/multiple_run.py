@@ -17,6 +17,7 @@ from multiple_run_core import MultipleRunConfig, run_config, run_methods
 # - Single-method run: METHODS = "ssa" or ("ssa",)
 # - Method comparison: METHODS = ("ssa", "blended")
 METHODS = ("ssa", "blended")
+NETWORK_SOURCE = "oscillator"  # "random", "oscillator", or "cross_catalysis"
 N_RUNS = 2
 BASE_SEED = 20260524
 # Set to None to compare computational efficiency at a fixed wall-clock budget.
@@ -29,10 +30,9 @@ MAX_RUNTIME_SECONDS = 60.0
 OUTPUT_DIR = EXAMPLES_DIR / "method_run_outputs"
 SAVE_TRAJECTORIES = True
 
-# Food handling is defined in multiple_run_core.build_shared_objects(). It
-# currently uses catalyst_run.py's formal INFLOW channels plus
-# FoodUpperLimitRestriction, so all methods compare the same capped
-# finite-reservoir model.
+# Network and food handling are selected in multiple_run_core.build_shared_objects().
+# All built-in sources use formal INFLOW channels plus FoodUpperLimitRestriction,
+# so all methods compare the same capped finite-reservoir model.
 
 COMPUTE_STRATEGY = ComputeStrategy(
     backend="process",  # "process", "thread", or "serial"
@@ -72,6 +72,7 @@ def build_config() -> MultipleRunConfig:
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_RUNTIME_SECONDS,
         output_dir=OUTPUT_DIR,
+        network_source=NETWORK_SOURCE,
         save_trajectories=SAVE_TRAJECTORIES,
         compute_strategy=COMPUTE_STRATEGY,
         stepper_dt=STEPPER_DT,
@@ -112,6 +113,7 @@ def run_paired_ssa_blended_test(
         max_steps=max_steps,
         max_runtime_seconds=max_runtime_seconds,
         output_dir=output_dir,
+        network_source=NETWORK_SOURCE,
         save_trajectories=True,
         compute_strategy=compute_strategy or COMPUTE_STRATEGY,
         blended_i1=BLENDED_I1,
