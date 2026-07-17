@@ -42,7 +42,7 @@ class ExperimentRunner:
         max_runtime_seconds: float | None = None,
         timing_report: bool = False,
         timing_report_dir: PathLike | None = None,
-        timing_report_interval_events: int = 1000,
+        timing_report_interval_events: int = 100,
         timing_report_sim_interval: float = 0.01,
         timing_report_name: str | None = None,
         network_build_elapsed_seconds: float | None = None,
@@ -220,6 +220,7 @@ class ExperimentRunner:
                     "n_species": int(network.n_species),
                     "n_channels": int(network.n_channels),
                     "simulation_clock_sampling": "point_propensity_times_interval",
+                    **_stepper_timing_metadata(stepper),
                 },
             )
             report_paths = save_run_timing_report(
@@ -246,7 +247,7 @@ class ExperimentRunner:
         max_runtime_seconds: float | None = None,
         timing_report: bool = False,
         timing_report_dir: PathLike | None = None,
-        timing_report_interval_events: int = 1000,
+        timing_report_interval_events: int = 100,
         timing_report_sim_interval: float = 0.01,
         network_build_elapsed_seconds: float | None = None,
     ) -> list[RunResult]:
@@ -333,6 +334,30 @@ def _timing_propensity_split(result: StepResult) -> tuple[float, float, float]:
     if mode in {"cle", "cle_empty"}:
         return total, 0.0, total
     return total, total, 0.0
+
+
+def _stepper_timing_metadata(stepper: BaseStepper) -> dict[str, object]:
+    config = getattr(stepper, "config", None)
+    if config is None:
+        return {}
+    metadata: dict[str, object] = {}
+    for name in (
+        "dt_cle",
+        "dt_macro",
+        "i1",
+        "i2",
+        "beta_species_mode",
+        "use_reaction_interval_dt",
+        "reaction_interval_update_steps",
+        "reaction_interval_scale",
+    ):
+        if hasattr(config, name):
+            value = getattr(config, name)
+            if isinstance(value, (str, bool)) or value is None:
+                metadata[name] = value
+            elif np.isscalar(value):
+                metadata[name] = float(value)
+    return metadata
 
 
 def _ensure_simulation_clock_bucket(

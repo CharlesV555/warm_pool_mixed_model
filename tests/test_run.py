@@ -73,12 +73,15 @@ def test_runner_can_write_timing_report():
         json_path = output_dir / "timing_test.json"
         plot_path = output_dir / "timing_test_events.png"
         simulation_clock_plot_path = output_dir / "timing_test_simulation_clock.png"
+        dt_cle_metrics_plot_path = output_dir / "timing_test_dt_cle_metrics.png"
         assert paths["json"] == str(json_path)
         assert paths["event_plot"] == str(plot_path)
         assert paths["simulation_clock_plot"] == str(simulation_clock_plot_path)
+        assert paths["dt_cle_metrics_plot"] == str(dt_cle_metrics_plot_path)
         assert json_path.exists()
         assert plot_path.exists()
         assert simulation_clock_plot_path.exists()
+        assert dt_cle_metrics_plot_path.exists()
 
         payload = json.loads(json_path.read_text(encoding="utf-8"))
         assert payload["seed"] == 3

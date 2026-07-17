@@ -138,13 +138,20 @@ def save_run_timing_report(
     json_path = output_path / f"{stem}.json"
     plot_path = output_path / f"{stem}_events.png"
     simulation_clock_plot_path = output_path / f"{stem}_simulation_clock.png"
+    dt_cle_metrics_plot_path = output_path / f"{stem}_dt_cle_metrics.png"
     
     payload = _run_timing_report_payload(report)
     json_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
     _save_event_timing_plot(plot_path, report)
     _save_simulation_clock_plot(simulation_clock_plot_path, report)
+    _save_dt_cle_metrics_plot(dt_cle_metrics_plot_path, report)
     
-    return {"json": json_path, "event_plot": plot_path, "simulation_clock_plot": simulation_clock_plot_path}
+    return {
+        "json": json_path,
+        "event_plot": plot_path,
+        "simulation_clock_plot": simulation_clock_plot_path,
+        "dt_cle_metrics_plot": dt_cle_metrics_plot_path,
+    }
 
 def _unique_stem(directory: Path, base_stem: str) -> str:
     """
@@ -358,6 +365,187 @@ def _save_simulation_clock_plot(path: Path, report: RunTimingReport, use_log = T
     plt.close(fig)
 
 
+def _save_dt_cle_metrics_plot(path: Path, report: RunTimingReport) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    dt_cle = _report_dt_cle(report)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 7), squeeze=False)
+
+    if dt_cle is None:
+        for ax in axes.ravel():
+            ax.text(
+                0.5,
+                0.5,
+                "dt_cle is not available in this timing report",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return
+
+    metrics = _dt_cle_metric_series(report, dt_cle)
+    _plot_metric_line(
+        axes[0, 0],
+        metrics["simulation_time"],
+        metrics["event_probability_time"],
+        xlabel="Simulation time",
+        ylabel="P(t > tau)",
+        title="Discrete event probability within dt_cle",
+    )
+    _plot_metric_line(
+        axes[0, 1],
+        metrics["simulation_time"],
+        metrics["continuous_discrete_ratio_time"],
+        xlabel="Simulation time",
+        ylabel="continuous / discrete propensity",
+        title="Partition propensity ratio",
+    )
+    _plot_metric_line(
+        axes[1, 0],
+        metrics["event_count"],
+        metrics["event_probability_events"],
+        xlabel=f"Discrete event count, interval={report.event_interval}",
+        ylabel="P(t > tau)",
+        title="Discrete event probability at event samples",
+    )
+    _plot_metric_line(
+        axes[1, 1],
+        metrics["event_count"],
+        metrics["continuous_discrete_ratio_events"],
+        xlabel=f"Discrete event count, interval={report.event_interval}",
+        ylabel="continuous / discrete propensity",
+        title="Partition propensity ratio at event samples",
+    )
+
+    fig.suptitle(f"dt_cle metrics: dt_cle={dt_cle:g}, seed={report.seed}", y=1.02)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _dt_cle_metric_series(report: RunTimingReport, dt_cle: float) -> dict[str, np.ndarray]:
+    samples = report.simulation_clock_samples
+    if not samples:
+        empty = np.asarray([], dtype=float)
+        return {
+            "simulation_time": empty,
+            "event_probability_time": empty,
+            "continuous_discrete_ratio_time": empty,
+            "event_count": empty,
+            "event_probability_events": empty,
+            "continuous_discrete_ratio_events": empty,
+        }
+
+    simulation_time = np.asarray([_simulation_sample_time(item) for item in samples], dtype=float)
+    discrete_propensity = np.asarray(
+        [
+            float(item.get("jump_propensity_sample", item.get("expected_jump_event_density", 0.0)))
+            for item in samples
+        ],
+        dtype=float,
+    )
+    continuous_propensity = np.asarray(
+        [
+            float(item.get("cle_propensity_sample", item.get("expected_cle_absorbed_event_density", 0.0)))
+            for item in samples
+        ],
+        dtype=float,
+    )
+
+    discrete_propensity = np.maximum(discrete_propensity, 0.0)
+    continuous_propensity = np.maximum(continuous_propensity, 0.0)
+    event_probability = 1.0 - np.exp(-discrete_propensity * float(dt_cle))
+    ratio = np.divide(
+        continuous_propensity,
+        discrete_propensity,
+        out=np.full_like(continuous_propensity, np.nan, dtype=float),
+        where=discrete_propensity > 0.0,
+    )
+
+    event_count, event_probability_events, ratio_events = _dt_cle_event_sample_series(
+        report,
+        simulation_time,
+        event_probability,
+        ratio,
+    )
+    return {
+        "simulation_time": simulation_time,
+        "event_probability_time": event_probability,
+        "continuous_discrete_ratio_time": ratio,
+        "event_count": event_count,
+        "event_probability_events": event_probability_events,
+        "continuous_discrete_ratio_events": ratio_events,
+    }
+
+
+def _dt_cle_event_sample_series(
+    report: RunTimingReport,
+    simulation_time: np.ndarray,
+    event_probability: np.ndarray,
+    ratio: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    samples = report.event_timing_samples
+    if not samples or simulation_time.size == 0:
+        empty = np.asarray([], dtype=float)
+        return empty, empty, empty
+    event_count = np.asarray([int(item["event_count"]) for item in samples], dtype=float)
+    event_time = np.asarray([float(item["simulation_time"]) for item in samples], dtype=float)
+    indices = _nearest_indices(simulation_time, event_time)
+    return event_count, event_probability[indices], ratio[indices]
+
+
+def _simulation_sample_time(sample: dict[str, float | int]) -> float:
+    if "sample_time" in sample:
+        return float(sample["sample_time"])
+    return 0.5 * (float(sample["t_start"]) + float(sample["t_end"]))
+
+
+def _nearest_indices(x: np.ndarray, values: np.ndarray) -> np.ndarray:
+    order = np.argsort(x)
+    sorted_x = x[order]
+    right = np.searchsorted(sorted_x, values, side="left")
+    right = np.clip(right, 0, sorted_x.size - 1)
+    left = np.clip(right - 1, 0, sorted_x.size - 1)
+    use_left = np.abs(values - sorted_x[left]) <= np.abs(values - sorted_x[right])
+    nearest = np.where(use_left, left, right)
+    return order[nearest]
+
+
+def _plot_metric_line(ax, x: np.ndarray, y: np.ndarray, *, xlabel: str, ylabel: str, title: str) -> None:
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not np.any(finite):
+        ax.text(0.5, 0.5, "No finite samples", ha="center", va="center", transform=ax.transAxes)
+    else:
+        ax.plot(x[finite], y[finite], linewidth=1.4)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+
+def _report_dt_cle(report: RunTimingReport) -> float | None:
+    metadata = dict(report.metadata)
+    for key in ("dt_cle", "blended_dt_cle"):
+        value = metadata.get(key)
+        if value is not None:
+            dt_cle = float(value)
+            if np.isfinite(dt_cle) and dt_cle > 0.0:
+                return dt_cle
+    stepper_config = metadata.get("stepper_config")
+    if isinstance(stepper_config, dict) and stepper_config.get("dt_cle") is not None:
+        dt_cle = float(stepper_config["dt_cle"])
+        if np.isfinite(dt_cle) and dt_cle > 0.0:
+            return dt_cle
+    return None
+
+
 def _unique_stem(output_dir: Path, stem: str) -> str:
     safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in str(stem))
     candidate = safe
@@ -366,6 +554,7 @@ def _unique_stem(output_dir: Path, stem: str) -> str:
         (output_dir / f"{candidate}.json").exists()
         or (output_dir / f"{candidate}_events.png").exists()
         or (output_dir / f"{candidate}_simulation_clock.png").exists()
+        or (output_dir / f"{candidate}_dt_cle_metrics.png").exists()
     ):
         candidate = f"{safe}_{index:03d}"
         index += 1
