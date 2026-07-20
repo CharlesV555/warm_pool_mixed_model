@@ -367,6 +367,40 @@ class BatchSummary:
         )
 
 
+def format_stepper_info(metadata: dict | None) -> str:
+    """Format stepper name and scalar parameters for console summaries."""
+
+    data = dict(metadata or {})
+    info = data.get("stepper_info")
+    if not isinstance(info, dict):
+        name = data.get("stepper_name") or data.get("stepper_method") or data.get("mode") or "unknown"
+        return f"stepper={name}"
+
+    name = str(info.get("name", data.get("stepper_name", "unknown")))
+    parts = [f"stepper={name}"]
+    config = info.get("config")
+    if isinstance(config, dict) and config:
+        parts.append(f"config={_compact_mapping(config)}")
+    nrm_config = info.get("nrm_config")
+    if isinstance(nrm_config, dict) and nrm_config:
+        parts.append(f"nrm_config={_compact_mapping(nrm_config)}")
+    return ", ".join(parts)
+
+
+def _compact_mapping(values: dict) -> str:
+    items = []
+    for key in sorted(values):
+        value = values[key]
+        if value is None:
+            text = "None"
+        elif isinstance(value, float):
+            text = f"{value:.6g}"
+        else:
+            text = str(value)
+        items.append(f"{key}={text}")
+    return "(" + ", ".join(items) + ")"
+
+
 class SummaryRecorder(BaseRecorder):
     """默认 summary recorder。
 
@@ -407,12 +441,18 @@ class SummaryRecorder(BaseRecorder):
         self._final_state = np.asarray(state, dtype=float).copy()
         self._n_steps = int(step_count)
         self._n_events = int(event_count)
+        discrete_event_times = None
         if metadata:
             step_metadata = dict(metadata)
             step_metadata.pop("continuous_channel_abs_increments", None)
+            step_metadata.pop("discrete_event_ids", None)
+            discrete_event_times = step_metadata.pop("discrete_event_times", None)
             self._metadata.update(step_metadata)
-        if self.include_event_times and event_time is not None:
-            self._event_times.append(float(event_time))
+        if self.include_event_times:
+            if discrete_event_times is not None:
+                self._event_times.extend(float(value) for value in np.asarray(discrete_event_times, dtype=float))
+            elif event_time is not None:
+                self._event_times.append(float(event_time))
 
     def finalize(self) -> RunSummary:
         if self._final_state is None:

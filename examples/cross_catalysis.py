@@ -2,37 +2,42 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from time import perf_counter
-
-import numpy as np
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_DIR = PROJECT_ROOT / "examples"
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(EXAMPLES_DIR))
+
+
+
+
+from time import perf_counter
+
+import numpy as np
 
 from polymer_sim import (
     BlendedHybridConfig,
     BlendedHybridStepper,
     ChannelBlock,
     ExperimentRunner,
-    FoodUpperLimitRestriction,
+    OptimizedNRMStepper,
     SSAStepper,
     ReactionNetworkData,
     TrajectoryRecorder,
     build_reaction_rule_tables,
     clear_all_catalysis,
+    format_stepper_info,
     generate_fixed_species_space,
     save_trajectory_record,
+    NRMBlendedHybridStepper,
 )
-
 
 MAX_LEN = 5
 ALPHABET = ("0", "1")
 T_END = 200.0
 SEED = 123
 MAX_STEPS = 100_000_000
-MAX_TIMES = 600.0
+MAX_TIMES = 60.0
 
 BACKGROUND_RATE = 0.001
 CATALYTIC_STRENGTH = 1.0
@@ -40,10 +45,10 @@ K_NONFOOD_OUTFLOW = 1.5
 CATALYSIS_MODE = "linear"
 SATURATION_ALPHA = 0.01
 INITIAL_FOOD_COUNT = 1000.0
-FOOD_INFLOW_RATE = 50000.0
-# Per-food-species upper bound enforced after each simulation step. INFLOW
-# remains a formal reaction channel; this cap only prevents the food inventory
-# from accumulating above the configured system concentration.
+FOOD_INFLOW_RATE = 500000.0
+FOOD_INFLOW_HILL_COEFFICIENT = 2.0
+# Per-food-species soft upper bound used by formal INFLOW propensity.  The
+# inflow rate approaches zero as food count approaches this capacity.
 FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 INITIAL_COUNTS = {
     name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
@@ -60,9 +65,9 @@ CROSS_CATALYSIS_RULES = {
     "00000": "1",
 }
 
-BLENDED_I1 = 110.0
-BLENDED_I2 = 150.0
-BLENDED_DT_CLE = 0.00043981
+BLENDED_I1 = 30.0
+BLENDED_I2 = 70.0
+BLENDED_DT_CLE = 0.00033981
 BLENDED_DT_MACRO = 0.01
 
 OUTPUT_PATH = EXAMPLES_DIR / "cross_catalysis_trajectory.npz"
@@ -94,6 +99,8 @@ def build_cross_catalysis_network() -> tuple[ReactionNetworkData, dict]:
             for sid, name in enumerate(space.species_names)
             if name in ALPHABET
         ],
+        inflow_capacity=FOOD_MAX_COUNT,
+        inflow_hill_coefficient=FOOD_INFLOW_HILL_COEFFICIENT,
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
     )
@@ -186,15 +193,10 @@ def catalyst_species_names(network: ReactionNetworkData) -> list[str]:
     ]
 
 
-def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUpperLimitRestriction:
-    # This restriction only caps food from above. It does not replenish food
-    # when reactions consume it, so the actual input remains the INFLOW channel.
-    return FoodUpperLimitRestriction(
-        {
-            network.species_idx(name): INITIAL_FOOD_COUNT
-            for name in ALPHABET
-        }
-    )
+# Legacy restriction entry point.
+# Food limiting now lives inside formal INFLOW channel propensities through
+# inflow_capacity / inflow_hill_coefficient, so the runner does not need a
+# FoodUpperLimitRestriction for this example.
 
 
 def json_ready(value):
@@ -228,6 +230,7 @@ def example_parameters() -> dict:
         "initial_food_count": INITIAL_FOOD_COUNT,
         "effective_initial_counts": dict(INITIAL_COUNTS),
         "food_inflow_rate": FOOD_INFLOW_RATE,
+        "food_inflow_hill_coefficient": FOOD_INFLOW_HILL_COEFFICIENT,
         "food_max_count": FOOD_MAX_COUNT,
         "catalysis_mode": CATALYSIS_MODE,
         "saturation_alpha": SATURATION_ALPHA,
@@ -242,6 +245,7 @@ def example_parameters() -> dict:
 
 def print_run_summary(run_result, trajectory_record) -> None:
     print("\nBlended hybrid summary:")
+    print(format_stepper_info(run_result.summary.metadata))
     print(
         f"t={run_result.summary.final_time:.4f}, "
         f"steps={run_result.summary.n_steps}, "
@@ -257,19 +261,31 @@ def print_run_summary(run_result, trajectory_record) -> None:
 
 def main() -> None:
     network, catalysis_result = build_cross_catalysis_network()
-    restriction = build_food_upper_limit_restriction(network)
-    stepper = BlendedHybridStepper(
-        BlendedHybridConfig(
-            i1=BLENDED_I1,
-            i2=BLENDED_I2,
-            dt_cle=BLENDED_DT_CLE,
-            dt_macro=BLENDED_DT_MACRO,
-            use_reaction_interval_dt=False,
-            reaction_interval_update_steps=1,
-            beta_species_mode="reactants",
-        )
-    )
-    # stepper = SSAStepper()
+    # restriction = build_food_upper_limit_restriction(network)
+    # stepper = BlendedHybridStepper(
+    #     BlendedHybridConfig(
+    #         i1=BLENDED_I1,
+    #         i2=BLENDED_I2,
+    #         dt_cle=BLENDED_DT_CLE,
+    #         dt_macro=BLENDED_DT_MACRO,
+    #         use_reaction_interval_dt=False,
+    #         reaction_interval_update_steps=1,
+    #         beta_species_mode="reactants",
+    #     )
+    # )
+    stepper = SSAStepper()
+    # stepper = OptimizedNRMStepper()
+    # stepper = NRMBlendedHybridStepper(
+    #     BlendedHybridConfig(
+    #         i1=BLENDED_I1,
+    #         i2=BLENDED_I2,
+    #         dt_cle=BLENDED_DT_CLE,
+    #         dt_macro=BLENDED_DT_MACRO,
+    #         use_reaction_interval_dt=False,
+    #         reaction_interval_update_steps=1,
+    #         beta_species_mode="reactants",
+    #     )
+    # )
     print("Cross-catalysis reaction system")
     print(f"alphabet={ALPHABET}, max_len={MAX_LEN}")
     print(f"n_species={network.n_species}, n_channels={network.n_channels}")
@@ -278,6 +294,7 @@ def main() -> None:
     print(
         f"initial_food_count={INITIAL_FOOD_COUNT}, "
         f"food_inflow_rate={FOOD_INFLOW_RATE}, "
+        f"food_inflow_hill={FOOD_INFLOW_HILL_COEFFICIENT}, "
         f"food_max_count={FOOD_MAX_COUNT}"
     )
     print(f"catalyst species={catalyst_species_names(network)}")
@@ -293,12 +310,12 @@ def main() -> None:
         t_end=T_END,
         seed=SEED,
         recorder=recorder,
-        restriction=restriction,
+        # restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
-        # timing_report=True,
-        # timing_report_dir="timing_reports",
-        # network_build_elapsed_seconds=build_elapsed,
+        timing_report=True,
+        timing_report_dir="timing_reports",
+        network_build_elapsed_seconds=build_elapsed,
     )
 
     trajectory_record = recorder.finalize()

@@ -59,6 +59,8 @@ class ReactionNetworkData:
     right_split_rates: np.ndarray
     outflow_rates: np.ndarray
     inflow_rates: np.ndarray
+    inflow_capacity: np.ndarray
+    inflow_hill_coefficient: np.ndarray
 
     cat_left_add: np.ndarray
     cat_right_add: np.ndarray
@@ -78,6 +80,8 @@ class ReactionNetworkData:
     channel_to_species: list[np.ndarray]
     species_to_channels: list[np.ndarray]
     channel_to_catalysts: list[np.ndarray]
+    channel_has_catalysts: np.ndarray
+    dependency_indices_dirty: bool
 
     @classmethod
     def from_species_space(
@@ -93,6 +97,8 @@ class ReactionNetworkData:
         outflow_species_ids: Sequence[int] | np.ndarray | None = None,
         k_inflow: float | Sequence[float] = 0.0,
         inflow_species_ids: Sequence[int] | np.ndarray | None = None,
+        inflow_capacity: float | Sequence[float] | None = None,
+        inflow_hill_coefficient: float | Sequence[float] = 1.0,
         catalysis_mode: str = "linear",
         saturation_alpha: float = 0.25,
     ) -> "ReactionNetworkData":
@@ -251,6 +257,12 @@ class ReactionNetworkData:
             right_split_rates=_rates(k_frag_right, len(right_split_source_a), "k_frag_right"),
             outflow_rates=_rates(k_outflow, len(outflow_source_a), "k_outflow"),
             inflow_rates=_rates(k_inflow, len(inflow_target_a), "k_inflow"),
+            inflow_capacity=_capacities(inflow_capacity, len(inflow_target_a), "inflow_capacity"),
+            inflow_hill_coefficient=_positive_values(
+                inflow_hill_coefficient,
+                len(inflow_target_a),
+                "inflow_hill_coefficient",
+            ),
             cat_left_add=dense_catalysis_block(len(left_add_target_a), n_species),
             cat_right_add=dense_catalysis_block(len(right_add_target_a), n_species),
             cat_left_split=dense_catalysis_block(len(left_split_source_a), n_species),
@@ -266,6 +278,8 @@ class ReactionNetworkData:
             channel_to_species=[],
             species_to_channels=[],
             channel_to_catalysts=[],
+            channel_has_catalysts=np.zeros(cursor, dtype=bool),
+            dependency_indices_dirty=False,
         )
         network.rebuild_dependency_indices()
         return network
@@ -354,6 +368,38 @@ class ReactionNetworkData:
     def apply_channel_update(self, state: SystemState, channel_id: int) -> None:
         self.apply_channel_delta(state.x, channel_id, 1.0)
 
+    def get_channel_changed_species(self, channel_id: int) -> np.ndarray:
+        """Return species ids whose counts can change when this channel fires."""
+
+        block, local = self._block_and_local(channel_id)
+        if block == ChannelBlock.LEFT_ADD:
+            return _unique_ints(
+                int(self.left_add_monomer[local]),
+                int(self.left_add_species[local]),
+                int(self.left_add_target[local]),
+            )
+        if block == ChannelBlock.RIGHT_ADD:
+            return _unique_ints(
+                int(self.right_add_species[local]),
+                int(self.right_add_monomer[local]),
+                int(self.right_add_target[local]),
+            )
+        if block == ChannelBlock.LEFT_SPLIT:
+            return _unique_ints(
+                int(self.left_split_source[local]),
+                int(self.left_split_monomer[local]),
+                int(self.left_split_rest[local]),
+            )
+        if block == ChannelBlock.OUTFLOW:
+            return np.asarray([int(self.outflow_source[local])], dtype=np.int64)
+        if block == ChannelBlock.INFLOW:
+            return np.asarray([int(self.inflow_target[local])], dtype=np.int64)
+        return _unique_ints(
+            int(self.right_split_source[local]),
+            int(self.right_split_rest[local]),
+            int(self.right_split_monomer[local]),
+        )
+
     def apply_channel_delta(self, x: np.ndarray, channel_id: int, amount: float) -> None:
         block, local = self._block_and_local(channel_id)
         a = float(amount)
@@ -409,11 +455,15 @@ class ReactionNetworkData:
         if sid < 0 or sid >= self.n_species:
             raise IndexError(f"catalyst_sid out of range: {sid}")
         self._set_catalytic_strength_no_rebuild(channel_id, sid, float(strength))
+        self._refresh_channel_has_catalysts(channel_id)
         if mirror_reverse:
             for reverse_channel_id in self.get_reverse_channel_ids(channel_id):
                 self._set_catalytic_strength_no_rebuild(int(reverse_channel_id), sid, float(strength))
+                self._refresh_channel_has_catalysts(int(reverse_channel_id))
         if rebuild:
             self.rebuild_dependency_indices()
+        else:
+            self.dependency_indices_dirty = True
 
     def get_reverse_channel_ids(self, channel_id: int) -> np.ndarray:
         self._check_channel(channel_id)
@@ -432,7 +482,7 @@ class ReactionNetworkData:
 
     def get_channel_catalysts(self, channel_id: int) -> np.ndarray:
         self._check_channel(channel_id)
-        if len(self.channel_to_catalysts) == self.n_channels:
+        if not self.dependency_indices_dirty and len(self.channel_to_catalysts) == self.n_channels:
             return self.channel_to_catalysts[int(channel_id)]
         return self._scan_channel_catalysts(channel_id)
 
@@ -480,7 +530,7 @@ class ReactionNetworkData:
             source = int(self.outflow_source[local])
             return float(self.outflow_rates[local] * max(float(x[source]), 0.0))
         if block == ChannelBlock.INFLOW:
-            return float(self.inflow_rates[local])
+            return float(self.inflow_rates[local] * self._inflow_capacity_factor(local, x))
         source = int(self.right_split_source[local])
         return float(self.right_split_rates[local] * self.right_split_multiplicity[local] * max(float(x[source]), 0.0))
 
@@ -499,14 +549,91 @@ class ReactionNetworkData:
         propensities = np.empty(self.n_channels, dtype=float) if out is None else out
         if propensities.shape != (self.n_channels,):
             raise ValueError(f"out must have shape ({self.n_channels},)")
-        for channel_id in range(self.n_channels):
-            propensities[channel_id] = self.compute_propensity(channel_id, state)
+        x = np.asarray(state.x, dtype=float)
+        for block in BLOCK_ORDER:
+            start, end = self._block_bounds(block)
+            if start == end:
+                continue
+            values = self._compute_block_base_propensities(block, None, x)
+            propensities[start:end] = self._apply_block_catalysis(block, None, values, x)
         return propensities
+
+    def compute_propensities_for_channels(
+        self,
+        channel_ids: np.ndarray | Sequence[int],
+        state: SystemState,
+        out: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Compute propensities for an arbitrary ordered set of global channels.
+
+        This is the local-update companion to ``compute_all_propensities``.  It
+        groups the requested channels by block so the inner propensity formulas
+        still run on NumPy arrays rather than one Python call per channel.
+        """
+
+        channels = np.asarray(channel_ids, dtype=np.int64)
+        if channels.ndim != 1:
+            raise ValueError("channel_ids must be a 1D array")
+        values = np.empty(channels.shape, dtype=float) if out is None else out
+        if values.shape != channels.shape:
+            raise ValueError(f"out must have shape {channels.shape}")
+        if channels.size == 0:
+            return values
+        if np.any((channels < 0) | (channels >= self.n_channels)):
+            raise IndexError("channel_ids contain out-of-range values")
+
+        x = np.asarray(state.x, dtype=float)
+        block_types = self.channel_block_type[channels]
+        for block in BLOCK_ORDER:
+            mask = block_types == int(block)
+            if not np.any(mask):
+                continue
+            local_ids = self.channel_local_id[channels[mask]]
+            base = self._compute_block_base_propensities(block, local_ids, x)
+            values[mask] = self._apply_block_catalysis(block, local_ids, base, x)
+        return values
+
+    def affected_channels_for_species(self, species_ids: np.ndarray | Sequence[int]) -> np.ndarray:
+        """Return channels whose propensity depends on any of ``species_ids``."""
+
+        species = np.asarray(species_ids, dtype=np.int64)
+        if species.ndim != 1:
+            raise ValueError("species_ids must be a 1D array")
+        if species.size == 0:
+            return np.empty(0, dtype=np.int64)
+        if np.any((species < 0) | (species >= self.n_species)):
+            raise IndexError("species_ids contain out-of-range values")
+        if self.dependency_indices_dirty or len(self.species_to_channels) != self.n_species:
+            self.rebuild_dependency_indices()
+
+        arrays = [self.species_to_channels[int(sid)] for sid in np.unique(species)]
+        arrays = [arr for arr in arrays if arr.size]
+        if not arrays:
+            return np.empty(0, dtype=np.int64)
+        if len(arrays) == 1:
+            return np.array(arrays[0], dtype=np.int64, copy=True)
+        return np.unique(np.concatenate(arrays)).astype(np.int64, copy=False)
+
+    def update_propensities_for_species(
+        self,
+        propensities: np.ndarray,
+        state: SystemState,
+        species_ids: np.ndarray | Sequence[int],
+    ) -> np.ndarray:
+        """Recompute cached propensities affected by changed species counts."""
+
+        if propensities.shape != (self.n_channels,):
+            raise ValueError(f"propensities must have shape ({self.n_channels},)")
+        affected = self.affected_channels_for_species(species_ids)
+        if affected.size:
+            propensities[affected] = self.compute_propensities_for_channels(affected, state)
+        return affected
 
     def rebuild_dependency_indices(self) -> None:
         channel_to_species: list[np.ndarray] = []
         channel_to_catalysts: list[np.ndarray] = []
         reverse: list[set[int]] = [set() for _ in range(self.n_species)]
+        channel_has_catalysts = np.zeros(self.n_channels, dtype=bool)
 
         for channel_id in range(self.n_channels):
             base_deps = self._base_dependency_species(channel_id)
@@ -514,14 +641,20 @@ class ReactionNetworkData:
             deps = _unique_concat(base_deps, cats)
             channel_to_species.append(deps)
             channel_to_catalysts.append(cats)
+            channel_has_catalysts[channel_id] = bool(cats.size)
             for sid in deps:
                 reverse[int(sid)].add(channel_id)
 
         self.channel_to_species = channel_to_species
         self.channel_to_catalysts = channel_to_catalysts
+        self.channel_has_catalysts = channel_has_catalysts
         self.species_to_channels = [np.asarray(sorted(channels), dtype=np.int64) for channels in reverse]
+        self.dependency_indices_dirty = False
 
     def _base_dependency_species(self, channel_id: int) -> np.ndarray:
+        block, local = self._block_and_local(channel_id)
+        if block == ChannelBlock.INFLOW:
+            return np.asarray([int(self.inflow_target[local])], dtype=np.int64)
         reactants = self.get_channel_reactants(channel_id)
         return np.asarray(sorted(set(int(sid) for sid in reactants)), dtype=np.int64)
 
@@ -547,6 +680,12 @@ class ReactionNetworkData:
         row = self._cat_row(channel_id)
         row[int(catalyst_sid)] = float(strength)
 
+    def _refresh_channel_has_catalysts(self, channel_id: int) -> None:
+        cid = int(channel_id)
+        if self.channel_has_catalysts.shape != (self.n_channels,):
+            self.channel_has_catalysts = np.zeros(self.n_channels, dtype=bool)
+        self.channel_has_catalysts[cid] = bool(np.any(self._cat_row(cid) != 0.0))
+
     def _uses_substrate_saturating_catalysis(self, channel_id: int) -> bool:
         if self.catalysis_mode != "substrate_saturating":
             return False
@@ -571,6 +710,181 @@ class ReactionNetworkData:
             return float(np.floor(x_a / 2.0))
         return float(min(x_a, x_b))
 
+    def _block_bounds(self, block: ChannelBlock | int) -> tuple[int, int]:
+        block_e = ChannelBlock(int(block))
+        start = int(self.channel_offsets[block_e])
+        return start, start + int(self.channel_sizes[block_e])
+
+    def _cat_block(self, block: ChannelBlock | int) -> np.ndarray:
+        block_e = ChannelBlock(int(block))
+        if block_e == ChannelBlock.LEFT_ADD:
+            return self.cat_left_add
+        if block_e == ChannelBlock.RIGHT_ADD:
+            return self.cat_right_add
+        if block_e == ChannelBlock.LEFT_SPLIT:
+            return self.cat_left_split
+        if block_e == ChannelBlock.OUTFLOW:
+            return self.cat_outflow
+        if block_e == ChannelBlock.INFLOW:
+            return self.cat_inflow
+        return self.cat_right_split
+
+    def _compute_block_base_propensities(
+        self,
+        block: ChannelBlock | int,
+        local_ids: np.ndarray | None,
+        x: np.ndarray,
+    ) -> np.ndarray:
+        block_e = ChannelBlock(int(block))
+        ids = self._local_ids_for_block(block_e, local_ids)
+        if ids.size == 0:
+            return np.empty(0, dtype=float)
+
+        if block_e == ChannelBlock.LEFT_ADD:
+            m = self.left_add_monomer[ids]
+            sid = self.left_add_species[ids]
+            return self.left_add_rates[ids] * _pair_count_array(x[m], x[sid], m == sid)
+        if block_e == ChannelBlock.RIGHT_ADD:
+            sid = self.right_add_species[ids]
+            m = self.right_add_monomer[ids]
+            return self.right_add_rates[ids] * _pair_count_array(x[sid], x[m], sid == m)
+        if block_e == ChannelBlock.LEFT_SPLIT:
+            source = self.left_split_source[ids]
+            return self.left_split_rates[ids] * self.left_split_multiplicity[ids] * np.maximum(x[source], 0.0)
+        if block_e == ChannelBlock.OUTFLOW:
+            source = self.outflow_source[ids]
+            return self.outflow_rates[ids] * np.maximum(x[source], 0.0)
+        if block_e == ChannelBlock.INFLOW:
+            return self.inflow_rates[ids] * self._inflow_capacity_factor_values(ids, x)
+        source = self.right_split_source[ids]
+        return self.right_split_rates[ids] * self.right_split_multiplicity[ids] * np.maximum(x[source], 0.0)
+
+    def _apply_block_catalysis(
+        self,
+        block: ChannelBlock | int,
+        local_ids: np.ndarray | None,
+        base: np.ndarray,
+        x: np.ndarray,
+    ) -> np.ndarray:
+        block_e = ChannelBlock(int(block))
+        values = np.maximum(np.asarray(base, dtype=float), 0.0)
+        if values.size == 0:
+            return values
+        if block_e == ChannelBlock.INFLOW:
+            return values
+
+        ids = self._local_ids_for_block(block_e, local_ids)
+        active = self._has_catalysts_for_local_ids(block_e, ids)
+
+        if self.catalysis_mode == "substrate_saturating" and block_e in (
+            ChannelBlock.LEFT_ADD,
+            ChannelBlock.RIGHT_ADD,
+        ):
+            capacity = self._substrate_capacity_values(block_e, ids, x)
+            values = np.where(capacity > 0.0, values, 0.0)
+            active = active & (values > 0.0)
+            if np.any(active):
+                cat_block = self._cat_block(block_e)
+                factors = self._substrate_saturating_factors(cat_block[ids[active]], capacity[active], x)
+                values[active] *= factors
+            np.maximum(values, 0.0, out=values)
+            return values
+
+        active = active & (values > 0.0)
+        if np.any(active):
+            cat_block = self._cat_block(block_e)
+            values[active] *= 1.0 + cat_block[ids[active]] @ x
+        np.maximum(values, 0.0, out=values)
+        return values
+
+    def _local_ids_for_block(self, block: ChannelBlock, local_ids: np.ndarray | None) -> np.ndarray:
+        if local_ids is None:
+            return np.arange(self.channel_sizes[block], dtype=np.int64)
+        ids = np.asarray(local_ids, dtype=np.int64)
+        if ids.ndim != 1:
+            raise ValueError("local_ids must be a 1D array")
+        return ids
+
+    def _has_catalysts_for_local_ids(self, block: ChannelBlock, local_ids: np.ndarray) -> np.ndarray:
+        if local_ids.size == 0:
+            return np.zeros(0, dtype=bool)
+        if self.channel_has_catalysts.shape != (self.n_channels,):
+            self.rebuild_dependency_indices()
+        offset = int(self.channel_offsets[block])
+        return self.channel_has_catalysts[offset + local_ids]
+
+    def _substrate_capacity_values(self, block: ChannelBlock, local_ids: np.ndarray, x: np.ndarray) -> np.ndarray:
+        if block == ChannelBlock.LEFT_ADD:
+            a = self.left_add_monomer[local_ids]
+            b = self.left_add_species[local_ids]
+        elif block == ChannelBlock.RIGHT_ADD:
+            a = self.right_add_species[local_ids]
+            b = self.right_add_monomer[local_ids]
+        else:
+            return np.zeros(local_ids.shape, dtype=float)
+
+        x_a = np.maximum(x[a], 0.0)
+        x_b = np.maximum(x[b], 0.0)
+        same = a == b
+        capacity = np.minimum(x_a, x_b)
+        if np.any(same):
+            capacity = np.array(capacity, dtype=float, copy=True)
+            capacity[same] = np.floor(x_a[same] / 2.0)
+        return capacity
+
+    def _substrate_saturating_factors(
+        self,
+        cat_rows: np.ndarray,
+        capacity: np.ndarray,
+        x: np.ndarray,
+    ) -> np.ndarray:
+        if cat_rows.size == 0:
+            return np.ones(capacity.shape, dtype=float)
+        x_c = np.maximum(np.asarray(x, dtype=float), 0.0)
+        cap = np.asarray(capacity, dtype=float)
+        denom = self.saturation_alpha * cap[:, None] + x_c[None, :]
+        scaled = np.zeros_like(denom, dtype=float)
+        np.divide(cap[:, None] * x_c[None, :], denom, out=scaled, where=denom > 0.0)
+        return 1.0 + np.sum(cat_rows * scaled, axis=1)
+
+    def _inflow_capacity_factor(self, local_id: int, x: np.ndarray) -> float:
+        capacity = float(self.inflow_capacity[int(local_id)])
+        if not np.isfinite(capacity):
+            return 1.0
+        if capacity <= 0.0:
+            return 0.0
+        target = int(self.inflow_target[int(local_id)])
+        count = max(float(x[target]), 0.0)
+        if count >= capacity:
+            return 0.0
+        hill = float(self.inflow_hill_coefficient[int(local_id)])
+        return float(max(1.0 - (count / capacity) ** hill, 0.0))
+
+    def _inflow_capacity_factor_values(self, local_ids: np.ndarray, x: np.ndarray) -> np.ndarray:
+        ids = np.asarray(local_ids, dtype=np.int64)
+        factors = np.ones(ids.shape, dtype=float)
+        if ids.size == 0:
+            return factors
+        capacities = self.inflow_capacity[ids]
+        finite = np.isfinite(capacities)
+        if not np.any(finite):
+            return factors
+
+        factors[finite] = 0.0
+        positive = finite & (capacities > 0.0)
+        if not np.any(positive):
+            return factors
+
+        targets = self.inflow_target[ids[positive]]
+        counts = np.maximum(x[targets], 0.0)
+        capacity = capacities[positive]
+        hill = self.inflow_hill_coefficient[ids[positive]]
+        ratios = counts / capacity
+        positive_factors = np.maximum(1.0 - ratios ** hill, 0.0)
+        positive_factors[counts >= capacity] = 0.0
+        factors[positive] = positive_factors
+        return factors
+
     def _block_and_local(self, channel_id: int) -> tuple[ChannelBlock, int]:
         self._check_channel(channel_id)
         cid = int(channel_id)
@@ -588,6 +902,21 @@ def _pair_count(a: float, b: float, same_species: bool) -> float:
     if same_species:
         return 0.5 * aa * max(aa - 1.0, 0.0)
     return aa * bb
+
+
+def _pair_count_array(a: np.ndarray, b: np.ndarray, same_species: np.ndarray) -> np.ndarray:
+    aa = np.maximum(np.asarray(a, dtype=float), 0.0)
+    bb = np.maximum(np.asarray(b, dtype=float), 0.0)
+    same = np.asarray(same_species, dtype=bool)
+    counts = aa * bb
+    if np.any(same):
+        counts = np.array(counts, dtype=float, copy=True)
+        counts[same] = 0.5 * aa[same] * np.maximum(aa[same] - 1.0, 0.0)
+    return counts
+
+
+def _unique_ints(*values: int) -> np.ndarray:
+    return np.unique(np.asarray(values, dtype=np.int64)).astype(np.int64, copy=False)
 
 
 def _species_tuple_key(species_ids: tuple[int, ...]) -> tuple[int, ...]:
@@ -615,6 +944,22 @@ def _rates(value: float | Sequence[float], n: int, name: str) -> np.ndarray:
     if arr.shape != (n,):
         raise ValueError(f"{name} must be scalar or shape ({n},)")
     return np.array(arr, dtype=float, copy=True)
+
+
+def _capacities(value: float | Sequence[float] | None, n: int, name: str) -> np.ndarray:
+    if value is None:
+        return np.full(n, np.inf, dtype=float)
+    arr = _rates(value, n, name)
+    if np.any(arr < 0.0):
+        raise ValueError(f"{name} values must be >= 0")
+    return arr
+
+
+def _positive_values(value: float | Sequence[float], n: int, name: str) -> np.ndarray:
+    arr = _rates(value, n, name)
+    if np.any(arr <= 0.0):
+        raise ValueError(f"{name} values must be > 0")
+    return arr
 
 
 def _unique_concat(a: np.ndarray, b: np.ndarray) -> np.ndarray:

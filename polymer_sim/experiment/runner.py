@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from time import perf_counter
 from typing import Iterable
 
@@ -74,13 +74,16 @@ class ExperimentRunner:
             partition_strategy=partition_strategy,
             blending_strategy=blending_strategy,
         )
-        restriction_context = RestrictionContext(network=network, rng=rng)
+        restriction_context = RestrictionContext(network=network, rng=rng) if restriction is not None else None
+        stepper_metadata = _stepper_metadata(stepper)
 
         active_recorder.initialize(
             species_names=list(network.species_names),
             initial_state=state.x,
             metadata={
                 "seed": int(seed),
+                "stepper_name": stepper_metadata["name"],
+                "stepper_info": dict(stepper_metadata),
                 "n_channels": int(network.n_channels),
                 "channel_labels": [network.describe_channel(channel_id) for channel_id in range(network.n_channels)],
             },
@@ -109,8 +112,11 @@ class ExperimentRunner:
                     next_sample_index=timing_next_sim_sample_index,
                 )
             if restriction is not None:
+                if restriction_context is None:
+                    raise RuntimeError("restriction_context was not initialized")
                 timing_restriction_started_at = perf_counter()
                 restriction.apply(state, float(result.advanced_time), restriction_context, result)
+                _invalidate_stepper_cache(stepper)
                 if timing_enabled:
                     timing_restriction_elapsed += perf_counter() - timing_restriction_started_at
             step_metadata = {"seed": int(seed)}
@@ -118,6 +124,10 @@ class ExperimentRunner:
                 step_metadata["channel_id"] = int(result.channel_id)
             if result.details and "continuous_channel_abs_increments" in result.details:
                 step_metadata["continuous_channel_abs_increments"] = result.details["continuous_channel_abs_increments"]
+            if result.details and "discrete_event_ids" in result.details:
+                step_metadata["discrete_event_ids"] = result.details["discrete_event_ids"]
+            if result.details and "discrete_event_times" in result.details:
+                step_metadata["discrete_event_times"] = result.details["discrete_event_times"]
             if restriction is not None:
                 step_metadata.update(restriction.metadata())
             timing_recording_started_at = perf_counter()
@@ -177,6 +187,8 @@ class ExperimentRunner:
         if isinstance(recorded, RunSummary):
             recorded.metadata["seed"] = int(seed)
             recorded.metadata["stop_reason"] = stop_reason
+            recorded.metadata["stepper_name"] = stepper_metadata["name"]
+            recorded.metadata["stepper_info"] = dict(stepper_metadata)
             summary = recorded
         else:
             summary = RunSummary(
@@ -184,7 +196,12 @@ class ExperimentRunner:
                 final_state=np.array(state.x, dtype=float, copy=True),
                 n_steps=int(state.step_count),
                 n_events=int(state.event_count),
-                metadata={"seed": int(seed), "stop_reason": stop_reason},
+                metadata={
+                    "seed": int(seed),
+                    "stop_reason": stop_reason,
+                    "stepper_name": stepper_metadata["name"],
+                    "stepper_info": dict(stepper_metadata),
+                },
                 species_names=list(network.species_names),
             )
         if timing_enabled:
@@ -200,7 +217,9 @@ class ExperimentRunner:
                 simulation_loop_wall_seconds=float(timing_loop_elapsed),
                 finalize_wall_seconds=float(timing_finalize_elapsed),
                 step_wall_seconds=float(timing_step_elapsed),
-                restriction_wall_seconds=float(timing_restriction_elapsed),
+                restriction_wall_seconds=(
+                    float(timing_restriction_elapsed) if restriction is not None else None
+                ),
                 recording_wall_seconds=float(timing_recording_elapsed),
                 event_interval=int(timing_report_interval_events),
                 event_timing_samples=list(timing_event_samples),
@@ -220,6 +239,8 @@ class ExperimentRunner:
                     "n_species": int(network.n_species),
                     "n_channels": int(network.n_channels),
                     "simulation_clock_sampling": "point_propensity_times_interval",
+                    "stepper_name": stepper_metadata["name"],
+                    "stepper_info": dict(stepper_metadata),
                     **_stepper_timing_metadata(stepper),
                 },
             )
@@ -318,7 +339,9 @@ def _accumulate_simulation_clock_timing(
         event_time = float(end_time)
         event_bucket_index = int(np.floor(event_time / interval))
         event_bucket = _ensure_simulation_clock_bucket(samples, event_bucket_index, interval)
-        event_bucket["actual_ssa_events"] = int(event_bucket["actual_ssa_events"]) + 1
+        details = result.details or {}
+        n_events = int(details.get("n_applied_discrete_events", 1))
+        event_bucket["actual_ssa_events"] = int(event_bucket["actual_ssa_events"]) + max(n_events, 1)
     return sample_index
 
 
@@ -337,27 +360,64 @@ def _timing_propensity_split(result: StepResult) -> tuple[float, float, float]:
 
 
 def _stepper_timing_metadata(stepper: BaseStepper) -> dict[str, object]:
-    config = getattr(stepper, "config", None)
-    if config is None:
-        return {}
+    stepper_info = _stepper_metadata(stepper)
     metadata: dict[str, object] = {}
-    for name in (
-        "dt_cle",
-        "dt_macro",
-        "i1",
-        "i2",
-        "beta_species_mode",
-        "use_reaction_interval_dt",
-        "reaction_interval_update_steps",
-        "reaction_interval_scale",
-    ):
-        if hasattr(config, name):
-            value = getattr(config, name)
-            if isinstance(value, (str, bool)) or value is None:
-                metadata[name] = value
-            elif np.isscalar(value):
-                metadata[name] = float(value)
+    config = stepper_info.get("config")
+    if isinstance(config, dict):
+        metadata["stepper_config"] = dict(config)
+        metadata.update(config)
+    nrm_config = stepper_info.get("nrm_config")
+    if isinstance(nrm_config, dict):
+        metadata["nrm_config"] = dict(nrm_config)
     return metadata
+
+
+def _stepper_metadata(stepper: BaseStepper) -> dict[str, object]:
+    metadata: dict[str, object] = {"name": stepper.__class__.__name__}
+    config = getattr(stepper, "config", None)
+    if config is not None:
+        metadata["config"] = _config_metadata(config)
+    nrm_config = getattr(stepper, "nrm_config", None)
+    if nrm_config is not None:
+        metadata["nrm_config"] = _config_metadata(nrm_config)
+    return metadata
+
+
+def _config_metadata(config: object) -> dict[str, object]:
+    names: list[str]
+    if is_dataclass(config):
+        names = [field.name for field in fields(config)]
+    else:
+        names = [
+            name
+            for name in dir(config)
+            if not name.startswith("_") and not callable(getattr(config, name))
+        ]
+    metadata: dict[str, object] = {}
+    for name in names:
+        value = getattr(config, name)
+        encoded = _json_scalar(value)
+        if encoded is not None or value is None:
+            metadata[name] = encoded
+    return metadata
+
+
+def _json_scalar(value: object) -> object:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return float(value)
+    if np.isscalar(value):
+        return float(value)
+    return None
+
+
+def _invalidate_stepper_cache(stepper: BaseStepper) -> None:
+    invalidate = getattr(stepper, "invalidate_cache", None)
+    if callable(invalidate):
+        invalidate()
 
 
 def _ensure_simulation_clock_bucket(

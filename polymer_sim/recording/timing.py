@@ -55,7 +55,7 @@ class RunTimingReport:
     simulation_loop_wall_seconds: float
     finalize_wall_seconds: float
     step_wall_seconds: float
-    restriction_wall_seconds: float
+    restriction_wall_seconds: float | None
     recording_wall_seconds: float
     event_interval: int
     event_timing_samples: list[dict[str, float | int]]
@@ -191,7 +191,7 @@ def _run_timing_report_payload(report: RunTimingReport) -> dict[str, object]:
             "network construction happens before ExperimentRunner.run_one; "
             "pass network_build_elapsed_seconds to include it in this report"
         )
-    return {
+    payload: dict[str, object] = {
         "seed": int(report.seed),
         "stepper": str(report.stepper),
         "final_time": float(report.final_time),
@@ -207,7 +207,6 @@ def _run_timing_report_payload(report: RunTimingReport) -> dict[str, object]:
         "simulation_loop_wall_seconds": float(report.simulation_loop_wall_seconds),
         "finalize_wall_seconds": float(report.finalize_wall_seconds),
         "step_wall_seconds": float(report.step_wall_seconds),
-        "restriction_wall_seconds": float(report.restriction_wall_seconds),
         "recording_wall_seconds": float(report.recording_wall_seconds),
         "event_interval": int(report.event_interval),
         "event_timing_samples": [dict(item) for item in report.event_timing_samples],
@@ -215,6 +214,9 @@ def _run_timing_report_payload(report: RunTimingReport) -> dict[str, object]:
         "simulation_clock_samples": [dict(item) for item in report.simulation_clock_samples],
         "metadata": dict(report.metadata),
     }
+    if report.restriction_wall_seconds is not None:
+        payload["restriction_wall_seconds"] = float(report.restriction_wall_seconds)
+    return payload
 
 
 def _save_event_timing_plot(path: Path, report: RunTimingReport) -> None:
@@ -259,34 +261,59 @@ def _unique_stem(output_dir: Path, stem: str) -> str:
     return candidate
 
 
-def _save_event_timing_plot(path: Path, report: RunTimingReport, use_log=False) -> None:
+def _save_event_timing_plot(path: Path, report: RunTimingReport, use_log=True) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     samples = report.event_timing_samples
     fig, ax = plt.subplots(figsize=(8, 4.5))
     if samples:
-        events = [int(item["event_count"]) for item in samples]
-
-        elapsed = [float(item["wall_elapsed_seconds"]) for item in samples]
-        ax.plot(events, elapsed, marker="o", linewidth=1.5, label="cumulative wall time")
+        events = np.asarray([int(item["event_count"]) for item in samples], dtype=float)
+        elapsed = np.asarray([float(item["wall_elapsed_seconds"]) for item in samples], dtype=float)
+        mask = np.isfinite(events) & np.isfinite(elapsed)
         if use_log:
-            ax.set_xscale('log')  # 这一行就够了，数据用原始 events
-            ax.set_xlabel("Discrete reaction event count (log scale)")
+            mask &= elapsed > 0.0
+        if np.any(mask):
+            ax.plot(events[mask], elapsed[mask], marker="o", linewidth=1.5, label="cumulative wall time")
         else:
-            ax.set_xlabel("Discrete reaction event count")
-        ax.set_ylabel("Wall time (s)")
+            ax.text(0.5, 0.5, "No positive timing samples", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlabel("Discrete reaction event count")
+        if use_log:
+            ax.set_yscale("log")
+            ax.set_ylabel("Wall time (s, log scale)")
+        else:
+            ax.set_ylabel("Wall time (s)")
         ax.grid(True, alpha=0.3)
         if len(samples) > 1:
             ax2 = ax.twinx()
-            interval_events = events[1:]
-            interval_elapsed = [float(item["interval_wall_seconds"]) for item in samples[1:]]
-            ax2.plot(interval_events, interval_elapsed, marker="x", color="tab:orange", linewidth=1.0, label="interval wall time")
-            ax2.set_ylabel("Interval wall time (s)")
+            interval_events = np.asarray(events[1:], dtype=float)
+            interval_elapsed = np.asarray(
+                [float(item["interval_wall_seconds"]) for item in samples[1:]],
+                dtype=float,
+            )
+            interval_mask = np.isfinite(interval_events) & np.isfinite(interval_elapsed)
+            if use_log:
+                interval_mask &= interval_elapsed > 0.0
+            if np.any(interval_mask):
+                ax2.plot(
+                    interval_events[interval_mask],
+                    interval_elapsed[interval_mask],
+                    marker="x",
+                    color="tab:orange",
+                    linewidth=1.0,
+                    label="interval wall time",
+                )
+            if use_log:
+                ax2.set_yscale("log")
+                ax2.set_ylabel("Interval wall time (s, log scale)")
+            else:
+                ax2.set_ylabel("Interval wall time (s)")
             lines, labels = ax.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
-            ax2.legend(lines + lines2, labels + labels2, loc="best")
+            if lines or lines2:
+                ax2.legend(lines + lines2, labels + labels2, loc="best")
         else:
             ax.legend(loc="best")
         ax.set_title(f"Runtime vs events: {report.stepper}, seed={report.seed}")
@@ -518,14 +545,30 @@ def _nearest_indices(x: np.ndarray, values: np.ndarray) -> np.ndarray:
     return order[nearest]
 
 
-def _plot_metric_line(ax, x: np.ndarray, y: np.ndarray, *, xlabel: str, ylabel: str, title: str) -> None:
+def _plot_metric_line(
+    ax,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    xlabel: str,
+    ylabel: str,
+    title: str,
+    log_y: bool = True,
+) -> None:
     finite = np.isfinite(x) & np.isfinite(y)
+    if log_y:
+        finite &= y > 0.0
     if not np.any(finite):
-        ax.text(0.5, 0.5, "No finite samples", ha="center", va="center", transform=ax.transAxes)
+        text = "No positive finite samples" if log_y else "No finite samples"
+        ax.text(0.5, 0.5, text, ha="center", va="center", transform=ax.transAxes)
     else:
         ax.plot(x[finite], y[finite], linewidth=1.4)
     ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+    if log_y:
+        ax.set_yscale("log")
+        ax.set_ylabel(f"{ylabel} (log scale)")
+    else:
+        ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
 

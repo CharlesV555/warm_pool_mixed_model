@@ -12,13 +12,13 @@ from polymer_sim import (
     ChannelBlock,
     ExperimentRunner,
     FixedPartitionStrategy,
-    FoodUpperLimitRestriction,
     HybridStepper,
     ReactionNetworkData,
     SSAStepper,
     TrajectoryRecorder,
     assign_random_longest_catalyst_to_all_channels,
     build_reaction_rule_tables,
+    format_stepper_info,
     generate_fixed_species_space,
 )
 
@@ -26,6 +26,7 @@ from polymer_sim import (
 ALPHABET = ("A", "B")
 INITIAL_FOOD_COUNT = 100.0
 FOOD_INFLOW_RATE = 5000.0
+FOOD_INFLOW_HILL_COEFFICIENT = 2.0
 FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 INITIAL_COUNTS = {
     name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
@@ -53,6 +54,8 @@ def build_network() -> ReactionNetworkData:
             for sid, name in enumerate(space.species_names)
             if name in ALPHABET
         ],
+        inflow_capacity=FOOD_MAX_COUNT,
+        inflow_hill_coefficient=FOOD_INFLOW_HILL_COEFFICIENT,
     )
 
     assign_random_longest_catalyst_to_all_channels(
@@ -64,24 +67,21 @@ def build_network() -> ReactionNetworkData:
     return network
 
 
-def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUpperLimitRestriction:
-    return FoodUpperLimitRestriction(
-        {
-            network.species_idx(name): INITIAL_FOOD_COUNT
-            for name in ALPHABET
-        }
-    )
+# Legacy restriction entry point.
+# Food limiting now lives inside formal INFLOW channel propensities through
+# inflow_capacity / inflow_hill_coefficient.
 
 
 def print_summary(label: str, summary) -> None:
     print(f"\n{label}")
+    print(format_stepper_info(summary.metadata))
     print(f"t={summary.final_time:.4f}, steps={summary.n_steps}, events={summary.n_events}")
     print(f"seed={summary.metadata.get('seed')}, final_state={summary.final_state}")
 
 
 def main() -> None:
     network = build_network()
-    restriction = build_food_upper_limit_restriction(network)
+    # restriction = build_food_upper_limit_restriction(network)
     runner = ExperimentRunner()
 
     ssa_recorder = TrajectoryRecorder()
@@ -91,7 +91,7 @@ def main() -> None:
         t_end=2.0,
         seed=123,
         recorder=ssa_recorder,
-        restriction=restriction,
+        # restriction=restriction,
     )
     print_summary("SSA summary", ssa.summary)
 
@@ -105,7 +105,7 @@ def main() -> None:
         seed=456,
         dt=0.05,
         recorder=hybrid_recorder,
-        restriction=restriction,
+        # restriction=restriction,
         partition_strategy=FixedPartitionStrategy([fast_channel]),
     )
     print_summary("Hybrid skeleton summary", hybrid.summary)

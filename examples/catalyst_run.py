@@ -15,13 +15,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from polymer_sim import (
     ExperimentRunner,
-    FoodUpperLimitRestriction,
     ReactionNetworkData,
     SSAStepper,
     TrajectoryRecorder,
     assign_random_longest_catalyst_to_all_channels,
     assign_random_longest_catalysts_to_distinct_channels,
     build_reaction_rule_tables,
+    format_stepper_info,
     generate_fixed_species_space,
     save_trajectory_record,
 )
@@ -39,6 +39,7 @@ K_RIGHT_SPLIT = 0.01
 K_NONFOOD_OUTFLOW = 0.5
 INITIAL_FOOD_COUNT = 100.0
 FOOD_INFLOW_RATE = 5000.0
+FOOD_INFLOW_HILL_COEFFICIENT = 2.0
 FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 CATALYSIS_MODE = "substrate_saturating"  # "linear" or "substrate_saturating"
 SATURATION_ALPHA = 0.01
@@ -80,6 +81,8 @@ def build_random_catalyst_network() -> tuple[ReactionNetworkData, dict]:
             for sid, name in enumerate(space.species_names)
             if name in ALPHABET
         ],
+        inflow_capacity=FOOD_MAX_COUNT,
+        inflow_hill_coefficient=FOOD_INFLOW_HILL_COEFFICIENT,
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
     )
@@ -128,13 +131,9 @@ def catalyst_species_names(network: ReactionNetworkData) -> list[str]:
     ]
 
 
-def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUpperLimitRestriction:
-    return FoodUpperLimitRestriction(
-        {
-            network.species_idx(name): INITIAL_FOOD_COUNT
-            for name in ALPHABET
-        }
-    )
+# Legacy restriction entry point.
+# Food limiting now lives inside formal INFLOW channel propensities through
+# inflow_capacity / inflow_hill_coefficient.
 
 
 def json_ready(value):
@@ -167,6 +166,7 @@ def example_parameters() -> dict:
         "initial_food_count": INITIAL_FOOD_COUNT,
         "effective_initial_counts": dict(INITIAL_COUNTS),
         "food_inflow_rate": FOOD_INFLOW_RATE,
+        "food_inflow_hill_coefficient": FOOD_INFLOW_HILL_COEFFICIENT,
         "food_max_count": FOOD_MAX_COUNT,
         "catalysis_mode": CATALYSIS_MODE,
         "saturation_alpha": SATURATION_ALPHA,
@@ -180,6 +180,7 @@ def example_parameters() -> dict:
 
 def print_run_summary(run_result, trajectory_record) -> None:
     print("\nSSA summary:")
+    print(format_stepper_info(run_result.summary.metadata))
     print(
         f"t={run_result.summary.final_time:.4f}, "
         f"steps={run_result.summary.n_steps}, "
@@ -204,13 +205,14 @@ def main() -> None:
     print(
         f"initial_food_count={INITIAL_FOOD_COUNT}, "
         f"food_inflow_rate={FOOD_INFLOW_RATE}, "
+        f"food_inflow_hill={FOOD_INFLOW_HILL_COEFFICIENT}, "
         f"food_max_count={FOOD_MAX_COUNT}"
     )
     print(f"catalyst species={catalyst_species_names(network)}")
     print(f"catalyzed channels={catalyzed_channel_count(network)}")
 
     recorder = TrajectoryRecorder()
-    restriction = build_food_upper_limit_restriction(network)
+    # restriction = build_food_upper_limit_restriction(network)
     t0 = perf_counter()
     build_elapsed = perf_counter() - t0
 
@@ -221,7 +223,7 @@ def main() -> None:
         seed=SEED,
         recorder=recorder,
         max_steps=MAX_STEPS,
-        restriction=restriction,
+        # restriction=restriction,
         max_runtime_seconds=MAX_TIMES,
         timing_report=True,
         timing_report_dir="timing_reports",

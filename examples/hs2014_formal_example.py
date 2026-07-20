@@ -8,7 +8,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from polymer_sim import (
     ExperimentRunner,
-    FoodUpperLimitRestriction,
     SSAStepper,
     TrajectoryRecorder,
     assign_paper_minimal_catalysis,
@@ -16,6 +15,7 @@ from polymer_sim import (
     build_n3_wh_reactions,
     compute_max_raf,
     enumerate_irr_rafs,
+    format_stepper_info,
     save_trajectory_record,
 )
 
@@ -27,6 +27,7 @@ K_RIGHT_ADD = 0.1
 K_NONFOOD_OUTFLOW = 0.8
 INITIAL_FOOD_COUNT = 10.0
 FOOD_INFLOW_RATE = 1000.0
+FOOD_INFLOW_HILL_COEFFICIENT = 2.0
 FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 INITIAL_COUNTS = {
     "0": min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT),
@@ -56,13 +57,9 @@ def print_static_raf_result(max_raf, irr_rafs) -> None:
         print(f"  irrRAF {idx}: {labels}")
 
 
-def build_food_upper_limit_restriction(network) -> FoodUpperLimitRestriction:
-    return FoodUpperLimitRestriction(
-        {
-            network.species_idx("0"): INITIAL_FOOD_COUNT,
-            network.species_idx("1"): INITIAL_FOOD_COUNT,
-        }
-    )
+# Legacy restriction entry point.
+# Food limiting now lives inside formal INFLOW channel propensities through
+# food_inflow_capacity / food_inflow_hill_coefficient.
 
 
 def print_run_summary(run_result, trajectory_record) -> None:
@@ -75,6 +72,7 @@ def print_run_summary(run_result, trajectory_record) -> None:
     )
 
     print("\nSSA summary:")
+    print("  " + format_stepper_info(run_result.summary.metadata))
     print(
         "  "
         f"t={run_result.summary.final_time:.4f}, "
@@ -109,6 +107,8 @@ def main() -> None:
         k_right_add=K_RIGHT_ADD,
         k_nonfood_outflow=K_NONFOOD_OUTFLOW,
         k_food_inflow=FOOD_INFLOW_RATE,
+        food_inflow_capacity=FOOD_MAX_COUNT,
+        food_inflow_hill_coefficient=FOOD_INFLOW_HILL_COEFFICIENT,
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
     )
@@ -143,23 +143,23 @@ def main() -> None:
     # to change is the ExperimentRunner.run_one(...) call below.
     #
     # Restriction entry point:
-    # Food input is represented by formal INFLOW channels in the network.
-    # The restriction below only caps food from above; it does not replenish
-    # food to a fixed count.
+    # Food input and its soft upper limit are represented by formal INFLOW
+    # channels. The old FoodUpperLimitRestriction call is intentionally not
+    # used so event-driven steppers can keep their local caches.
     #
     # Runtime cutoff entry point:
     # If MAX_TIMES is not None, runner will stop when wall-clock runtime reaches
     # that limit, even if t_end has not been reached yet.
     runner = ExperimentRunner()
     recorder = TrajectoryRecorder()
-    restriction = build_food_upper_limit_restriction(network)
+    # restriction = build_food_upper_limit_restriction(network)
     run_result = runner.run_one(
         network,
         stepper,
         t_end=T_END,
         seed=SEED,
         recorder=recorder,
-        restriction=restriction,
+        # restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
     )
@@ -174,7 +174,7 @@ def main() -> None:
 
     print_run_summary(run_result, trajectory_record)
     print(f"  trajectory saved to: {output_path}")
-    print("  hs2014 model enabled: formal OUTFLOW/INFLOW channels + food upper-limit restriction")
+    print("  hs2014 model enabled: formal OUTFLOW/INFLOW channels with Hill-like food inflow cap")
 
 
 if __name__ == "__main__":

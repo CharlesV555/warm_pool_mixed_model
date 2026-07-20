@@ -14,8 +14,8 @@ from multiple_run_core import MultipleRunConfig, run_config, run_methods
 
 
 # Main entry configuration:
-# - Single-method run: METHODS = "ssa" or ("ssa",)
-# - Method comparison: METHODS = ("ssa", "blended")
+# - Single-method run: METHODS = "ssa", "optimized_nrm", or ("ssa",)
+# - Method comparison: METHODS = ("ssa", "optimized_nrm") or ("ssa", "blended")
 METHODS = ("ssa", "blended")
 NETWORK_SOURCE = "oscillator"  # "random", "oscillator", or "cross_catalysis"
 N_RUNS = 2
@@ -31,8 +31,9 @@ OUTPUT_DIR = EXAMPLES_DIR / "method_run_outputs"
 SAVE_TRAJECTORIES = True
 
 # Network and food handling are selected in multiple_run_core.build_shared_objects().
-# All built-in sources use formal INFLOW channels plus FoodUpperLimitRestriction,
-# so all methods compare the same capped finite-reservoir model.
+# Built-in sources use formal INFLOW channels with a Hill-like capacity factor,
+# so all methods compare the same capped finite-reservoir model without an
+# external food restriction.
 
 COMPUTE_STRATEGY = ComputeStrategy(
     backend="process",  # "process", "thread", or "serial"

@@ -7,7 +7,62 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 
-from polymer_sim.recording.summary import load
+from polymer_sim.recording.summary import format_stepper_info, load
+
+
+def test_format_stepper_info_includes_scalar_config():
+    text = format_stepper_info(
+        {
+            "stepper_info": {
+                "name": "BlendedHybridStepper",
+                "config": {
+                    "dt_cle": 0.01,
+                    "dt_macro": None,
+                    "use_reaction_interval_dt": True,
+                },
+            }
+        }
+    )
+
+    assert "stepper=BlendedHybridStepper" in text
+    assert "dt_cle=0.01" in text
+    assert "dt_macro=None" in text
+    assert "use_reaction_interval_dt=True" in text
+
+
+def test_load_batch_metadata_without_restriction_block():
+    metadata_path = Path("tests") / "_summary_no_restriction_metadata_tmp.json"
+    try:
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "shared": {
+                        "methods": ["ssa"],
+                        "n_species": 2,
+                    },
+                    "runs": [
+                        {
+                            "mode": "ssa",
+                            "seed": 1,
+                            "simulation_final_time": 0.1,
+                            "n_steps": 1,
+                            "n_events": 1,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        batch = load(metadata_path)
+
+        assert "restriction" not in batch.shared
+        assert len(batch.runs) == 1
+        assert batch.runs[0].mode == "ssa"
+        assert batch.runs[0].simulation_time == 0.1
+    finally:
+        if metadata_path.exists():
+            metadata_path.unlink()
 
 
 def test_dt_compare_averages_simulation_time_by_blended_dt_pair():

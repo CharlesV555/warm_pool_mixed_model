@@ -19,6 +19,11 @@ def clear_all_catalysis(network, *, rebuild: bool = True) -> None:
         network.cat_inflow.fill(0.0)
     if rebuild:
         network.rebuild_dependency_indices()
+    else:
+        if hasattr(network, "channel_has_catalysts"):
+            network.channel_has_catalysts.fill(False)
+        if hasattr(network, "dependency_indices_dirty"):
+            network.dependency_indices_dirty = True
 
 
 def longest_polymer_species_ids(network) -> np.ndarray:

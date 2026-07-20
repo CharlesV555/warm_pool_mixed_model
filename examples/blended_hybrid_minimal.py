@@ -19,13 +19,14 @@ from polymer_sim import (
     BlendedHybridStepper,
     ExperimentRunner,
     TrajectoryRecorder,
+    format_stepper_info,
     save_trajectory_record,
 )
 
 
 # Keep the same reaction network, catalysis assignment, rates, outflow, and
-# formal INFLOW/food-cap restriction as catalyst_run.py, but use a short
-# horizon for this smoke test.
+# formal INFLOW food cap as catalyst_run.py, but use a short horizon for this
+# smoke test.
 T_END = 2.0
 SEED = catalyst_run.SEED
 MAX_STEPS = catalyst_run.MAX_STEPS
@@ -39,7 +40,7 @@ OUTPUT_PATH = EXAMPLES_DIR / "blended_hybrid_minimal_trajectory.npz"
 
 def main() -> None:
     network, catalysis_result = catalyst_run.build_random_catalyst_network()
-    restriction = catalyst_run.build_food_upper_limit_restriction(network)
+    # restriction = catalyst_run.build_food_upper_limit_restriction(network)
     stepper = BlendedHybridStepper(
         BlendedHybridConfig(
             i1=BLENDED_I1,
@@ -60,7 +61,7 @@ def main() -> None:
         t_end=T_END,
         seed=SEED,
         recorder=recorder,
-        restriction=restriction,
+        # restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
         timing_report=True,
@@ -83,6 +84,7 @@ def main() -> None:
     print(f"n_steps: {result.summary.n_steps}")
     print(f"n_events: {result.summary.n_events}")
     print(f"stop_reason: {result.summary.metadata.get('stop_reason')}")
+    print(format_stepper_info(result.summary.metadata))
     print(f"final total abundance: {float(result.summary.final_state.sum()):.4f}")
     print(f"max species count: {float(result.summary.final_state.max()):.4f}")
     print(f"trajectory saved to: {OUTPUT_PATH}")

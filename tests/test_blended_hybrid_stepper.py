@@ -5,9 +5,11 @@ from polymer_sim import (
     BlendedHybridStepper,
     ChannelBlock,
     ExperimentRunner,
+    NRMBlendedHybridStepper,
     ReactionNetworkData,
     StepperContext,
     SystemState,
+    TrajectoryRecorder,
     build_reaction_rule_tables,
     generate_fixed_species_space,
 )
@@ -79,6 +81,98 @@ def test_blended_hybrid_mixed_branch_smoke():
         assert np.all(np.isfinite(state.x))
         assert np.all(state.x >= 0.0)
     assert modes <= {"mixed_cle", "mixed_jump", "ssa", "cle"}
+
+
+def test_nrm_blended_pure_cle_branch_has_no_discrete_event():
+    network = make_network()
+    state = SystemState.from_x0(network.x0)
+    stepper = NRMBlendedHybridStepper(BlendedHybridConfig(i1=-2.0, i2=-1.0, dt_cle=0.01))
+    result = stepper.step(
+        state,
+        0.01,
+        StepperContext(network=network, rng=np.random.default_rng(20)),
+    )
+    assert result.details["mode"] == "nrm_blended_cle"
+    assert result.channel_id is None
+    assert not result.event_occurred
+    assert np.all(np.isfinite(state.x))
+    assert np.all(state.x >= 0.0)
+
+
+def test_nrm_blended_pure_nrm_branch_keeps_state_valid():
+    network = make_network()
+    state = SystemState.from_x0(network.x0)
+    stepper = NRMBlendedHybridStepper(BlendedHybridConfig(i1=1_000.0, i2=2_000.0, dt_cle=0.01))
+    result = stepper.step(
+        state,
+        0.01,
+        StepperContext(network=network, rng=np.random.default_rng(21)),
+    )
+    assert result.details["mode"] == "nrm_blended_nrm"
+    assert np.all(np.isfinite(state.x))
+    assert np.all(state.x >= 0.0)
+
+
+def test_nrm_blended_mixed_branch_schedules_multiple_discrete_events():
+    space = generate_fixed_species_space(
+        ["A"],
+        max_len=1,
+        initial_counts={"A": 20.0},
+    )
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_outflow=200.0,
+        outflow_species_ids=[space.idx("A")],
+    )
+    state = SystemState.from_x0(network.x0)
+    stepper = NRMBlendedHybridStepper(BlendedHybridConfig(i1=10.0, i2=110.0, dt_cle=0.01))
+
+    result = stepper.step(
+        state,
+        0.01,
+        StepperContext(network=network, rng=np.random.default_rng(22)),
+    )
+
+    assert result.details["mode"] == "nrm_blended_mixed"
+    assert result.details["n_scheduled_discrete_events"] > 1
+    assert result.details["n_applied_discrete_events"] == len(result.details["discrete_event_ids"])
+    assert result.details["n_applied_discrete_events"] == len(result.details["discrete_event_times"])
+    assert state.event_count == result.details["n_applied_discrete_events"]
+    assert state.t == 0.01
+    assert np.all(np.isfinite(state.x))
+    assert np.all(state.x >= 0.0)
+
+
+def test_nrm_blended_runner_records_multiple_discrete_events():
+    space = generate_fixed_species_space(
+        ["A"],
+        max_len=1,
+        initial_counts={"A": 20.0},
+    )
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_outflow=200.0,
+        outflow_species_ids=[space.idx("A")],
+    )
+    recorder = TrajectoryRecorder()
+    result = ExperimentRunner().run_one(
+        network,
+        NRMBlendedHybridStepper(BlendedHybridConfig(i1=10.0, i2=110.0, dt_cle=0.01)),
+        t_end=0.01,
+        seed=22,
+        recorder=recorder,
+        max_steps=1,
+    )
+    record = recorder.finalize()
+
+    assert result.summary.n_events > 1
+    assert len(record.run_metadata["channel_event_ids"]) == result.summary.n_events
+    assert len(record.run_metadata["channel_event_times"]) == result.summary.n_events
+    assert sum(record.run_metadata["channel_trigger_counts"]) == result.summary.n_events
 
 
 def test_blended_hybrid_splits_outflow_channels_like_reactions():

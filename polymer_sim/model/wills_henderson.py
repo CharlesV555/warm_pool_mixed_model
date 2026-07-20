@@ -47,6 +47,8 @@ def build_n3_wh_network(
     k_trimer_outflow: float = 0.0,
     k_nonfood_outflow: float | None = None,
     k_food_inflow: float = 0.0,
+    food_inflow_capacity: float | None = None,
+    food_inflow_hill_coefficient: float = 1.0,
     food_species: tuple[str, ...] = ("0", "1"),
     catalysis_mode: str = "linear",
     saturation_alpha: float = 0.25,
@@ -83,6 +85,8 @@ def build_n3_wh_network(
         outflow_species_ids=nonfood_species_ids if outflow_rate > 0.0 else None,
         k_inflow=float(k_food_inflow),
         inflow_species_ids=food_species_ids if float(k_food_inflow) > 0.0 else None,
+        inflow_capacity=food_inflow_capacity,
+        inflow_hill_coefficient=food_inflow_hill_coefficient,
         catalysis_mode=catalysis_mode,
         saturation_alpha=saturation_alpha,
     )

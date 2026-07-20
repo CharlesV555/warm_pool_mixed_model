@@ -126,26 +126,48 @@ class TrajectoryRecorder(BaseRecorder):
             if not np.all(np.isfinite(increments)):
                 raise ValueError("continuous_channel_abs_increments contains non-finite values")
             self._channel_continuous_trigger_counts += np.maximum(increments, 0.0)
+        discrete_event_ids = step_metadata.pop("discrete_event_ids", None)
+        discrete_event_times = step_metadata.pop("discrete_event_times", None)
         channel_id = step_metadata.get("channel_id")
-        is_reaction_event = channel_id is not None or event_time is not None
+        if discrete_event_ids is not None:
+            event_ids = [int(cid) for cid in np.asarray(discrete_event_ids, dtype=np.int64).tolist()]
+        elif channel_id is not None:
+            event_ids = [int(channel_id)]
+        else:
+            event_ids = []
+        if discrete_event_times is not None:
+            event_times = [float(value) for value in np.asarray(discrete_event_times, dtype=float).tolist()]
+            if len(event_times) != len(event_ids):
+                raise ValueError("discrete_event_times must have the same length as discrete_event_ids")
+        elif event_ids:
+            event_times = [float(event_time if event_time is not None else time) for _ in event_ids]
+        else:
+            event_times = []
+        is_reaction_event = bool(event_ids) or event_time is not None
         if step_metadata:
             self._metadata.update(step_metadata)
         if is_reaction_event:
             event_timestamp = float(event_time if event_time is not None else time)
-            if channel_id is not None and self._channel_trigger_counts is not None:
-                self._channel_trigger_counts[int(channel_id)] += 1
-                self._channel_event_times.append(event_timestamp)
-                self._channel_event_ids.append(int(channel_id))
-            interval = event_timestamp - self._last_reaction_event_time
-            self._reaction_intervals.append(float(max(interval, 0.0)))
-            self._reaction_interval_times.append(event_timestamp)
-            self._last_reaction_event_time = event_timestamp
+            if event_ids:
+                for cid, event_timestamp in zip(event_ids, event_times):
+                    if self._channel_trigger_counts is not None:
+                        self._channel_trigger_counts[int(cid)] += 1
+                        self._channel_event_times.append(float(event_timestamp))
+                        self._channel_event_ids.append(int(cid))
+                    interval = float(event_timestamp) - self._last_reaction_event_time
+                    self._reaction_intervals.append(float(max(interval, 0.0)))
+                    self._reaction_interval_times.append(float(event_timestamp))
+                    self._last_reaction_event_time = float(event_timestamp)
+            else:
+                interval = event_timestamp - self._last_reaction_event_time
+                self._reaction_intervals.append(float(max(interval, 0.0)))
+                self._reaction_interval_times.append(event_timestamp)
+                self._last_reaction_event_time = event_timestamp
         if self._tracked_outflow_species:
             outflow_row = [0.0 for _ in self._tracked_outflow_species]
-            if step_metadata:
-                channel_id = step_metadata.get("channel_id")
-                if channel_id is not None and int(channel_id) in self._tracked_outflow_channel_to_col:
-                    outflow_row[self._tracked_outflow_channel_to_col[int(channel_id)]] = 1.0
+            for cid in event_ids:
+                if int(cid) in self._tracked_outflow_channel_to_col:
+                    outflow_row[self._tracked_outflow_channel_to_col[int(cid)]] += 1.0
             self._tracked_outflow_times.append(float(time))
             self._tracked_outflow_removed.append(outflow_row)
         self._metadata["n_steps"] = int(step_count)

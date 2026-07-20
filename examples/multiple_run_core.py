@@ -27,15 +27,18 @@ from polymer_sim import (
     ExperimentRunner,
     FixedPartitionStrategy,
     HybridStepper,
+    NRMBlendedHybridStepper,
+    OptimizedNRMStepper,
     ReactionNetworkData,
     SSAStepper,
     TrajectoryRecorder,
+    format_stepper_info,
     save_trajectory_record,
 )
 
-# Food handling is inherited from catalyst_run.py: formal INFLOW channels plus
-# FoodUpperLimitRestriction. This keeps every method on the same capped
-# finite-reservoir model.
+# Food handling is inherited from each network builder: formal INFLOW channels
+# include a Hill-like capacity factor, so no external food restriction is
+# passed through the runner by default.
 
 @dataclass(slots=True)
 class MultipleRunConfig:
@@ -202,19 +205,21 @@ def normalize_methods(methods: str | Sequence[str]) -> tuple[str, ...]:
     normalized = tuple(method.lower() for method in values)
     if not normalized:
         raise ValueError("methods must contain at least one method")
-    allowed = {"ssa", "cle", "hybrid", "blended"}
+    allowed = {"ssa", "optimized_nrm", "nrm", "cle", "hybrid", "blended", "nrm_blended", "blended_nrm"}
     unknown = sorted(set(normalized) - allowed)
     if unknown:
         raise ValueError(f"unknown method(s): {unknown}; allowed methods are {sorted(allowed)}")
     return normalized
 
 
-def build_shared_objects(network_source: str = "random") -> tuple[ReactionNetworkData, dict, BaseRestriction, dict]:
+def build_shared_objects(network_source: str = "random") -> tuple[ReactionNetworkData, dict, BaseRestriction | None, dict]:
     source_key, module_name, builder_name = _network_source_spec(network_source)
     module = importlib.import_module(module_name)
     builder = getattr(module, builder_name)
     network, catalysis_result = builder()
-    restriction = module.build_food_upper_limit_restriction(network)
+    # Legacy path:
+    # restriction = module.build_food_upper_limit_restriction(network)
+    restriction = None
     metadata = _network_source_metadata(source_key, module, network, catalysis_result)
     return network, catalysis_result, restriction, metadata
 
@@ -251,26 +256,7 @@ def _network_source_metadata(
         "example_parameters": json_ready(example_parameters),
         "catalysis_assignment": json_ready(catalysis_result),
         "catalyst_species_names": json_ready(catalyst_species_names),
-        "restriction": _restriction_metadata_from_module(module),
     }
-
-
-def _restriction_metadata_from_module(module) -> dict[str, object]:
-    return {
-        "type": "FoodUpperLimitRestriction",
-        "food_species": list(getattr(module, "ALPHABET", ())),
-        "initial_food_count": _optional_float_attr(module, "INITIAL_FOOD_COUNT"),
-        "effective_initial_counts": dict(getattr(module, "INITIAL_COUNTS", {})),
-        "food_inflow_rate": _optional_float_attr(module, "FOOD_INFLOW_RATE"),
-        "food_max_count": _optional_float_attr(module, "FOOD_MAX_COUNT"),
-    }
-
-
-def _optional_float_attr(module, name: str) -> float | None:
-    if not hasattr(module, name):
-        return None
-    value = getattr(module, name)
-    return None if value is None else float(value)
 
 
 def make_run_seeds(base_seed: int, n_runs: int) -> list[int]:
@@ -453,7 +439,7 @@ def _task_record(
 
 def run_tasks(
     network: ReactionNetworkData,
-    restriction: BaseRestriction,
+    restriction: BaseRestriction | None,
     tasks: Sequence[dict[str, object]],
     compute_strategy: ComputeStrategy,
 ) -> list[dict[str, object]]:
@@ -476,14 +462,14 @@ def run_tasks(
     raise ValueError("compute_strategy.backend must be 'process', 'thread', or 'serial'")
 
 
-def _initialize_worker(network: ReactionNetworkData, restriction: BaseRestriction) -> None:
+def _initialize_worker(network: ReactionNetworkData, restriction: BaseRestriction | None) -> None:
     global _SHARED_NETWORK, _SHARED_RESTRICTION
     _SHARED_NETWORK = network
     _SHARED_RESTRICTION = restriction
 
 
 def _run_one_task(task: dict[str, object]) -> dict[str, object]:
-    if _SHARED_NETWORK is None or _SHARED_RESTRICTION is None:
+    if _SHARED_NETWORK is None:
         raise RuntimeError("worker has not been initialized")
     network = _SHARED_NETWORK
     restriction = _SHARED_RESTRICTION
@@ -534,6 +520,8 @@ def _run_one_task(task: dict[str, object]) -> dict[str, object]:
         "method_order": int(task["method_order"]),
         "mode": method,
         "stepper_method": method,
+        "stepper_name": summary.metadata.get("stepper_name"),
+        "stepper_info": summary.metadata.get("stepper_info"),
         "blended_dt_pair_order": _json_int_or_none(task["blended_dt_pair_order"]),
         "blended_dt_cle_order": _json_int_or_none(task["blended_dt_cle_order"]),
         "blended_dt_macro_order": _json_int_or_none(task["blended_dt_macro_order"]),
@@ -585,6 +573,8 @@ def _trajectory_metadata(
         "max_runtime_seconds": task["max_runtime_seconds"],
         "wall_runtime_seconds": float(wall_runtime),
         "stepper_dt": None if dt is None else float(dt),
+        "stepper_name": summary_metadata.get("stepper_name"),
+        "stepper_info": summary_metadata.get("stepper_info"),
         "stop_reason": summary_metadata.get("stop_reason"),
     }
 
@@ -605,6 +595,8 @@ def make_stepper(
     name = str(method).lower()
     if name == "ssa":
         return SSAStepper(), None, None if stepper_dt is None else float(stepper_dt)
+    if name in {"optimized_nrm", "nrm"}:
+        return OptimizedNRMStepper(), None, None if stepper_dt is None else float(stepper_dt)
     if name == "cle":
         dt = _require_dt(name, stepper_dt)
         return CLEStepper(), _fixed_partition(network, cle_fast_channel_ids), dt
@@ -623,7 +615,22 @@ def make_stepper(
             reaction_interval_update_steps=blended_reaction_interval_update_steps,
         )
         return BlendedHybridStepper(config), None, None
-    raise ValueError("method must be 'ssa', 'cle', 'hybrid', or 'blended'")
+    if name in {"nrm_blended", "blended_nrm"}:
+        if blended_dt_cle is None:
+            raise ValueError("blended_dt_cle must be set for nrm_blended tasks")
+        config = BlendedHybridConfig(
+            i1=blended_i1,
+            i2=blended_i2,
+            dt_cle=blended_dt_cle,
+            dt_macro=blended_dt_macro,
+            use_reaction_interval_dt=blended_use_reaction_interval_dt,
+            reaction_interval_update_steps=blended_reaction_interval_update_steps,
+        )
+        return NRMBlendedHybridStepper(config), None, None
+    raise ValueError(
+        "method must be 'ssa', 'optimized_nrm', 'nrm', 'cle', 'hybrid', "
+        "'blended', or 'nrm_blended'"
+    )
 
 
 def _require_dt(method: str, stepper_dt: float | None) -> float:
@@ -692,7 +699,6 @@ def metadata_payload(
             "example_parameters": network_metadata.get("example_parameters", {}),
             "catalysis_assignment": network_metadata.get("catalysis_assignment", catalysis_result),
             "catalyst_species_names": network_metadata.get("catalyst_species_names", []),
-            "restriction": network_metadata.get("restriction", {}),
             "blended_config": {
                 "i1": float(config.blended_i1),
                 "i2": float(config.blended_i2),
@@ -724,6 +730,11 @@ def print_run_summary(payload: dict[str, object], metadata_path: Path, trajector
         f"backend={shared['compute_strategy']['backend']}, "
         f"workers={shared['compute_strategy']['n_workers']}"
     )
+    print("  stepper settings:")
+    for method in shared["methods"]:
+        selected = [item for item in runs if item["mode"] == method]
+        if selected:
+            print("    " + format_stepper_info(selected[0]))
     print(f"  requested_t_end={shared['requested_t_end']}, max_runtime_seconds={shared['max_runtime_seconds']}")
     print(
         f"  simulation_final_time: min={final_times.min():.4f}, "

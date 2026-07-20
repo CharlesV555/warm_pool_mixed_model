@@ -24,7 +24,7 @@ from polymer_sim.recording.plot_single_run import (
     plot_time_series,
 )
 from polymer_sim.recording.plot_summary import plot_summary_pipeline
-from polymer_sim.recording.summary import RunSummary, SummaryRecorder, load_summary, save_summary
+from polymer_sim.recording.summary import RunSummary, SummaryRecorder, format_stepper_info, load_summary, save_summary
 from polymer_sim.recording.timing import (
     RunTimingReport,
     TimingRecorder,
@@ -52,6 +52,7 @@ __all__ = [
     "TimingSummary",
     "TrajectoryRecord",
     "TrajectoryRecorder",
+    "format_stepper_info",
     "load_summary",
     "load_timing_summary",
     "load_trajectory_record",

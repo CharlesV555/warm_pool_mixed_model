@@ -84,11 +84,16 @@ def test_runner_can_write_timing_report():
         assert dt_cle_metrics_plot_path.exists()
 
         payload = json.loads(json_path.read_text(encoding="utf-8"))
+        assert result.summary.metadata["stepper_name"] == "SSAStepper"
+        assert result.summary.metadata["stepper_info"]["name"] == "SSAStepper"
         assert payload["seed"] == 3
         assert payload["stepper"] == "SSAStepper"
+        assert payload["metadata"]["stepper_name"] == "SSAStepper"
+        assert payload["metadata"]["stepper_info"]["name"] == "SSAStepper"
         assert payload["runner_setup_wall_seconds"] >= 0.0
         assert payload["simulation_loop_wall_seconds"] >= 0.0
         assert payload["step_wall_seconds"] >= 0.0
+        assert "restriction_wall_seconds" not in payload
         assert payload["simulation_clock_interval"] == 0.01
         assert "simulation_clock_samples" in payload
     finally:

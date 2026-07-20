@@ -16,11 +16,11 @@ from polymer_sim import (
     BlendedHybridStepper,
     ChannelBlock,
     ExperimentRunner,
-    FoodUpperLimitRestriction,
     ReactionNetworkData,
     TrajectoryRecorder,
     build_reaction_rule_tables,
     clear_all_catalysis,
+    format_stepper_info,
     generate_fixed_species_space,
     save_trajectory_record,
 )
@@ -39,6 +39,7 @@ CATALYSIS_MODE = "linear"
 SATURATION_ALPHA = 0.01
 INITIAL_FOOD_COUNT = 50.0
 FOOD_INFLOW_RATE = 500.0
+FOOD_INFLOW_HILL_COEFFICIENT = 2.0
 FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 INITIAL_COUNTS = {
     name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
@@ -91,6 +92,8 @@ def build_oscillator_network() -> tuple[ReactionNetworkData, dict]:
             for sid, name in enumerate(space.species_names)
             if name in ALPHABET
         ],
+        inflow_capacity=FOOD_MAX_COUNT,
+        inflow_hill_coefficient=FOOD_INFLOW_HILL_COEFFICIENT,
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
     )
@@ -246,13 +249,9 @@ def catalyst_species_names(network: ReactionNetworkData) -> list[str]:
     ]
 
 
-def build_food_upper_limit_restriction(network: ReactionNetworkData) -> FoodUpperLimitRestriction:
-    return FoodUpperLimitRestriction(
-        {
-            network.species_idx(name): INITIAL_FOOD_COUNT
-            for name in ALPHABET
-        }
-    )
+# Legacy restriction entry point.
+# Food limiting now lives inside formal INFLOW channel propensities through
+# inflow_capacity / inflow_hill_coefficient.
 
 
 def json_ready(value):
@@ -286,6 +285,7 @@ def example_parameters() -> dict:
         "initial_food_count": INITIAL_FOOD_COUNT,
         "effective_initial_counts": dict(INITIAL_COUNTS),
         "food_inflow_rate": FOOD_INFLOW_RATE,
+        "food_inflow_hill_coefficient": FOOD_INFLOW_HILL_COEFFICIENT,
         "food_max_count": FOOD_MAX_COUNT,
         "catalysis_mode": CATALYSIS_MODE,
         "saturation_alpha": SATURATION_ALPHA,
@@ -304,6 +304,7 @@ def example_parameters() -> dict:
 
 def print_run_summary(run_result, trajectory_record) -> None:
     print("\nOscillator blended hybrid summary:")
+    print(format_stepper_info(run_result.summary.metadata))
     print(
         f"t={run_result.summary.final_time:.4f}, "
         f"steps={run_result.summary.n_steps}, "
@@ -319,7 +320,7 @@ def print_run_summary(run_result, trajectory_record) -> None:
 
 def main() -> None:
     network, catalysis_result = build_oscillator_network()
-    restriction = build_food_upper_limit_restriction(network)
+    # restriction = build_food_upper_limit_restriction(network)
     stepper = BlendedHybridStepper(
         BlendedHybridConfig(
             i1=BLENDED_I1,
@@ -347,7 +348,7 @@ def main() -> None:
         t_end=T_END,
         seed=SEED,
         recorder=recorder,
-        restriction=restriction,
+        # restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
         network_build_elapsed_seconds=build_elapsed,
