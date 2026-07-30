@@ -7,17 +7,26 @@ from typing import Any
 
 import numpy as np
 
+from polymer_sim.core.elementary import ElementaryMassActionNetwork
 from polymer_sim.core.enums import ChannelBlock
 from polymer_sim.core.network import ReactionNetworkData
 from polymer_sim.core.state import SystemState
+from polymer_sim.partition.pdmp import (
+    FixedPDMPPartitionStrategy,
+    LinearCatalysisScalingPDMPPartitionStrategy,
+    PDMPPartitionResult,
+    PDMPPartitionStrategy,
+    ScalingPDMPConfig,
+    ScalingPDMPPartitionStrategy,
+)
 from polymer_sim.partition.strategies import BlendingStrategy, FixedPartitionStrategy, NoBlendingStrategy, PartitionStrategy
 
 
 @dataclass(slots=True)
 class StepperContext:
-    network: ReactionNetworkData
+    network: ReactionNetworkData | ElementaryMassActionNetwork
     rng: np.random.Generator
-    partition_strategy: PartitionStrategy | None = None
+    partition_strategy: PartitionStrategy | PDMPPartitionStrategy | None = None
     blending_strategy: BlendingStrategy | None = None
     fast_channels: np.ndarray | None = None
 
@@ -52,6 +61,39 @@ class OptimizedNRMConfig:
             raise ValueError("propensity_tol must be >= 0")
         if self.heap_rebuild_factor < 1.0:
             raise ValueError("heap_rebuild_factor must be >= 1")
+
+
+@dataclass(slots=True)
+class PDMPConfig:
+    """Configuration for the adaptive PDMP stepper.
+
+    The current implementation follows the paper's Algorithm 1 structure with a
+    lightweight Euler integrator for continuous channels and integrated hazards
+    for discrete channels.  A later implementation can replace the Euler loop
+    with an ODE solver plus event root finding without changing the runner
+    interface.
+    """
+
+    ode_step: float = 0.01
+    adaptive: bool = True
+    repartition_on_event: bool = True
+    repartition_on_bounds: bool = True
+    validate_nonnegative: bool = True
+    hazard_tol: float = 1e-12
+    diagnostics: bool = True
+
+    def __post_init__(self) -> None:
+        self.ode_step = float(self.ode_step)
+        self.adaptive = bool(self.adaptive)
+        self.repartition_on_event = bool(self.repartition_on_event)
+        self.repartition_on_bounds = bool(self.repartition_on_bounds)
+        self.validate_nonnegative = bool(self.validate_nonnegative)
+        self.hazard_tol = float(self.hazard_tol)
+        self.diagnostics = bool(self.diagnostics)
+        if self.ode_step <= 0.0:
+            raise ValueError("ode_step must be > 0")
+        if self.hazard_tol < 0.0:
+            raise ValueError("hazard_tol must be >= 0")
 
 
 @dataclass(slots=True)
@@ -543,6 +585,536 @@ class OptimizedNRMStepper(BaseStepper):
         if self._versions is None:
             raise RuntimeError("optimized NRM is not initialized")
         return self._versions
+
+
+def _pdmp_partition_strategy_from_method(
+    partition_method: str,
+    partition_config: ScalingPDMPConfig | None,
+) -> PDMPPartitionStrategy:
+    method = str(partition_method).lower()
+    config = partition_config or ScalingPDMPConfig()
+    if method in {"scaling", "scaling_lp", "algorithm3"}:
+        return ScalingPDMPPartitionStrategy(config)
+    if method in {"linear_catalysis", "linear_catalysis_scaling", "linear_catalysis_scaling_lp"}:
+        return LinearCatalysisScalingPDMPPartitionStrategy(config)
+    raise ValueError(
+        "partition_method must be one of "
+        "'scaling', 'scaling_lp', 'algorithm3', "
+        "'linear_catalysis', 'linear_catalysis_scaling', or 'linear_catalysis_scaling_lp'"
+    )
+
+
+class PDMPStepper(BaseStepper):
+    """Adaptive PDMP stepper for mass-action and direct-catalysis network views.
+
+    This implements the Algorithm-1 execution pattern:
+    - continuous channels contribute deterministic drift;
+    - discrete channels keep independent exponential firing thresholds;
+    - discrete hazards are accumulated while the continuous state evolves;
+    - adaptive repartitioning can run after jumps or when scaling bounds are left.
+
+    The default scaling partition follows the elementary mass-action view.  Set
+    ``partition_method="linear_catalysis_scaling"`` to run the direct
+    effective-catalysis scaling partition on ``ReactionNetworkData``.
+    """
+
+    def __init__(
+        self,
+        partition_strategy: PDMPPartitionStrategy | PartitionStrategy | None = None,
+        partition_method: str = "scaling",
+        partition_config: ScalingPDMPConfig | None = None,
+        config: PDMPConfig | None = None,
+    ):
+        self.partition_method = str(partition_method)
+        self.partition_config = partition_config
+        self.partition_strategy = partition_strategy or _pdmp_partition_strategy_from_method(
+            self.partition_method,
+            self.partition_config,
+        )
+        self.config = config or PDMPConfig()
+        self._invalidated = False
+
+    def invalidate_cache(self) -> None:
+        self._invalidated = True
+
+    def step(self, state: SystemState, dt: float, context: StepperContext) -> StepResult:
+        network = self._pdmp_network(context.network)
+        duration = float(dt)
+        if duration <= 0.0:
+            return StepResult(advanced_time=0.0, event_occurred=False, details={"mode": "pdmp_no_dt"})
+
+        rng = context.rng
+        store = self._ensure_runtime_store(state, network)
+        repartitions = 0
+        # Algorithm 2: initial adaptation.
+        # Pseudocode:
+        #   call adaptation, get RC, RD, SC, SD, RQ and bounds
+        # Current implementation:
+        #   _compute_partition(...) calls the configured PDMPPartitionStrategy.
+        #   For Algorithm 3 this is ScalingPDMPPartitionStrategy.partition(...).
+        #   The result stores RC as continuous_channels, RD as discrete_channels,
+        #   SC/SD as continuous_species/discrete_species, and scale bounds.
+        #   RQ is not represented as a separate set yet.
+        if self._invalidated or store.get("partition") is None:
+            # External invalidation means either the caller changed the state or
+            # the network/stepper configuration changed.  Do not trust any
+            # previously cached propensity array in that case.
+            if self._invalidated:
+                self._mark_propensities_dirty(store, "external invalidation")
+            propensities = self._get_propensities(network, state, store, reason="initial adaptation")
+            partition = self._compute_partition(network, state, propensities, context)
+            self._install_partition(store, partition, rng, reset_all=True)
+            self._invalidated = False
+            repartitions += 1
+
+        start_time = float(state.t)
+        end_time = start_time + duration
+        continuous_abs_total = np.zeros(network.n_channels, dtype=float)
+        last_total_discrete_propensity = 0.0
+        last_total_continuous_propensity = 0.0
+
+        # Algorithm 2 outer loop.
+        # Pseudocode:
+        #   while t < tf:
+        # Here one PDMPStepper.step(...) call advances at most dt simulation time.
+        # ExperimentRunner repeatedly calls this method until global t_end.
+        while float(state.t) < end_time - self.config.hazard_tol:
+            remaining = max(end_time - float(state.t), 0.0)
+            if remaining <= 0.0:
+                break
+            step_dt = min(float(self.config.ode_step), remaining)
+            partition = self._require_partition(store)
+            # Use cached propensities when the state has not changed since the
+            # previous calculation.  A continuous Euler update or discrete jump
+            # marks the cache dirty below; repartition alone does not.
+            propensities = self._get_propensities(network, state, store, reason="micro-step start")
+            continuous_channels = partition.continuous_channels
+            discrete_channels = partition.discrete_channels
+            last_total_continuous_propensity = (
+                float(np.sum(propensities[continuous_channels])) if continuous_channels.size else 0.0
+            )
+            last_total_discrete_propensity = (
+                float(np.sum(propensities[discrete_channels])) if discrete_channels.size else 0.0
+            )
+
+            # Algorithm 2 step 1: try one continuous integration step.
+            # Pseudocode:
+            #   tN = min(t + dt, tf)
+            #   integrate dz/dt = sum_{k in RC} lambda_k(z) xi_k
+            #             dw/dt = sum_{k in RD} lambda_k(z)
+            # Current implementation is a lightweight approximation:
+            #   - lambda_k is frozen at the start of this micro-step;
+            #   - _advance_continuous(...) applies explicit Euler for z;
+            #   - _advance_hazards(...) applies explicit Euler for discrete
+            #     hazard accumulation;
+            #   - there is no dense output object.
+            #
+            # Difference from the pseudocode:
+            #   The pseudocode uses one scalar integrated hazard w over RD and
+            #   a scalar threshold u.  This implementation keeps per-channel
+            #   hazards and thresholds, closer to a next-reaction formulation
+            #   for the discrete subset.
+            tau, fired_channel = self._next_discrete_event(
+                store,
+                discrete_channels,
+                propensities,
+                horizon=step_dt,
+            )
+            if fired_channel is not None:
+                # Algorithm 2 step 2: handle a discrete event inside the ODE step.
+                # Pseudocode:
+                #   find tR where w(tR) = u
+                #   interpolate zR, wR
+                #   sample r from lambda_k(x_pre) / sum lambda_m(x_pre)
+                #   if r in RQ: break and repartition
+                #   else: accumulate Delta z and continue inside the same ODE step
+                #
+                # Current implementation:
+                #   - _next_discrete_event(...) computes tR by the frozen
+                #     per-channel hazard slope;
+                #   - the selected channel is the channel whose threshold is
+                #     reached first, so there is no separate multinomial draw;
+                #   - the jump is applied immediately to state.x;
+                #   - this method returns after one event.  The runner calls
+                #     step(...) again for additional events, so the inner
+                #     "while wN >= u" loop is distributed across runner steps;
+                #   - RQ is not separated yet.  repartition_on_event=True treats
+                #     every discrete event as a possible repartition point.
+                event_dt = max(float(tau), 0.0)
+                continuous_abs_total += self._advance_continuous(network, state, propensities, continuous_channels, event_dt)
+                self._advance_hazards(store, discrete_channels, propensities, event_dt)
+                state.t += event_dt
+                network.apply_channel_update(state, int(fired_channel))
+                self._validate_or_clip_state(state)
+                # The continuous drift over event_dt and the discrete jump both
+                # change state.x.  The old propensity vector describes x_pre and
+                # must not be reused for the post-event state.
+                self._mark_propensities_dirty(store, "discrete event changed state")
+                self._reset_channel_threshold(store, int(fired_channel), rng)
+
+                if self.config.adaptive and self.config.repartition_on_event:
+                    # Repartition requires propensities at the new state.  The
+                    # freshly computed array remains valid after _install_partition
+                    # because partition installation only changes thresholds and
+                    # masks, not state.x.
+                    propensities = self._get_propensities(network, state, store, reason="event repartition")
+                    partition = self._compute_partition(network, state, propensities, context)
+                    self._install_partition(store, partition, rng, reset_all=False)
+                    repartitions += 1
+
+                state.step_count += 1
+                state.event_count += 1
+                return StepResult(
+                    advanced_time=float(state.t - start_time),
+                    event_occurred=True,
+                    channel_id=int(fired_channel),
+                    propensity_sum=last_total_discrete_propensity,
+                    tau=float(state.t - start_time),
+                    details=self._details(
+                        store,
+                        total_discrete_propensity=last_total_discrete_propensity,
+                        total_continuous_propensity=last_total_continuous_propensity,
+                        continuous_abs_total=continuous_abs_total,
+                        repartitions=repartitions,
+                    ),
+                )
+
+            # Algorithm 2 step 3: accept the current ODE/hazard step.
+            # Pseudocode:
+            #   t = tN
+            #   z = zN + Delta z
+            #   w = wN
+            # Here Delta z is always applied immediately when an event fires.
+            # If no event fires inside this micro-step, we accept the Euler
+            # continuous update and hazard accumulation over step_dt.
+            continuous_abs_total += self._advance_continuous(network, state, propensities, continuous_channels, step_dt)
+            self._advance_hazards(store, discrete_channels, propensities, step_dt)
+            state.t += step_dt
+            if continuous_channels.size:
+                # The Euler drift may change continuous species by fractional
+                # amounts.  Any later propensity evaluation must be based on the
+                # updated state, so the cache is invalid after accepting the
+                # continuous part of the step.  If RC is empty, only time changed
+                # and propensities remain valid because current rates are time
+                # homogeneous.
+                self._mark_propensities_dirty(store, "continuous drift changed state")
+
+            # Algorithm 2 step 4: check whether the partition is invalid.
+            # Pseudocode:
+            #   if any species violates current scale bounds:
+            #       adaptation
+            #       w = 0
+            #       u = Exp(1)
+            # Current implementation checks PDMPPartitionResult.is_within_bounds.
+            # _install_partition(..., reset_all=False) preserves thresholds for
+            # channels that remain discrete and initializes only newly discrete
+            # channels.  This differs from the pseudocode's global w/u reset.
+            if (
+                self.config.adaptive
+                and self.config.repartition_on_bounds
+                and not self._require_partition(store).is_within_bounds(state.x)
+            ):
+                # Bounds violation triggers adaptation.  It does not by itself
+                # alter state.x; the recomputed propensities can therefore be
+                # reused by the following micro-step unless a later drift/jump
+                # marks the cache dirty.
+                propensities = self._get_propensities(network, state, store, reason="bounds repartition")
+                partition = self._compute_partition(network, state, propensities, context)
+                self._install_partition(store, partition, rng, reset_all=False)
+                repartitions += 1
+
+        state.step_count += 1
+        return StepResult(
+            advanced_time=float(state.t - start_time),
+            event_occurred=False,
+            propensity_sum=last_total_discrete_propensity,
+            details=self._details(
+                store,
+                total_discrete_propensity=last_total_discrete_propensity,
+                total_continuous_propensity=last_total_continuous_propensity,
+                continuous_abs_total=continuous_abs_total,
+                repartitions=repartitions,
+            ),
+        )
+
+    def _pdmp_network(self, network: ReactionNetworkData | ElementaryMassActionNetwork) -> ReactionNetworkData | ElementaryMassActionNetwork:
+        if not isinstance(network, (ReactionNetworkData, ElementaryMassActionNetwork)):
+            raise TypeError(
+                "PDMPStepper requires ReactionNetworkData or ElementaryMassActionNetwork. "
+                "Use partition_method='linear_catalysis_scaling' for direct effective-catalysis polymer networks, "
+                "or build an ElementaryMassActionNetwork first for the default paper-style scaling partition."
+            )
+        return network
+
+    def _ensure_runtime_store(self, state: SystemState, network: ReactionNetworkData | ElementaryMassActionNetwork) -> dict[str, Any]:
+        if not isinstance(state.partition_state, dict):
+            state.partition_state = {}
+        store = state.partition_state.get("pdmp")
+        if not isinstance(store, dict):
+            store = {}
+            state.partition_state["pdmp"] = store
+
+        invalid = (
+            store.get("network_id") != id(network)
+            or store.get("n_channels") != network.n_channels
+            or store.get("n_species") != network.n_species
+        )
+        if invalid:
+            store.clear()
+            store["network_id"] = id(network)
+            store["n_channels"] = int(network.n_channels)
+            store["n_species"] = int(network.n_species)
+            store["thresholds"] = np.full(network.n_channels, np.inf, dtype=float)
+            store["hazards"] = np.zeros(network.n_channels, dtype=float)
+            store["discrete_mask"] = np.zeros(network.n_channels, dtype=bool)
+            store["partition"] = None
+            store["propensities"] = np.empty(network.n_channels, dtype=float)
+            store["propensities_valid"] = False
+            store["propensities_dirty_reason"] = "new runtime store"
+        return store
+
+    def _get_propensities(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        store: dict[str, Any],
+        *,
+        reason: str,
+    ) -> np.ndarray:
+        """Return the current propensity vector, reusing it only when valid.
+
+        Cache contract:
+        - valid means the array was computed for the current ``state.x``;
+        - continuous Euler drift and discrete jumps call
+          ``_mark_propensities_dirty`` immediately after mutating ``state.x``;
+        - partition installation does not mutate ``state.x``, so a vector
+          computed for repartition can be reused by the next micro-step;
+        - external callers can force a rebuild through ``invalidate_cache``.
+        """
+
+        cached = store.get("propensities")
+        if (
+            bool(store.get("propensities_valid", False))
+            and isinstance(cached, np.ndarray)
+            and cached.shape == (network.n_channels,)
+        ):
+            return cached
+
+        if not isinstance(cached, np.ndarray) or cached.shape != (network.n_channels,):
+            cached = np.empty(network.n_channels, dtype=float)
+            store["propensities"] = cached
+        network.compute_all_propensities(state, out=cached)
+        self._clean_propensities(cached)
+        store["propensities_valid"] = True
+        store["propensities_dirty_reason"] = None
+        store["propensities_last_compute_reason"] = str(reason)
+        return cached
+
+    def _mark_propensities_dirty(self, store: dict[str, Any], reason: str) -> None:
+        """Mark cached propensities invalid after a state-changing operation."""
+
+        store["propensities_valid"] = False
+        store["propensities_dirty_reason"] = str(reason)
+
+    def _compute_partition(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        propensities: np.ndarray,
+        context: StepperContext,
+    ) -> PDMPPartitionResult:
+        # Algorithm 2 adaptation hook.
+        # This method is where the stepper delegates partition construction.
+        # With ScalingPDMPPartitionStrategy it executes the Algorithm-3-style
+        # scale analysis; with FixedPDMPPartitionStrategy it uses a manual split.
+        strategy = context.partition_strategy or self.partition_strategy
+        if strategy is None:
+            strategy = _pdmp_partition_strategy_from_method(self.partition_method, self.partition_config)
+        result = strategy.partition(network, state, propensities)
+        if isinstance(result, PDMPPartitionResult):
+            self._validate_partition(network, result)
+            return result
+        if hasattr(result, "fast_channels") and hasattr(result, "slow_channels"):
+            converted = FixedPDMPPartitionStrategy(
+                continuous_channels=np.asarray(result.fast_channels, dtype=np.int64),
+            ).partition(network, state, propensities)
+            self._validate_partition(network, converted)
+            return converted
+        raise TypeError("PDMP partition_strategy must return PDMPPartitionResult or a fast/slow PartitionResult")
+
+    def _install_partition(
+        self,
+        store: dict[str, Any],
+        partition: PDMPPartitionResult,
+        rng: np.random.Generator,
+        *,
+        reset_all: bool,
+    ) -> None:
+        thresholds = np.asarray(store["thresholds"], dtype=float)
+        hazards = np.asarray(store["hazards"], dtype=float)
+        old_mask = np.asarray(store.get("discrete_mask"), dtype=bool)
+        new_mask = np.zeros_like(old_mask, dtype=bool)
+        new_mask[partition.discrete_channels] = True
+
+        if reset_all:
+            initialize_mask = new_mask
+        else:
+            initialize_mask = new_mask & ~old_mask
+        removed_mask = old_mask & ~new_mask
+        if np.any(removed_mask):
+            thresholds[removed_mask] = np.inf
+            hazards[removed_mask] = 0.0
+        if np.any(initialize_mask):
+            thresholds[initialize_mask] = rng.exponential(1.0, size=int(np.sum(initialize_mask)))
+            hazards[initialize_mask] = 0.0
+
+        store["partition"] = partition
+        store["discrete_mask"] = new_mask
+
+    def _next_discrete_event(
+        self,
+        store: dict[str, Any],
+        discrete_channels: np.ndarray,
+        propensities: np.ndarray,
+        *,
+        horizon: float,
+    ) -> tuple[float | None, int | None]:
+        # Discrete-event locator for the current micro-step.
+        # Pseudocode uses a scalar condition wN >= u and then solves w(tR) = u.
+        # Here each discrete channel has its own threshold and hazard.  Under
+        # frozen propensities for this micro-step, the next firing time is
+        # (threshold_r - hazard_r) / propensity_r, and the smallest such time is
+        # the event inside the horizon.
+        channels = np.asarray(discrete_channels, dtype=np.int64)
+        if channels.size == 0:
+            return None, None
+        props = np.maximum(propensities[channels], 0.0)
+        active = props > self.config.hazard_tol
+        if not np.any(active):
+            return None, None
+
+        thresholds = np.asarray(store["thresholds"], dtype=float)
+        hazards = np.asarray(store["hazards"], dtype=float)
+        remaining_hazard = np.maximum(thresholds[channels] - hazards[channels], 0.0)
+        taus = np.full(channels.shape, np.inf, dtype=float)
+        taus[active] = remaining_hazard[active] / props[active]
+        local = int(np.argmin(taus))
+        tau = float(taus[local])
+        if not np.isfinite(tau) or tau > float(horizon) + self.config.hazard_tol:
+            return None, None
+        return max(tau, 0.0), int(channels[local])
+
+    def _advance_continuous(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        propensities: np.ndarray,
+        continuous_channels: np.ndarray,
+        dt: float,
+    ) -> np.ndarray:
+        # Continuous part of Algorithm 2 step 1.
+        # This is explicit Euler for dz/dt = sum_{RC} lambda_k(z) xi_k using
+        # propensities frozen at the start of the micro-step.  It is not yet a
+        # dense-output ODE solve.
+        continuous_abs = np.zeros(network.n_channels, dtype=float)
+        if dt <= 0.0 or continuous_channels.size == 0:
+            return continuous_abs
+        channels = np.asarray(continuous_channels, dtype=np.int64)
+        reaction_amounts = np.maximum(propensities[channels], 0.0) * float(dt)
+        if reaction_amounts.size:
+            state.x[:] = np.asarray(state.x, dtype=float) + reaction_amounts @ network.nu[channels]
+            continuous_abs[channels] = np.abs(reaction_amounts)
+        self._validate_or_clip_state(state)
+        return continuous_abs
+
+    def _advance_hazards(
+        self,
+        store: dict[str, Any],
+        discrete_channels: np.ndarray,
+        propensities: np.ndarray,
+        dt: float,
+    ) -> None:
+        # Discrete hazard part of Algorithm 2 step 1.
+        # This advances integrated hazards for RD over dt.  The implementation
+        # uses one hazard per discrete channel instead of the pseudocode's
+        # scalar w = integral sum_{RD} lambda_k(z) dt.
+        if dt <= 0.0 or discrete_channels.size == 0:
+            return
+        channels = np.asarray(discrete_channels, dtype=np.int64)
+        hazards = np.asarray(store["hazards"], dtype=float)
+        hazards[channels] += np.maximum(propensities[channels], 0.0) * float(dt)
+
+    def _reset_channel_threshold(
+        self,
+        store: dict[str, Any],
+        channel_id: int,
+        rng: np.random.Generator,
+    ) -> None:
+        cid = int(channel_id)
+        thresholds = np.asarray(store["thresholds"], dtype=float)
+        hazards = np.asarray(store["hazards"], dtype=float)
+        thresholds[cid] = float(rng.exponential(1.0))
+        hazards[cid] = 0.0
+
+    def _validate_or_clip_state(self, state: SystemState) -> None:
+        if not np.all(np.isfinite(state.x)):
+            raise ValueError("PDMP produced NaN or inf species counts")
+        if self.config.validate_nonnegative and np.any(state.x < -self.config.hazard_tol):
+            raise ValueError("PDMP produced negative species counts")
+        np.maximum(state.x, 0.0, out=state.x)
+
+    def _validate_partition(self, network: ReactionNetworkData | ElementaryMassActionNetwork, partition: PDMPPartitionResult) -> None:
+        for name, values, size in (
+            ("continuous_channels", partition.continuous_channels, network.n_channels),
+            ("discrete_channels", partition.discrete_channels, network.n_channels),
+            ("continuous_species", partition.continuous_species, network.n_species),
+            ("discrete_species", partition.discrete_species, network.n_species),
+        ):
+            arr = np.asarray(values, dtype=np.int64)
+            if np.any(arr < 0) or np.any(arr >= int(size)):
+                raise IndexError(f"{name} contains out-of-range ids")
+
+    def _require_partition(self, store: dict[str, Any]) -> PDMPPartitionResult:
+        partition = store.get("partition")
+        if not isinstance(partition, PDMPPartitionResult):
+            raise RuntimeError("PDMP partition is not initialized")
+        return partition
+
+    def _clean_propensities(self, propensities: np.ndarray) -> np.ndarray:
+        values = np.asarray(propensities, dtype=float)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("PDMP propensities contain NaN or inf values")
+        np.maximum(values, 0.0, out=values)
+        return values
+
+    def _details(
+        self,
+        store: dict[str, Any],
+        *,
+        total_discrete_propensity: float,
+        total_continuous_propensity: float,
+        continuous_abs_total: np.ndarray,
+        repartitions: int,
+    ) -> dict[str, Any] | None:
+        if not self.config.diagnostics:
+            return None
+        partition = self._require_partition(store)
+        metadata = dict(partition.metadata)
+        return {
+            "mode": "pdmp",
+            "partition_method": metadata.get("method", "unknown"),
+            "n_continuous_channels": int(partition.continuous_channels.size),
+            "n_discrete_channels": int(partition.discrete_channels.size),
+            "n_continuous_species": int(partition.continuous_species.size),
+            "n_discrete_species": int(partition.discrete_species.size),
+            "fast_subnetwork_count": int(len(partition.fast_subnetworks)),
+            "n_repartitions": int(repartitions),
+            "total_jump_propensity": max(float(total_discrete_propensity), 0.0),
+            "total_cle_propensity": max(float(total_continuous_propensity), 0.0),
+            "total_continuous_propensity": max(float(total_continuous_propensity), 0.0),
+            "continuous_channel_abs_increments": np.asarray(continuous_abs_total, dtype=float).copy(),
+            "partition_metadata": metadata,
+        }
 
 
 class CLEStepper(BaseStepper):

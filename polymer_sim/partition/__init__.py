@@ -1,3 +1,18 @@
+from polymer_sim.partition.pdmp import (
+    FastSubnetwork,
+    FastSubnetworkSelector,
+    FastNetworkReport,
+    FixedPDMPPartitionStrategy,
+    FiniteMarkovConfig,
+    FiniteMarkovSubnetworkAnalyzer,
+    FiniteMarkovSubnetworkResult,
+    LinearCatalysisScalingPDMPPartitionStrategy,
+    PDMPPartitionResult,
+    PDMPPartitionStrategy,
+    ScalingPDMPConfig,
+    ScalingPDMPPartitionStrategy,
+    analyze_fast_network,
+)
 from polymer_sim.partition.strategies import (
     BlendingStrategy,
     FixedPartitionStrategy,
@@ -8,8 +23,21 @@ from polymer_sim.partition.strategies import (
 
 __all__ = [
     "BlendingStrategy",
+    "FastSubnetwork",
+    "FastSubnetworkSelector",
+    "FastNetworkReport",
     "FixedPartitionStrategy",
+    "FixedPDMPPartitionStrategy",
+    "FiniteMarkovConfig",
+    "FiniteMarkovSubnetworkAnalyzer",
+    "FiniteMarkovSubnetworkResult",
+    "LinearCatalysisScalingPDMPPartitionStrategy",
     "NoBlendingStrategy",
+    "PDMPPartitionResult",
+    "PDMPPartitionStrategy",
     "PartitionResult",
     "PartitionStrategy",
+    "ScalingPDMPConfig",
+    "ScalingPDMPPartitionStrategy",
+    "analyze_fast_network",
 ]

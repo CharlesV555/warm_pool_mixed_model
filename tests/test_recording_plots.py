@@ -26,6 +26,7 @@ from polymer_sim import (
     plot_reaction_trigger_frequency,
     plot_species_with_outflow,
     plot_time_series,
+    TrajectoryRecord,
 )
 
 
@@ -105,6 +106,11 @@ def test_plot_functions_run_on_record():
         label_alpha=0.6,
     )
     fig9, ax9 = plot_time_series(record, species_indices=[0, 1], time_range=(0.1, 0.3))
+    fig10, ax10 = plot_time_series(
+        record,
+        species_indices=[record.species_names[0], record.species_names[1]],
+        time_range=(0.1, 0.3),
+    )
     assert fig1 is not None and ax1 is not None
     assert len(ax1.collections) >= 1
     assert fig1b is not None and ax1b is not None
@@ -118,12 +124,41 @@ def test_plot_functions_run_on_record():
     assert fig5 is not None and ax5 is not None
     assert fig6 is not None and ax6 is not None
     assert fig7 is not None and ax7 is not None
+    assert fig10 is not None and ax10 is not None
     assert fig8 is not None and ax8 is not None and anim8 is not None
     assert fig9 is not None and ax9 is not None
     for line in ax9.lines:
         xdata = line.get_xdata()
         assert xdata.min() >= 0.1
         assert xdata.max() <= 0.3
+
+
+def test_plot_time_series_named_species_includes_complex_moieties():
+    record = TrajectoryRecord(
+        times=np.asarray([0.0, 1.0]),
+        states=np.asarray(
+            [
+                [1.0, 10.0, 2.0, 3.0, 4.0, 6.0],
+                [2.0, 11.0, 5.0, 7.0, 13.0, 17.0],
+            ]
+        ),
+        species_names=["A", "B", "complex:A|B", "complex:B|A", "complex:A|A", "A:B"],
+        run_metadata={},
+    )
+
+    fig_name, ax_name = plot_time_series(record, species_indices=["A"])
+    np.testing.assert_allclose(ax_name.lines[0].get_ydata(), np.asarray([20.0, 57.0]))
+    assert ax_name.lines[0].get_label() == "A (free+complex)"
+
+    fig_index, ax_index = plot_time_series(record, species_indices=[0])
+    np.testing.assert_allclose(ax_index.lines[0].get_ydata(), np.asarray([1.0, 2.0]))
+
+    fig_default, ax_default = plot_time_series(record)
+    assert len(ax_default.lines) == 2
+    assert [line.get_label() for line in ax_default.lines] == ["A (free+complex)", "B (free+complex)"]
+    np.testing.assert_allclose(ax_default.lines[0].get_ydata(), np.asarray([20.0, 57.0]))
+    np.testing.assert_allclose(ax_default.lines[1].get_ydata(), np.asarray([21.0, 40.0]))
+    assert fig_name is not None and fig_index is not None and fig_default is not None
 
 
 def test_reaction_trigger_frequency_stacks_continuous_counts():

@@ -9,6 +9,7 @@
 """
 
 from polymer_sim.recording.base import BaseRecorder, BaseRunSummary, BaseTrajectoryRecord
+from polymer_sim.recording.fast_network_report import FastNetworkReportRecorder
 from polymer_sim.recording.plot_single_run import (
     animate_reaction_network_state_tree,
     plot_channel_propensity_time_series,
@@ -45,6 +46,7 @@ __all__ = [
     "BaseRecorder",
     "BaseRunSummary",
     "BaseTrajectoryRecord",
+    "FastNetworkReportRecorder",
     "RunSummary",
     "RunTimingReport",
     "SummaryRecorder",

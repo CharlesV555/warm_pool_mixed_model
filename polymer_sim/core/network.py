@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -82,6 +82,9 @@ class ReactionNetworkData:
     channel_to_catalysts: list[np.ndarray]
     channel_has_catalysts: np.ndarray
     dependency_indices_dirty: bool
+    _nu_minus_cache: np.ndarray | None = field(default=None, init=False, repr=False)
+    _nu_plus_cache: np.ndarray | None = field(default=None, init=False, repr=False)
+    _nu_cache: np.ndarray | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_species_space(
@@ -282,6 +285,7 @@ class ReactionNetworkData:
             dependency_indices_dirty=False,
         )
         network.rebuild_dependency_indices()
+        network.precompute_stoichiometry_matrices()
         return network
 
     @property
@@ -312,6 +316,47 @@ class ReactionNetworkData:
 
     def get_channel_block_name(self, channel_id: int) -> str:
         return BLOCK_NAMES[self.get_channel_block(channel_id)]
+
+    @property
+    def rate_constants(self) -> np.ndarray:
+        """Return the uncatalyzed base rate for each global channel."""
+
+        values = np.empty(self.n_channels, dtype=float)
+        for channel_id in range(self.n_channels):
+            block, local = self._block_and_local(channel_id)
+            if block == ChannelBlock.LEFT_ADD:
+                values[channel_id] = float(self.left_add_rates[local])
+            elif block == ChannelBlock.RIGHT_ADD:
+                values[channel_id] = float(self.right_add_rates[local])
+            elif block == ChannelBlock.LEFT_SPLIT:
+                values[channel_id] = float(self.left_split_rates[local] * self.left_split_multiplicity[local])
+            elif block == ChannelBlock.RIGHT_SPLIT:
+                values[channel_id] = float(self.right_split_rates[local] * self.right_split_multiplicity[local])
+            elif block == ChannelBlock.OUTFLOW:
+                values[channel_id] = float(self.outflow_rates[local])
+            elif block == ChannelBlock.INFLOW:
+                values[channel_id] = float(self.inflow_rates[local])
+            else:
+                raise ValueError(f"unsupported channel block: {block}")
+        return values
+
+    @property
+    def nu_minus(self) -> np.ndarray:
+        if self._nu_minus_cache is None:
+            self.precompute_stoichiometry_matrices()
+        return self._nu_minus_cache
+
+    @property
+    def nu_plus(self) -> np.ndarray:
+        if self._nu_plus_cache is None:
+            self.precompute_stoichiometry_matrices()
+        return self._nu_plus_cache
+
+    @property
+    def nu(self) -> np.ndarray:
+        if self._nu_cache is None:
+            self.precompute_stoichiometry_matrices()
+        return self._nu_cache
 
     def get_channel_reactants(self, channel_id: int) -> tuple[int, ...]:
         block, local = self._block_and_local(channel_id)
@@ -441,6 +486,34 @@ class ReactionNetworkData:
         x[source] -= a
         x[rest] += a
         x[monomer] += a
+
+    def precompute_stoichiometry_matrices(self) -> None:
+        """Build and cache dense stoichiometry matrices for structural analyses.
+
+        The polymer-rule hot path uses O(1) local updates and block-vectorized
+        propensities, so it does not need these matrices.  PDMP partitioning,
+        Algorithm-4-style fast-subnetwork scans, and debug/export code do need
+        ``nu_minus``, ``nu_plus``, and ``nu`` repeatedly.  They are structural:
+        catalytic strength changes do not affect them, so caching avoids
+        rebuilding the full dense matrix on every property access.
+        """
+
+        nu_minus = self._stoichiometry_matrix(products=False)
+        nu_plus = self._stoichiometry_matrix(products=True)
+        nu = nu_plus - nu_minus
+        for matrix in (nu_minus, nu_plus, nu):
+            matrix.setflags(write=False)
+        self._nu_minus_cache = nu_minus
+        self._nu_plus_cache = nu_plus
+        self._nu_cache = nu
+
+    def _stoichiometry_matrix(self, *, products: bool) -> np.ndarray:
+        matrix = np.zeros((self.n_channels, self.n_species), dtype=float)
+        for channel_id in range(self.n_channels):
+            species = self.get_channel_products(channel_id) if products else self.get_channel_reactants(channel_id)
+            for sid in species:
+                matrix[int(channel_id), int(sid)] += 1.0
+        return matrix
 
     def set_catalytic_strength(
         self,

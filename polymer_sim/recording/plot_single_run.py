@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from tkinter.font import names
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -63,12 +64,14 @@ from polymer_sim.recording.trajectory import TrajectoryRecord, load_trajectory_r
 #     return fig, ax
 def plot_time_series(
     record_or_path: TrajectoryRecord | PathLike,
-    species_indices: list[int] | np.ndarray | None = None,
+    species_indices: list[int | str] | np.ndarray | None = None,
+    species_names: list[str] | None = None,
     title: str | None = None,
     time_range: tuple[float | None, float | None] | None = None,
     threshold: float | None = None,
     time_lookback: float | None = None,
     log_scale=False,
+    x_log_scle=False,
 ):
     """绘制单次轨迹的时间序列图。
     
@@ -90,10 +93,17 @@ def plot_time_series(
     times, states = _time_series_window(record, time_range)
     
     # --- 2. 确定所有要绘制的物种索引 ---
-    if species_indices is None:
-        all_indices = np.arange(record.states.shape[1], dtype=np.int64)
-    else:
-        all_indices = np.asarray(species_indices, dtype=np.int64)
+    # Integer selections keep the old exact-column behavior. String selections
+    # use moiety counts: free species plus matching explicit complex counts.
+ 
+    plot_values, plot_labels = _resolve_time_series_plot_data(
+        record,
+        states,
+        species_indices,
+        species_names,
+    )
+    all_indices = np.arange(plot_values.shape[1], dtype=np.int64)
+
     
     # --- 3. 筛选满足阈值条件的物种（用于图例和高亮） ---
     legend_indices = []
@@ -101,7 +111,7 @@ def plot_time_series(
         t_end = times[-1]
         t_start = t_end - time_lookback
         mask = (times >= t_start) & (times <= t_end)
-        window_states = states[mask, :]
+        window_states = plot_values[mask, :]
         
         for sid in all_indices:
             if np.any(window_states[:, sid] > threshold):
@@ -129,7 +139,7 @@ def plot_time_series(
     # 5.1 先绘制所有非图例物种（浅灰色细线）
     non_legend_indices = [sid for sid in all_indices if sid not in legend_indices]
     for sid in non_legend_indices:
-        ax.plot(times, states[:, sid], 
+        ax.plot(times, plot_values[:, sid], 
                 color='lightgray', 
                 linewidth=0.8, 
                 alpha=0.6,
@@ -138,8 +148,8 @@ def plot_time_series(
     # 5.2 再绘制图例物种（彩色粗线）
     for idx, sid in enumerate(legend_indices):
         color = colors[idx] if len(colors) > 0 else None
-        ax.plot(times, states[:, sid], 
-                label=record.species_names[int(sid)],
+        ax.plot(times, plot_values[:, sid], 
+                label=plot_labels[int(sid)],
                 linewidth=2.5,
                 color=color,
                 alpha=0.9)
@@ -152,6 +162,8 @@ def plot_time_series(
     # --- 6.5 log scale ---
     if log_scale:
         ax.set_yscale('log')
+    
+
     # --- 7. 显示图例（仅包含满足条件的物种） ---
     if len(legend_indices) > 0:
         if len(legend_indices) <= 12:
@@ -177,6 +189,199 @@ def plot_time_series(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     return fig, ax
+
+
+def _resolve_time_series_plot_data(
+    record: TrajectoryRecord,
+    states: np.ndarray,
+    species_indices: list[int | str] | np.ndarray | None,
+    species_names: list[str] | None,
+) -> tuple[np.ndarray, list[str]]:
+    """Resolve plotted series for ``plot_time_series``.
+
+    整数选择保持原始列语义；名称选择使用 moiety 语义：
+    free species count 加上所有显式复合物中的 bound count。
+    例如选择 ``"0000"`` 会绘制 ``0000``、``complex:0000|...``、
+    ``complex:...|0000`` 的合计。
+    """
+
+    if species_indices is not None and species_names is not None:
+        raise ValueError("species_indices and species_names cannot both be provided")
+    if species_indices is None and species_names is None:
+        base_items = [
+            name
+            for name in record.species_names
+            if _parse_complex_species_name(name) is None
+        ]
+        return _time_series_data_for_named_species(record, states, base_items)
+
+    selection = species_indices if species_indices is not None else species_names
+    if selection is None:
+        base_items = [
+            name
+            for name in record.species_names
+            if _parse_complex_species_name(name) is None
+        ]
+        return _time_series_data_for_named_species(record, states, base_items)
+    if isinstance(selection, (str, bytes)):
+        selection_items = [selection]
+    else:
+        selection_items = list(np.asarray(selection, dtype=object).ravel())
+
+    values: list[np.ndarray] = []
+    labels: list[str] = []
+    missing_names: list[str] = []
+    n_species = int(record.states.shape[1])
+    name_to_idx = {name: idx for idx, name in enumerate(record.species_names)}
+
+    for item in selection_items:
+        if isinstance(item, str):
+            if item not in name_to_idx:
+                missing_names.append(item)
+                continue
+            component_ids, component_weights = _species_moiety_components(
+                record.species_names,
+                item,
+                int(name_to_idx[item]),
+            )
+            values.append(np.asarray(states[:, component_ids] @ component_weights, dtype=float))
+            labels.append(item if component_ids.size == 1 else f"{item} (free+complex)")
+            continue
+
+        sid = int(item)
+        if sid < 0 or sid >= n_species:
+            raise IndexError(f"species index out of range: {sid}")
+        values.append(np.asarray(states[:, sid], dtype=float))
+        labels.append(record.species_names[sid])
+
+    if missing_names:
+        available = ", ".join(record.species_names[:10])
+        suffix = "..." if len(record.species_names) > 10 else ""
+        raise KeyError(f"unknown species names: {missing_names}; available examples: {available}{suffix}")
+    if not values:
+        return np.empty((states.shape[0], 0), dtype=float), []
+    return np.column_stack(values), labels
+
+
+def _time_series_data_for_named_species(
+    record: TrajectoryRecord,
+    states: np.ndarray,
+    names: list[str],
+) -> tuple[np.ndarray, list[str]]:
+    values: list[np.ndarray] = []
+    labels: list[str] = []
+    name_to_idx = {name: idx for idx, name in enumerate(record.species_names)}
+    for name in names:
+        sid = name_to_idx.get(name)
+        if sid is None:
+            continue
+        component_ids, component_weights = _species_moiety_components(
+            record.species_names,
+            name,
+            int(sid),
+        )
+        values.append(np.asarray(states[:, component_ids] @ component_weights, dtype=float))
+        labels.append(name if component_ids.size == 1 else f"{name} (free+complex)")
+    if not values:
+        return np.empty((states.shape[0], 0), dtype=float), []
+    return np.column_stack(values), labels
+
+
+def _species_moiety_components(
+    species_names: list[str],
+    species_name: str,
+    free_sid: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return columns and weights for one named species moiety.
+
+    显式复合物命名为 ``complex:<catalyst>|<substrate>``。目标物种
+    出现在 catalyst 或 substrate 位置时各贡献 1；若两边都是同一个
+    目标物种，则该复合物贡献 2。
+    """
+
+    ids = [int(free_sid)]
+    weights = [1.0]
+    for sid, name in enumerate(species_names):
+        parsed = _parse_complex_species_name(name)
+        if parsed is None:
+            continue
+        catalyst_name, substrate_name = parsed
+        weight = 0.0
+        if catalyst_name == species_name:
+            weight += 1.0
+        if substrate_name == species_name:
+            weight += 1.0
+        if weight > 0.0:
+            ids.append(int(sid))
+            weights.append(weight)
+    return np.asarray(ids, dtype=np.int64), np.asarray(weights, dtype=float)
+
+
+def _parse_complex_species_name(name: str) -> tuple[str, str] | None:
+    """Parse explicit complex names used in trajectory records.
+
+    当前 elementary 网络使用 ``complex:<catalyst>|<substrate>``。这里也
+    接受 ``complex:<left>:<right>`` 和 ``<left>:<right>``，用于兼容
+    分析脚本里可能出现的简写。
+    """
+
+    text = str(name)
+    if text.startswith("complex:"):
+        text = text[len("complex:"):]
+    elif "|" not in text and ":" not in text:
+        return None
+
+    if "|" in text:
+        left, right = text.split("|", 1)
+    elif ":" in text:
+        left, right = text.split(":", 1)
+    else:
+        return None
+    if not left or not right:
+        return None
+    return left, right
+
+
+def _resolve_time_series_species_indices(
+    record: TrajectoryRecord,
+    species_indices: list[int | str] | np.ndarray | None,
+    species_names: list[str] | None,
+) -> np.ndarray:
+    if species_indices is not None and species_names is not None:
+        raise ValueError("species_indices and species_names cannot both be provided")
+    if species_indices is None and species_names is None:
+        return np.arange(record.states.shape[1], dtype=np.int64)
+
+    selection = species_indices if species_indices is not None else species_names
+    if selection is None:
+        return np.arange(record.states.shape[1], dtype=np.int64)
+    if isinstance(selection, (str, bytes)):
+        selection_items = [selection]
+    else:
+        selection_items = list(np.asarray(selection, dtype=object).ravel())
+
+    name_to_idx = {name: idx for idx, name in enumerate(record.species_names)}
+    resolved: list[int] = []
+    missing_names: list[str] = []
+    n_species = int(record.states.shape[1])
+    for item in selection_items:
+        if isinstance(item, str):
+            if item not in name_to_idx:
+                missing_names.append(item)
+                continue
+            resolved.append(int(name_to_idx[item]))
+            continue
+        sid = int(item)
+        if sid < 0 or sid >= n_species:
+            raise IndexError(f"species index out of range: {sid}")
+        resolved.append(sid)
+
+    if missing_names:
+        available = ", ".join(record.species_names[:10])
+        suffix = "..." if len(record.species_names) > 10 else ""
+        raise KeyError(f"unknown species names: {missing_names}; available examples: {available}{suffix}")
+    return np.asarray(resolved, dtype=np.int64)
+
 
 def plot_reaction_trigger_frequency(
     record_or_path: TrajectoryRecord | PathLike,

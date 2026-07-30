@@ -1,5 +1,11 @@
 from polymer_sim.analysis import closure, compute_max_raf, enumerate_irr_rafs, is_raf_subset
 from polymer_sim.core.enums import BLOCK_ORDER, ChannelBlock
+from polymer_sim.core.elementary import (
+    DEFAULT_STANDARD_ZERO_ORDER_INFLOW,
+    ElementaryExpansionConfig,
+    ElementaryMassActionNetwork,
+    build_elementary_mass_action_network,
+)
 from polymer_sim.core.network import ReactionNetworkData
 from polymer_sim.core.state import SystemState
 from polymer_sim.experiment.runner import ExperimentRunner, RunResult
@@ -27,9 +33,25 @@ from polymer_sim.partition.strategies import (
     PartitionResult,
     PartitionStrategy,
 )
+from polymer_sim.partition.pdmp import (
+    FastSubnetwork,
+    FastSubnetworkSelector,
+    FastNetworkReport,
+    FixedPDMPPartitionStrategy,
+    FiniteMarkovConfig,
+    FiniteMarkovSubnetworkAnalyzer,
+    FiniteMarkovSubnetworkResult,
+    LinearCatalysisScalingPDMPPartitionStrategy,
+    PDMPPartitionResult,
+    PDMPPartitionStrategy,
+    ScalingPDMPConfig,
+    ScalingPDMPPartitionStrategy,
+    analyze_fast_network,
+)
 from polymer_sim.recording import (
     animate_reaction_network_state_tree,
     BaseRecorder,
+    FastNetworkReportRecorder,
     format_stepper_info,
     RunSummary,
     SummaryRecorder,
@@ -67,6 +89,8 @@ from polymer_sim.simulation.stepper import (
     NRMBlendedHybridStepper,
     OptimizedNRMConfig,
     OptimizedNRMStepper,
+    PDMPConfig,
+    PDMPStepper,
     SSAStepper,
     StepResult,
     StepperContext,
@@ -92,6 +116,17 @@ __all__ = [
     "BlendingStrategy",
     "ChannelBlock",
     "CLEStepper",
+    "DEFAULT_STANDARD_ZERO_ORDER_INFLOW",
+    "ElementaryExpansionConfig",
+    "ElementaryMassActionNetwork",
+    "FastSubnetwork",
+    "FastSubnetworkSelector",
+    "FastNetworkReport",
+    "FastNetworkReportRecorder",
+    "FiniteMarkovConfig",
+    "FiniteMarkovSubnetworkAnalyzer",
+    "FiniteMarkovSubnetworkResult",
+    "LinearCatalysisScalingPDMPPartitionStrategy",
     "FoodReplenishmentRestriction",
     "FoodUpperLimitRestriction",
     "WHReaction",
@@ -104,6 +139,10 @@ __all__ = [
     "NRMBlendedHybridStepper",
     "OptimizedNRMConfig",
     "OptimizedNRMStepper",
+    "PDMPConfig",
+    "PDMPPartitionResult",
+    "PDMPPartitionStrategy",
+    "PDMPStepper",
     "PartitionResult",
     "PartitionStrategy",
     "BaseRecorder",
@@ -131,6 +170,8 @@ __all__ = [
     "build_n3_wh_species",
     "assign_random_longest_catalyst_to_all_channels",
     "assign_random_longest_catalysts_to_distinct_channels",
+    "analyze_fast_network",
+    "build_elementary_mass_action_network",
     "build_reaction_rule_tables",
     "classify_wh_reaction_category",
     "closure",
@@ -138,6 +179,7 @@ __all__ = [
     "clear_all_catalysis",
     "enumerate_irr_rafs",
     "generate_fixed_species_space",
+    "FixedPDMPPartitionStrategy",
     "build_restriction",
     "is_raf_subset",
     "load_summary",
@@ -160,5 +202,7 @@ __all__ = [
     "save_run_timing_report",
     "save_timing_summary",
     "save_trajectory_record",
+    "ScalingPDMPConfig",
+    "ScalingPDMPPartitionStrategy",
     "estimate_mean_reaction_interval",
 ]

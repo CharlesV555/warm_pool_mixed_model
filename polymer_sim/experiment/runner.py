@@ -6,8 +6,10 @@ from typing import Iterable
 
 import numpy as np
 
+from polymer_sim.core.elementary import ElementaryMassActionNetwork
 from polymer_sim.core.network import ReactionNetworkData
 from polymer_sim.core.state import SystemState
+from polymer_sim.partition.pdmp import PDMPPartitionStrategy
 from polymer_sim.partition.strategies import BlendingStrategy, PartitionStrategy
 from polymer_sim.recording.base import BaseRecorder, PathLike
 from polymer_sim.recording.summary import RunSummary, SummaryRecorder
@@ -27,7 +29,7 @@ class RunResult:
 class ExperimentRunner:
     def run_one(
         self,
-        network: ReactionNetworkData,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
         stepper: BaseStepper,
         *,
         t_end: float,
@@ -36,7 +38,7 @@ class ExperimentRunner:
         dt: float | None = None,
         recorder: BaseRecorder | None = None,
         restriction: BaseRestriction | None = None,
-        partition_strategy: PartitionStrategy | None = None,
+        partition_strategy: PartitionStrategy | PDMPPartitionStrategy | None = None,
         blending_strategy: BlendingStrategy | None = None,
         max_steps: int = 100_000,
         max_runtime_seconds: float | None = None,
@@ -254,7 +256,7 @@ class ExperimentRunner:
 
     def run_many(
         self,
-        network: ReactionNetworkData,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
         stepper: BaseStepper,
         *,
         t_end: float,
@@ -262,7 +264,7 @@ class ExperimentRunner:
         x0: np.ndarray | None = None,
         dt: float | None = None,
         restriction: BaseRestriction | None = None,
-        partition_strategy: PartitionStrategy | None = None,
+        partition_strategy: PartitionStrategy | PDMPPartitionStrategy | None = None,
         blending_strategy: BlendingStrategy | None = None,
         max_steps: int = 100_000,
         max_runtime_seconds: float | None = None,
@@ -380,6 +382,12 @@ def _stepper_metadata(stepper: BaseStepper) -> dict[str, object]:
     nrm_config = getattr(stepper, "nrm_config", None)
     if nrm_config is not None:
         metadata["nrm_config"] = _config_metadata(nrm_config)
+    partition_method = getattr(stepper, "partition_method", None)
+    if partition_method is not None:
+        metadata["partition_method"] = str(partition_method)
+    partition_config = getattr(stepper, "partition_config", None)
+    if partition_config is not None:
+        metadata["partition_config"] = _config_metadata(partition_config)
     return metadata
 
 

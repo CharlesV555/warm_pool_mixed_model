@@ -2,34 +2,33 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXAMPLES_DIR = PROJECT_ROOT / "examples"
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(EXAMPLES_DIR))
-
-
-
-
 from time import perf_counter
 
 import numpy as np
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLES_DIR = PROJECT_ROOT / "examples"
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from polymer_sim import (
-    BlendedHybridConfig,
-    BlendedHybridStepper,
     ChannelBlock,
     ExperimentRunner,
-    OptimizedNRMStepper,
-    SSAStepper,
     ReactionNetworkData,
+    SSAStepper,
     TrajectoryRecorder,
     build_reaction_rule_tables,
     clear_all_catalysis,
     format_stepper_info,
     generate_fixed_species_space,
     save_trajectory_record,
+)
+
+from polymer_sim import (
+    BlendedHybridConfig,
+    BlendedHybridStepper,
     NRMBlendedHybridStepper,
+    OptimizedNRMStepper,
+    SSAStepper,
 )
 
 MAX_LEN = 5
@@ -39,16 +38,15 @@ SEED = 123
 MAX_STEPS = 100_000_000
 MAX_TIMES = 60.0
 
-BACKGROUND_RATE = 0.001
-CATALYTIC_STRENGTH = 1.0
-K_NONFOOD_OUTFLOW = 1.5
+BACKGROUND_RATE = 2
+CATALYTIC_STRENGTH = 1000.0
+K_NONFOOD_OUTFLOW = 10
 CATALYSIS_MODE = "linear"
 SATURATION_ALPHA = 0.01
+
 INITIAL_FOOD_COUNT = 1000.0
-FOOD_INFLOW_RATE = 500000.0
+FOOD_INFLOW_RATE = 10000.0
 FOOD_INFLOW_HILL_COEFFICIENT = 2.0
-# Per-food-species soft upper bound used by formal INFLOW propensity.  The
-# inflow rate approaches zero as food count approaches this capacity.
 FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
 INITIAL_COUNTS = {
     name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
@@ -65,12 +63,7 @@ CROSS_CATALYSIS_RULES = {
     "00000": "1",
 }
 
-BLENDED_I1 = 30.0
-BLENDED_I2 = 70.0
-BLENDED_DT_CLE = 0.00033981
-BLENDED_DT_MACRO = 0.01
-
-OUTPUT_PATH = EXAMPLES_DIR / "cross_catalysis_trajectory.npz"
+OUTPUT_PATH = EXAMPLES_DIR / "cross_catalysis_SSA_trajectory.npz"
 
 
 def build_cross_catalysis_network() -> tuple[ReactionNetworkData, dict]:
@@ -129,6 +122,7 @@ def assign_cross_terminal_catalysis(network: ReactionNetworkData) -> dict:
                 rebuild=False,
                 mirror_reverse=True,
             )
+
         primary_channels = [int(channel_id) for channel_id in catalyzed_channels]
         mirrored_channels = [
             int(reverse_channel_id)
@@ -193,12 +187,6 @@ def catalyst_species_names(network: ReactionNetworkData) -> list[str]:
     ]
 
 
-# Legacy restriction entry point.
-# Food limiting now lives inside formal INFLOW channel propensities through
-# inflow_capacity / inflow_hill_coefficient, so the runner does not need a
-# FoodUpperLimitRestriction for this example.
-
-
 def json_ready(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -236,15 +224,11 @@ def example_parameters() -> dict:
         "saturation_alpha": SATURATION_ALPHA,
         "catalytic_strength": CATALYTIC_STRENGTH,
         "cross_catalysis_rules": dict(CROSS_CATALYSIS_RULES),
-        "blended_i1": BLENDED_I1,
-        "blended_i2": BLENDED_I2,
-        "blended_dt_cle": BLENDED_DT_CLE,
-        "blended_dt_macro": BLENDED_DT_MACRO,
     }
 
 
 def print_run_summary(run_result, trajectory_record) -> None:
-    print("\nBlended hybrid summary:")
+    print("\nSSA summary:")
     print(format_stepper_info(run_result.summary.metadata))
     print(
         f"t={run_result.summary.final_time:.4f}, "
@@ -260,33 +244,11 @@ def print_run_summary(run_result, trajectory_record) -> None:
 
 
 def main() -> None:
+    build_started_at = perf_counter()
     network, catalysis_result = build_cross_catalysis_network()
-    # restriction = build_food_upper_limit_restriction(network)
-    # stepper = BlendedHybridStepper(
-    #     BlendedHybridConfig(
-    #         i1=BLENDED_I1,
-    #         i2=BLENDED_I2,
-    #         dt_cle=BLENDED_DT_CLE,
-    #         dt_macro=BLENDED_DT_MACRO,
-    #         use_reaction_interval_dt=False,
-    #         reaction_interval_update_steps=1,
-    #         beta_species_mode="reactants",
-    #     )
-    # )
-    stepper = SSAStepper()
-    # stepper = OptimizedNRMStepper()
-    # stepper = NRMBlendedHybridStepper(
-    #     BlendedHybridConfig(
-    #         i1=BLENDED_I1,
-    #         i2=BLENDED_I2,
-    #         dt_cle=BLENDED_DT_CLE,
-    #         dt_macro=BLENDED_DT_MACRO,
-    #         use_reaction_interval_dt=False,
-    #         reaction_interval_update_steps=1,
-    #         beta_species_mode="reactants",
-    #     )
-    # )
-    print("Cross-catalysis reaction system")
+    # build_elapsed = perf_counter() - build_started_at
+
+    print("Cross-catalysis SSA reaction system")
     print(f"alphabet={ALPHABET}, max_len={MAX_LEN}")
     print(f"n_species={network.n_species}, n_channels={network.n_channels}")
     print(f"catalysis_mode={network.catalysis_mode}, saturation_alpha={network.saturation_alpha}")
@@ -301,16 +263,12 @@ def main() -> None:
     print(f"catalyzed channels={catalyzed_channel_count(network)}")
 
     recorder = TrajectoryRecorder()
-    t0 = perf_counter()
-
-    build_elapsed = perf_counter() - t0
     result = ExperimentRunner().run_one(
         network,
-        stepper,
+        SSAStepper(),
         t_end=T_END,
         seed=SEED,
         recorder=recorder,
-        # restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
         timing_report=True,
@@ -322,6 +280,10 @@ def main() -> None:
     trajectory_record.run_metadata["example_parameters"] = example_parameters()
     trajectory_record.run_metadata["catalysis_assignment"] = json_ready(catalysis_result)
     trajectory_record.run_metadata["catalyst_species_names"] = catalyst_species_names(network)
+    trajectory_record.run_metadata["network"] = {
+        "n_species": int(network.n_species),
+        "n_channels": int(network.n_channels),
+    }
     save_trajectory_record(OUTPUT_PATH, trajectory_record)
 
     print_run_summary(result, trajectory_record)
