@@ -3,6 +3,9 @@ from polymer_sim.model.catalysis import (
     assign_random_longest_catalysts_to_distinct_channels,
     clear_all_catalysis,
     longest_polymer_species_ids,
+    scale_all_catalytic_strengths,
+    set_all_existing_catalytic_strengths,
+    set_catalytic_strengths_for_channels,
 )
 from polymer_sim.model.rules import ReactionRuleTables, build_reaction_rule_tables
 from polymer_sim.model.species import SpeciesSpace, generate_fixed_species_space
@@ -32,4 +35,7 @@ __all__ = [
     "clear_all_catalysis",
     "generate_fixed_species_space",
     "longest_polymer_species_ids",
+    "scale_all_catalytic_strengths",
+    "set_all_existing_catalytic_strengths",
+    "set_catalytic_strengths_for_channels",
 ]

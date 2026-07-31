@@ -42,6 +42,40 @@ class StepResult:
 
 
 @dataclass(slots=True)
+class _AdaptiveCLEResult:
+    x: np.ndarray
+    continuous_abs: np.ndarray
+    dt: float
+    requested_dt: float
+    rejected_attempts: int
+    n_clipped: int
+    n_low_count_rounded: int
+    total_cle_propensity: float
+    dt_after: float
+    min_dt_reached: bool
+
+
+@dataclass(slots=True)
+class _FastCLEAdvanceResult:
+    continuous_abs: np.ndarray
+    advanced_time: float
+    requested_dt: float
+    rejected_attempts: int
+    n_clipped: int
+    dt_after: float | None
+    min_dt_reached: bool
+
+
+@dataclass(slots=True)
+class _ChannelBetaLookup:
+    relevant_species: np.ndarray
+    relevant_mask: np.ndarray
+    n_channels: int
+    n_species: int
+    mode: str
+
+
+@dataclass(slots=True)
 class OptimizedNRMConfig:
     use_dependency_graph: bool = True
     fallback_full_recompute: bool = True
@@ -81,6 +115,11 @@ class PDMPConfig:
     validate_nonnegative: bool = True
     hazard_tol: float = 1e-12
     diagnostics: bool = True
+    discrete_event_method: str = "auto"
+    use_discrete_event_heap: bool = False
+    use_local_propensity_updates: bool = True
+    local_propensity_full_recompute_fraction: float = 0.5
+    heap_rebuild_factor: float = 4.0
 
     def __post_init__(self) -> None:
         self.ode_step = float(self.ode_step)
@@ -90,10 +129,24 @@ class PDMPConfig:
         self.validate_nonnegative = bool(self.validate_nonnegative)
         self.hazard_tol = float(self.hazard_tol)
         self.diagnostics = bool(self.diagnostics)
+        self.discrete_event_method = _normalize_pdmp_discrete_event_method(
+            self.discrete_event_method,
+            legacy_use_heap=bool(self.use_discrete_event_heap),
+        )
+        # Keep the historical boolean aligned for old call sites and metadata.
+        self.use_discrete_event_heap = self.discrete_event_method == "nrm_heap"
+        self.use_discrete_event_heap = bool(self.use_discrete_event_heap)
+        self.use_local_propensity_updates = bool(self.use_local_propensity_updates)
+        self.local_propensity_full_recompute_fraction = float(self.local_propensity_full_recompute_fraction)
+        self.heap_rebuild_factor = float(self.heap_rebuild_factor)
         if self.ode_step <= 0.0:
             raise ValueError("ode_step must be > 0")
         if self.hazard_tol < 0.0:
             raise ValueError("hazard_tol must be >= 0")
+        if not (0.0 <= self.local_propensity_full_recompute_fraction <= 1.0):
+            raise ValueError("local_propensity_full_recompute_fraction must be in [0, 1]")
+        if self.heap_rebuild_factor < 1.0:
+            raise ValueError("heap_rebuild_factor must be >= 1")
 
 
 @dataclass(slots=True)
@@ -110,6 +163,12 @@ class BlendedHybridConfig:
     use_reaction_interval_dt: bool = False
     reaction_interval_update_steps: int = 100
     reaction_interval_scale: float = 1.0
+    adaptive_cle_dt: bool = True
+    cle_dt_min: float = 1e-12
+    cle_dt_max: float | None = None
+    cle_dt_shrink_factor: float = 0.5
+    cle_dt_growth_factor: float = 2.0
+    cle_dt_max_retries: int = 20
 
     def __post_init__(self) -> None:
         self.i1 = float(self.i1)
@@ -117,10 +176,18 @@ class BlendedHybridConfig:
         self.dt_cle = float(self.dt_cle)
         self.dt_macro = None if self.dt_macro is None else float(self.dt_macro)
         self.beta_tol = float(self.beta_tol)
+        self.clip_negative = bool(self.clip_negative)
+        self.use_reaction_interval_dt = bool(self.use_reaction_interval_dt)
         self.beta_species_mode = str(self.beta_species_mode).lower()
         self.round_low_counts_after_cle = bool(self.round_low_counts_after_cle)
         self.reaction_interval_update_steps = int(self.reaction_interval_update_steps)
         self.reaction_interval_scale = float(self.reaction_interval_scale)
+        self.adaptive_cle_dt = bool(self.adaptive_cle_dt)
+        self.cle_dt_min = float(self.cle_dt_min)
+        self.cle_dt_max = None if self.cle_dt_max is None else float(self.cle_dt_max)
+        self.cle_dt_shrink_factor = float(self.cle_dt_shrink_factor)
+        self.cle_dt_growth_factor = float(self.cle_dt_growth_factor)
+        self.cle_dt_max_retries = int(self.cle_dt_max_retries)
         if self.i1 >= self.i2:
             raise ValueError("i1 must be < i2")
         if self.dt_cle <= 0.0:
@@ -137,6 +204,16 @@ class BlendedHybridConfig:
             raise ValueError("reaction_interval_update_steps must be > 0")
         if self.reaction_interval_scale <= 0.0:
             raise ValueError("reaction_interval_scale must be > 0")
+        if self.cle_dt_min <= 0.0:
+            raise ValueError("cle_dt_min must be > 0")
+        if self.cle_dt_max is not None and self.cle_dt_max < self.cle_dt_min:
+            raise ValueError("cle_dt_max must be >= cle_dt_min when provided")
+        if not (0.0 < self.cle_dt_shrink_factor < 1.0):
+            raise ValueError("cle_dt_shrink_factor must be in (0, 1)")
+        if self.cle_dt_growth_factor < 1.0:
+            raise ValueError("cle_dt_growth_factor must be >= 1")
+        if self.cle_dt_max_retries < 0:
+            raise ValueError("cle_dt_max_retries must be >= 0")
 
     @property
     def effective_dt_macro(self) -> float:
@@ -663,7 +740,7 @@ class PDMPStepper(BaseStepper):
                 self._mark_propensities_dirty(store, "external invalidation")
             propensities = self._get_propensities(network, state, store, reason="initial adaptation")
             partition = self._compute_partition(network, state, propensities, context)
-            self._install_partition(store, partition, rng, reset_all=True)
+            self._install_partition(store, partition, rng, current_time=float(state.t), propensities=propensities, reset_all=True)
             self._invalidated = False
             repartitions += 1
 
@@ -709,15 +786,22 @@ class PDMPStepper(BaseStepper):
             #     hazard accumulation;
             #   - there is no dense output object.
             #
-            # Difference from the pseudocode:
-            #   The pseudocode uses one scalar integrated hazard w over RD and
-            #   a scalar threshold u.  This implementation keeps per-channel
-            #   hazards and thresholds, closer to a next-reaction formulation
-            #   for the discrete subset.
+            # Discrete event selection is configurable:
+            #   - "gillespie" uses the Direct SSA rule on RD for this frozen
+            #     micro-step: tau ~ Exp(sum lambda_k), then channel sampled by
+            #     lambda_k / sum lambda_k.
+            #   - "nrm_scan" keeps per-channel internal hazard/threshold arrays
+            #     and scans for the first threshold crossing.
+            #   - "nrm_heap" keeps scheduled real firing times in a priority
+            #     queue and lazily refreshes affected channels.
             tau, fired_channel = self._next_discrete_event(
                 store,
+                network,
+                state,
                 discrete_channels,
                 propensities,
+                rng=rng,
+                current_time=float(state.t),
                 horizon=step_dt,
             )
             if fired_channel is not None:
@@ -730,11 +814,10 @@ class PDMPStepper(BaseStepper):
                 #   else: accumulate Delta z and continue inside the same ODE step
                 #
                 # Current implementation:
-                #   - _next_discrete_event(...) computes tR by the frozen
-                #     per-channel hazard slope;
-                #   - the selected channel is the channel whose threshold is
-                #     reached first, so there is no separate multinomial draw;
-                #   - the jump is applied immediately to state.x;
+                #   - _next_discrete_event(...) computes tR using the selected
+                #     discrete_event_method;
+                #   - the jump is applied immediately to state.x after the
+                #     continuous drift over event_dt;
                 #   - this method returns after one event.  The runner calls
                 #     step(...) again for additional events, so the inner
                 #     "while wN >= u" loop is distributed across runner steps;
@@ -744,13 +827,88 @@ class PDMPStepper(BaseStepper):
                 continuous_abs_total += self._advance_continuous(network, state, propensities, continuous_channels, event_dt)
                 self._advance_hazards(store, discrete_channels, propensities, event_dt)
                 state.t += event_dt
+                changed_species = self._changed_species_for_channels(network, continuous_channels) if event_dt > 0.0 else np.empty(0, dtype=np.int64)
+                if self._uses_discrete_event_gillespie():
+                    sampled_channel, event_total = self._sample_gillespie_channel_at_current_state(
+                        network,
+                        state,
+                        discrete_channels,
+                        rng,
+                    )
+                    if sampled_channel is None:
+                        store["gillespie_disabled_event_candidates"] = int(
+                            store.get("gillespie_disabled_event_candidates", 0)
+                        ) + 1
+                        self._mark_propensities_dirty(
+                            store,
+                            "gillespie event candidate disabled after continuous drift",
+                            changed_species,
+                        )
+                        if (
+                            self.config.adaptive
+                            and self.config.repartition_on_bounds
+                            and not self._require_partition(store).is_within_bounds(state.x)
+                        ):
+                            propensities = self._get_propensities(network, state, store, reason="bounds repartition")
+                            partition = self._compute_partition(network, state, propensities, context)
+                            self._install_partition(
+                                store,
+                                partition,
+                                rng,
+                                current_time=float(state.t),
+                                propensities=propensities,
+                                reset_all=False,
+                            )
+                            repartitions += 1
+                        continue
+                    fired_channel = int(sampled_channel)
+                    last_total_discrete_propensity = float(event_total)
+                elif not self._channel_has_available_reactants(network, state, int(fired_channel)):
+                    store["disabled_discrete_event_candidates"] = int(
+                        store.get("disabled_discrete_event_candidates", 0)
+                    ) + 1
+                    if self._uses_discrete_event_heap():
+                        self._refresh_propensities_after_state_change(
+                            network,
+                            state,
+                            store,
+                            changed_species,
+                            rng,
+                            reason="nrm event candidate disabled after continuous drift",
+                            fired_channel=int(fired_channel),
+                        )
+                    else:
+                        self._mark_propensities_dirty(
+                            store,
+                            "nrm event candidate disabled after continuous drift",
+                            changed_species,
+                        )
+                        if self._uses_discrete_event_hazards():
+                            self._reset_channel_threshold(store, int(fired_channel), rng)
+                    continue
+                jump_changed_species = network.get_channel_changed_species(int(fired_channel))
                 network.apply_channel_update(state, int(fired_channel))
                 self._validate_or_clip_state(state)
+                changed_species = self._merge_species_ids(changed_species, jump_changed_species)
                 # The continuous drift over event_dt and the discrete jump both
-                # change state.x.  The old propensity vector describes x_pre and
-                # must not be reused for the post-event state.
-                self._mark_propensities_dirty(store, "discrete event changed state")
-                self._reset_channel_threshold(store, int(fired_channel), rng)
+                # change state.x.  In heap mode we update the cached propensity
+                # vector immediately and reschedule only affected discrete
+                # channels.  In scan mode we keep the older hazard/threshold
+                # implementation and let the next read recompute the full vector.
+                if self._uses_discrete_event_heap():
+                    self._refresh_propensities_after_state_change(
+                        network,
+                        state,
+                        store,
+                        changed_species,
+                        rng,
+                        reason="discrete event changed state",
+                        fired_channel=int(fired_channel),
+                    )
+                else:
+                    self._mark_propensities_dirty(store, "discrete event changed state", changed_species)
+                    if self._uses_discrete_event_hazards():
+                        self._reset_channel_threshold(store, int(fired_channel), rng)
 
                 if self.config.adaptive and self.config.repartition_on_event:
                     # Repartition requires propensities at the new state.  The
@@ -759,7 +917,7 @@ class PDMPStepper(BaseStepper):
                     # masks, not state.x.
                     propensities = self._get_propensities(network, state, store, reason="event repartition")
                     partition = self._compute_partition(network, state, propensities, context)
-                    self._install_partition(store, partition, rng, reset_all=False)
+                    self._install_partition(store, partition, rng, current_time=float(state.t), propensities=propensities, reset_all=False)
                     repartitions += 1
 
                 state.step_count += 1
@@ -797,7 +955,18 @@ class PDMPStepper(BaseStepper):
                 # continuous part of the step.  If RC is empty, only time changed
                 # and propensities remain valid because current rates are time
                 # homogeneous.
-                self._mark_propensities_dirty(store, "continuous drift changed state")
+                changed_species = self._changed_species_for_channels(network, continuous_channels)
+                if self._uses_discrete_event_heap():
+                    self._refresh_propensities_after_state_change(
+                        network,
+                        state,
+                        store,
+                        changed_species,
+                        rng,
+                        reason="continuous drift changed state",
+                    )
+                else:
+                    self._mark_propensities_dirty(store, "continuous drift changed state", changed_species)
 
             # Algorithm 2 step 4: check whether the partition is invalid.
             # Pseudocode:
@@ -820,7 +989,7 @@ class PDMPStepper(BaseStepper):
                 # marks the cache dirty.
                 propensities = self._get_propensities(network, state, store, reason="bounds repartition")
                 partition = self._compute_partition(network, state, propensities, context)
-                self._install_partition(store, partition, rng, reset_all=False)
+                self._install_partition(store, partition, rng, current_time=float(state.t), propensities=propensities, reset_all=False)
                 repartitions += 1
 
         state.step_count += 1
@@ -871,6 +1040,14 @@ class PDMPStepper(BaseStepper):
             store["propensities"] = np.empty(network.n_channels, dtype=float)
             store["propensities_valid"] = False
             store["propensities_dirty_reason"] = "new runtime store"
+            store["propensities_dirty_species"] = np.empty(0, dtype=np.int64)
+            store["propensity_update_mode"] = "full"
+            store["propensity_update_channels"] = int(network.n_channels)
+            store["scheduled_times"] = np.full(network.n_channels, np.inf, dtype=float)
+            store["heap_versions"] = np.zeros(network.n_channels, dtype=np.int64)
+            store["event_heap"] = []
+            store["heap_stale_pops"] = 0
+            store["heap_rebuilds"] = 0
         return store
 
     def _get_propensities(
@@ -907,14 +1084,25 @@ class PDMPStepper(BaseStepper):
         self._clean_propensities(cached)
         store["propensities_valid"] = True
         store["propensities_dirty_reason"] = None
+        store["propensities_dirty_species"] = np.empty(0, dtype=np.int64)
         store["propensities_last_compute_reason"] = str(reason)
+        store["propensity_update_mode"] = "full"
+        store["propensity_update_channels"] = int(network.n_channels)
         return cached
 
-    def _mark_propensities_dirty(self, store: dict[str, Any], reason: str) -> None:
+    def _mark_propensities_dirty(
+        self,
+        store: dict[str, Any],
+        reason: str,
+        changed_species: np.ndarray | None = None,
+    ) -> None:
         """Mark cached propensities invalid after a state-changing operation."""
 
         store["propensities_valid"] = False
         store["propensities_dirty_reason"] = str(reason)
+        if changed_species is not None:
+            previous = np.asarray(store.get("propensities_dirty_species", np.empty(0, dtype=np.int64)), dtype=np.int64)
+            store["propensities_dirty_species"] = self._merge_species_ids(previous, changed_species)
 
     def _compute_partition(
         self,
@@ -948,6 +1136,8 @@ class PDMPStepper(BaseStepper):
         partition: PDMPPartitionResult,
         rng: np.random.Generator,
         *,
+        current_time: float,
+        propensities: np.ndarray,
         reset_all: bool,
     ) -> None:
         thresholds = np.asarray(store["thresholds"], dtype=float)
@@ -970,15 +1160,147 @@ class PDMPStepper(BaseStepper):
 
         store["partition"] = partition
         store["discrete_mask"] = new_mask
+        if self._uses_discrete_event_heap():
+            self._install_discrete_event_heap_mask(
+                store,
+                current_time=float(current_time),
+                propensities=propensities,
+                rng=rng,
+                old_mask=old_mask,
+                new_mask=new_mask,
+                reset_all=reset_all,
+            )
+
+    def _install_discrete_event_heap_mask(
+        self,
+        store: dict[str, Any],
+        *,
+        current_time: float,
+        propensities: np.ndarray,
+        rng: np.random.Generator,
+        old_mask: np.ndarray,
+        new_mask: np.ndarray,
+        reset_all: bool,
+    ) -> None:
+        scheduled = self._ensure_heap_array(store, "scheduled_times", fill=np.inf)
+        versions = self._ensure_heap_versions(store)
+        heap = self._ensure_event_heap(store)
+
+        if reset_all:
+            scheduled[:] = np.inf
+            versions[:] = 0
+            heap.clear()
+            initialize_mask = new_mask
+        else:
+            removed_mask = old_mask & ~new_mask
+            if np.any(removed_mask):
+                removed = np.flatnonzero(removed_mask).astype(np.int64, copy=False)
+                scheduled[removed] = np.inf
+                versions[removed] += 1
+            initialize_mask = new_mask & ~old_mask
+
+        initialize_channels = np.flatnonzero(initialize_mask).astype(np.int64, copy=False)
+        for channel_id in initialize_channels:
+            self._schedule_discrete_heap_channel(
+                store,
+                int(channel_id),
+                now=float(current_time),
+                propensity=float(propensities[int(channel_id)]),
+                rng=rng,
+                fresh=True,
+            )
+        self._maybe_rebuild_discrete_event_heap(store)
+
+    def _ensure_heap_array(self, store: dict[str, Any], name: str, *, fill: float) -> np.ndarray:
+        values = store.get(name)
+        n_channels = int(store["n_channels"])
+        if not isinstance(values, np.ndarray) or values.shape != (n_channels,):
+            values = np.full(n_channels, float(fill), dtype=float)
+            store[name] = values
+        return values
+
+    def _ensure_heap_versions(self, store: dict[str, Any]) -> np.ndarray:
+        versions = store.get("heap_versions")
+        n_channels = int(store["n_channels"])
+        if not isinstance(versions, np.ndarray) or versions.shape != (n_channels,):
+            versions = np.zeros(n_channels, dtype=np.int64)
+            store["heap_versions"] = versions
+        return versions
+
+    def _ensure_event_heap(self, store: dict[str, Any]) -> list[tuple[float, int, int]]:
+        heap = store.get("event_heap")
+        if not isinstance(heap, list):
+            heap = []
+            store["event_heap"] = heap
+        return heap
+
+    def _schedule_discrete_heap_channel(
+        self,
+        store: dict[str, Any],
+        channel_id: int,
+        *,
+        now: float,
+        propensity: float,
+        rng: np.random.Generator,
+        fresh: bool,
+    ) -> None:
+        scheduled = self._ensure_heap_array(store, "scheduled_times", fill=np.inf)
+        versions = self._ensure_heap_versions(store)
+        heap = self._ensure_event_heap(store)
+        cid = int(channel_id)
+        if fresh:
+            versions[cid] += 1
+        propensity_value = max(float(propensity), 0.0)
+        if propensity_value <= self.config.hazard_tol:
+            scheduled[cid] = np.inf
+            return
+        fire_time = float(now) + float(rng.exponential(1.0 / propensity_value))
+        scheduled[cid] = fire_time
+        heapq.heappush(heap, (fire_time, cid, int(versions[cid])))
+
+    def _rebuild_discrete_event_heap(self, store: dict[str, Any]) -> None:
+        scheduled = self._ensure_heap_array(store, "scheduled_times", fill=np.inf)
+        versions = self._ensure_heap_versions(store)
+        mask = np.asarray(store.get("discrete_mask"), dtype=bool)
+        channels = np.flatnonzero(mask & np.isfinite(scheduled)).astype(np.int64, copy=False)
+        heap = [(float(scheduled[int(cid)]), int(cid), int(versions[int(cid)])) for cid in channels]
+        heapq.heapify(heap)
+        store["event_heap"] = heap
+        store["heap_rebuilds"] = int(store.get("heap_rebuilds", 0)) + 1
+
+    def _maybe_rebuild_discrete_event_heap(self, store: dict[str, Any]) -> None:
+        heap = self._ensure_event_heap(store)
+        scheduled = self._ensure_heap_array(store, "scheduled_times", fill=np.inf)
+        live = int(np.sum(np.isfinite(scheduled) & np.asarray(store.get("discrete_mask"), dtype=bool)))
+        limit = max(int(np.ceil(self.config.heap_rebuild_factor * max(live, 1))), live + 1)
+        if len(heap) > limit:
+            self._rebuild_discrete_event_heap(store)
 
     def _next_discrete_event(
         self,
         store: dict[str, Any],
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
         discrete_channels: np.ndarray,
         propensities: np.ndarray,
         *,
+        rng: np.random.Generator,
+        current_time: float,
         horizon: float,
     ) -> tuple[float | None, int | None]:
+        if self._uses_discrete_event_heap():
+            return self._next_discrete_heap_event(store, current_time=float(current_time), horizon=float(horizon))
+        if self._uses_discrete_event_gillespie():
+            return self._next_discrete_gillespie_event(
+                network,
+                state,
+                discrete_channels,
+                propensities,
+                rng=rng,
+                current_time=float(current_time),
+                horizon=float(horizon),
+            )
+
         # Discrete-event locator for the current micro-step.
         # Pseudocode uses a scalar condition wN >= u and then solves w(tR) = u.
         # Here each discrete channel has its own threshold and hazard.  Under
@@ -1003,6 +1325,181 @@ class PDMPStepper(BaseStepper):
         if not np.isfinite(tau) or tau > float(horizon) + self.config.hazard_tol:
             return None, None
         return max(tau, 0.0), int(channels[local])
+
+    def _next_discrete_gillespie_event(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        discrete_channels: np.ndarray,
+        propensities: np.ndarray,
+        *,
+        rng: np.random.Generator,
+        current_time: float,
+        horizon: float,
+    ) -> tuple[float | None, int | None]:
+        channels = np.asarray(discrete_channels, dtype=np.int64)
+        if channels.size == 0:
+            return None, None
+        props = np.maximum(np.asarray(propensities, dtype=float)[channels], 0.0)
+        self._zero_unavailable_gillespie_props(network, state, channels, props)
+        total = float(np.sum(props))
+        if total <= self.config.hazard_tol:
+            return None, None
+        tau = float(rng.exponential(1.0 / total))
+        if not np.isfinite(tau) or tau > float(horizon) + self.config.hazard_tol:
+            return None, None
+        # Only the event time is decided here.  The actual channel is sampled
+        # after continuous drift has advanced to the event state, using current
+        # RD propensities and an explicit reactant-availability check.
+        return max(tau, 0.0), -1
+
+    def _zero_unavailable_gillespie_props(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        channels: np.ndarray,
+        props: np.ndarray,
+    ) -> None:
+        channels_array = np.asarray(channels, dtype=np.int64)
+        if channels_array.size == 0:
+            return
+        available = self._available_channel_mask(network, state, channels_array)
+        props[~available] = 0.0
+
+    def _sample_gillespie_channel_at_current_state(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        discrete_channels: np.ndarray,
+        rng: np.random.Generator,
+    ) -> tuple[int | None, float]:
+        channels = np.asarray(discrete_channels, dtype=np.int64)
+        if channels.size == 0:
+            return None, 0.0
+
+        props = network.compute_propensities_for_channels(channels, state)
+        self._clean_propensities(props)
+        self._zero_unavailable_gillespie_props(network, state, channels, props)
+        total = float(np.sum(props))
+        if total <= self.config.hazard_tol:
+            return None, 0.0
+        threshold = float(rng.random() * total)
+        cumulative = np.cumsum(props)
+        local = int(np.searchsorted(cumulative, threshold, side="right"))
+        if local >= channels.size:
+            local = int(channels.size - 1)
+        return int(channels[local]), total
+
+    def _channel_has_available_reactants(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        channel_id: int,
+    ) -> bool:
+        if self._has_precomputed_reactant_terms(network):
+            return bool(self._available_channel_mask(network, state, np.asarray([int(channel_id)], dtype=np.int64))[0])
+        reactants = network.get_channel_reactants(int(channel_id))
+        if not reactants:
+            return True
+        required: dict[int, int] = {}
+        for sid in reactants:
+            key = int(sid)
+            required[key] = required.get(key, 0) + 1
+        x = np.asarray(state.x, dtype=float)
+        tol = max(float(self.config.hazard_tol), 1e-12)
+        return all(float(x[sid]) >= float(count) - tol for sid, count in required.items())
+
+    def _available_channel_mask(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        channels: np.ndarray,
+    ) -> np.ndarray:
+        ids = np.asarray(channels, dtype=np.int64)
+        available = np.ones(ids.shape, dtype=bool)
+        if ids.size == 0:
+            return available
+        if not self._has_precomputed_reactant_terms(network):
+            for position, channel_id in enumerate(ids):
+                available[position] = self._channel_has_available_reactants(network, state, int(channel_id))
+            return available
+
+        order = np.asarray(getattr(network, "reaction_order"), dtype=np.int8)[ids]
+        reactant1 = np.asarray(getattr(network, "reactant1"), dtype=np.int64)[ids]
+        reactant2 = np.asarray(getattr(network, "reactant2"), dtype=np.int64)[ids]
+        homo_second_order = np.asarray(getattr(network, "homo_second_order"), dtype=bool)[ids]
+        x = np.asarray(state.x, dtype=float)
+        tol = max(float(self.config.hazard_tol), 1e-12)
+
+        first = order == 1
+        if np.any(first):
+            available[first] = x[reactant1[first]] >= 1.0 - tol
+
+        second = order == 2
+        if np.any(second):
+            homo = second & homo_second_order
+            if np.any(homo):
+                available[homo] = x[reactant1[homo]] >= 2.0 - tol
+            hetero = second & ~homo_second_order
+            if np.any(hetero):
+                available[hetero] = (
+                    (x[reactant1[hetero]] >= 1.0 - tol)
+                    & (x[reactant2[hetero]] >= 1.0 - tol)
+                )
+
+        higher_order = order > 2
+        if np.any(higher_order):
+            for position in np.flatnonzero(higher_order):
+                reactants = network.get_channel_reactants(int(ids[int(position)]))
+                required: dict[int, int] = {}
+                for sid in reactants:
+                    key = int(sid)
+                    required[key] = required.get(key, 0) + 1
+                available[int(position)] = all(
+                    float(x[sid]) >= float(count) - tol
+                    for sid, count in required.items()
+                )
+        return available
+
+    def _has_precomputed_reactant_terms(self, network: ReactionNetworkData | ElementaryMassActionNetwork) -> bool:
+        return all(
+            hasattr(network, name)
+            for name in ("reaction_order", "reactant1", "reactant2", "homo_second_order")
+        )
+
+    def _next_discrete_heap_event(
+        self,
+        store: dict[str, Any],
+        *,
+        current_time: float,
+        horizon: float,
+    ) -> tuple[float | None, int | None]:
+        heap = self._ensure_event_heap(store)
+        scheduled = self._ensure_heap_array(store, "scheduled_times", fill=np.inf)
+        versions = self._ensure_heap_versions(store)
+        discrete_mask = np.asarray(store.get("discrete_mask"), dtype=bool)
+        deadline = float(current_time) + float(horizon) + self.config.hazard_tol
+
+        while heap:
+            fire_time, channel_id, version = heap[0]
+            cid = int(channel_id)
+            valid = (
+                0 <= cid < scheduled.size
+                and bool(discrete_mask[cid])
+                and int(version) == int(versions[cid])
+                and np.isfinite(fire_time)
+                and float(fire_time) == float(scheduled[cid])
+            )
+            if not valid:
+                heapq.heappop(heap)
+                store["heap_stale_pops"] = int(store.get("heap_stale_pops", 0)) + 1
+                continue
+            if float(fire_time) > deadline:
+                return None, None
+            heapq.heappop(heap)
+            scheduled[cid] = np.inf
+            return max(float(fire_time) - float(current_time), 0.0), cid
+        return None, None
 
     def _advance_continuous(
         self,
@@ -1038,6 +1535,8 @@ class PDMPStepper(BaseStepper):
         # This advances integrated hazards for RD over dt.  The implementation
         # uses one hazard per discrete channel instead of the pseudocode's
         # scalar w = integral sum_{RD} lambda_k(z) dt.
+        if not self._uses_discrete_event_hazards():
+            return
         if dt <= 0.0 or discrete_channels.size == 0:
             return
         channels = np.asarray(discrete_channels, dtype=np.int64)
@@ -1055,6 +1554,248 @@ class PDMPStepper(BaseStepper):
         hazards = np.asarray(store["hazards"], dtype=float)
         thresholds[cid] = float(rng.exponential(1.0))
         hazards[cid] = 0.0
+
+    def _refresh_propensities_after_state_change(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        store: dict[str, Any],
+        changed_species: np.ndarray,
+        rng: np.random.Generator,
+        *,
+        reason: str,
+        fired_channel: int | None = None,
+    ) -> None:
+        cached = store.get("propensities")
+        if not isinstance(cached, np.ndarray) or cached.shape != (network.n_channels,):
+            cached = np.empty(network.n_channels, dtype=float)
+            store["propensities"] = cached
+            network.compute_all_propensities(state, out=cached)
+            self._clean_propensities(cached)
+            self._rebuild_heap_from_propensities(store, state, cached, rng)
+            store["propensities_valid"] = True
+            store["propensities_dirty_reason"] = None
+            store["propensities_dirty_species"] = np.empty(0, dtype=np.int64)
+            store["propensity_update_mode"] = "full"
+            store["propensity_update_channels"] = int(network.n_channels)
+            return
+
+        if not bool(store.get("propensities_valid", False)):
+            network.compute_all_propensities(state, out=cached)
+            self._clean_propensities(cached)
+            self._rebuild_heap_from_propensities(store, state, cached, rng)
+            store["propensities_valid"] = True
+            store["propensities_dirty_reason"] = None
+            store["propensities_dirty_species"] = np.empty(0, dtype=np.int64)
+            store["propensity_update_mode"] = "full"
+            store["propensity_update_channels"] = int(network.n_channels)
+            return
+
+        species = np.asarray(changed_species, dtype=np.int64)
+        if species.ndim != 1:
+            raise ValueError("changed_species must be a 1D array")
+        species = np.unique(species)
+        if species.size == 0 and fired_channel is None:
+            return
+
+        if self.config.use_local_propensity_updates and species.size:
+            try:
+                affected = network.affected_channels_for_species(species)
+            except Exception:
+                affected = np.arange(network.n_channels, dtype=np.int64)
+        else:
+            affected = np.arange(network.n_channels, dtype=np.int64)
+        if fired_channel is not None:
+            fired = np.asarray([int(fired_channel)], dtype=np.int64)
+            affected = fired if affected.size == 0 else np.unique(np.concatenate((affected, fired))).astype(np.int64, copy=False)
+        if affected.size == 0:
+            return
+
+        full_recompute = (
+            not self.config.use_local_propensity_updates
+            or affected.size >= int(np.ceil(self.config.local_propensity_full_recompute_fraction * network.n_channels))
+        )
+        if full_recompute:
+            affected = np.arange(network.n_channels, dtype=np.int64)
+
+        old_propensities = np.asarray(cached[affected], dtype=float).copy()
+        old_scheduled = np.asarray(store.get("scheduled_times", np.full(network.n_channels, np.inf, dtype=float)))[affected].copy()
+        if full_recompute:
+            network.compute_all_propensities(state, out=cached)
+            self._clean_propensities(cached)
+            new_propensities = cached[affected]
+            update_mode = "full"
+        else:
+            new_propensities = network.compute_propensities_for_channels(affected, state)
+            self._clean_propensities(new_propensities)
+            cached[affected] = new_propensities
+            update_mode = "local"
+
+        if self._uses_discrete_event_heap():
+            self._reschedule_discrete_heap_channels(
+                store,
+                affected,
+                old_propensities,
+                old_scheduled,
+                new_propensities,
+                now=float(state.t),
+                rng=rng,
+                fired_channel=fired_channel,
+            )
+            self._maybe_rebuild_discrete_event_heap(store)
+
+        store["propensities_valid"] = True
+        store["propensities_dirty_reason"] = None
+        store["propensities_dirty_species"] = np.empty(0, dtype=np.int64)
+        store["propensities_last_compute_reason"] = str(reason)
+        store["propensity_update_mode"] = update_mode
+        store["propensity_update_channels"] = int(affected.size)
+
+    def _rebuild_heap_from_propensities(
+        self,
+        store: dict[str, Any],
+        state: SystemState,
+        propensities: np.ndarray,
+        rng: np.random.Generator,
+    ) -> None:
+        if not self._uses_discrete_event_heap():
+            return
+        discrete_mask = np.asarray(store.get("discrete_mask"), dtype=bool)
+        scheduled = self._ensure_heap_array(store, "scheduled_times", fill=np.inf)
+        versions = self._ensure_heap_versions(store)
+        scheduled[:] = np.inf
+        versions += 1
+        heap: list[tuple[float, int, int]] = []
+        for channel_id in np.flatnonzero(discrete_mask).astype(np.int64, copy=False):
+            cid = int(channel_id)
+            propensity = max(float(propensities[cid]), 0.0)
+            if propensity <= self.config.hazard_tol:
+                continue
+            fire_time = float(state.t) + float(rng.exponential(1.0 / propensity))
+            scheduled[cid] = fire_time
+            heap.append((fire_time, cid, int(versions[cid])))
+        heapq.heapify(heap)
+        store["event_heap"] = heap
+        store["heap_rebuilds"] = int(store.get("heap_rebuilds", 0)) + 1
+
+    def _reschedule_discrete_heap_channels(
+        self,
+        store: dict[str, Any],
+        channels: np.ndarray,
+        old_propensities: np.ndarray,
+        old_scheduled: np.ndarray,
+        new_propensities: np.ndarray,
+        *,
+        now: float,
+        rng: np.random.Generator,
+        fired_channel: int | None,
+    ) -> None:
+        scheduled = self._ensure_heap_array(store, "scheduled_times", fill=np.inf)
+        versions = self._ensure_heap_versions(store)
+        heap = self._ensure_event_heap(store)
+        discrete_mask = np.asarray(store.get("discrete_mask"), dtype=bool)
+
+        channel_array = np.asarray(channels, dtype=np.int64)
+        if channel_array.size == 0:
+            return
+        valid = (channel_array >= 0) & (channel_array < scheduled.size)
+        if discrete_mask.shape == scheduled.shape:
+            valid_indices = np.flatnonzero(valid)
+            valid[valid_indices] = discrete_mask[channel_array[valid_indices]]
+        if not np.any(valid):
+            return
+
+        cids = channel_array[valid]
+        old_a = np.maximum(np.asarray(old_propensities, dtype=float)[valid], 0.0)
+        new_a = np.maximum(np.asarray(new_propensities, dtype=float)[valid], 0.0)
+        old_time = np.asarray(old_scheduled, dtype=float)[valid]
+
+        versions[cids] += 1
+        current_versions = np.asarray(versions[cids], dtype=np.int64)
+        next_times = np.full(cids.shape, np.inf, dtype=float)
+
+        new_active = new_a > self.config.hazard_tol
+        if fired_channel is None:
+            fired_mask = np.zeros(cids.shape, dtype=bool)
+        else:
+            fired_mask = cids == int(fired_channel)
+
+        # Unfired channels keep their already sampled exponential threshold.
+        # If lambda changes from old_a to new_a, the remaining real time scales
+        # by old_a / new_a.  Fired channels, newly active channels, and channels
+        # without a finite previous schedule draw a fresh exponential time.
+        transform = new_active & ~fired_mask & (old_a > self.config.hazard_tol) & np.isfinite(old_time)
+        if np.any(transform):
+            remaining = np.maximum(old_time[transform] - float(now), 0.0)
+            next_times[transform] = float(now) + (old_a[transform] / new_a[transform]) * remaining
+
+        fresh = new_active & ~transform
+        if np.any(fresh):
+            next_times[fresh] = float(now) + rng.exponential(1.0 / new_a[fresh])
+
+        scheduled[cids] = next_times
+        finite = np.isfinite(next_times)
+        if not np.any(finite):
+            return
+
+        entries = [
+            (float(time), int(channel_id), int(version))
+            for time, channel_id, version in zip(next_times[finite], cids[finite], current_versions[finite])
+        ]
+        if len(entries) > max(64, len(heap) // 4):
+            heap.extend(entries)
+            heapq.heapify(heap)
+            store["heap_batch_heapifies"] = int(store.get("heap_batch_heapifies", 0)) + 1
+        else:
+            for entry in entries:
+                heapq.heappush(heap, entry)
+
+    def _transform_heap_fire_time(
+        self,
+        now: float,
+        old_time: float,
+        old_propensity: float,
+        new_propensity: float,
+        rng: np.random.Generator,
+    ) -> float:
+        if new_propensity <= self.config.hazard_tol:
+            return float("inf")
+        if old_propensity <= self.config.hazard_tol or not np.isfinite(old_time):
+            return self._sample_heap_fire_time(float(now), float(new_propensity), rng)
+        remaining = max(float(old_time) - float(now), 0.0)
+        return float(now) + (float(old_propensity) / float(new_propensity)) * remaining
+
+    def _sample_heap_fire_time_or_inf(
+        self,
+        now: float,
+        propensity: float,
+        rng: np.random.Generator,
+    ) -> float:
+        if propensity <= self.config.hazard_tol:
+            return float("inf")
+        return self._sample_heap_fire_time(now, propensity, rng)
+
+    def _sample_heap_fire_time(self, now: float, propensity: float, rng: np.random.Generator) -> float:
+        return float(now) + float(rng.exponential(1.0 / float(propensity)))
+
+    def _changed_species_for_channels(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        channels: np.ndarray,
+    ) -> np.ndarray:
+        ids = np.asarray(channels, dtype=np.int64)
+        if ids.size == 0:
+            return np.empty(0, dtype=np.int64)
+        return np.flatnonzero(np.any(network.nu[ids] != 0.0, axis=0)).astype(np.int64, copy=False)
+
+    def _merge_species_ids(self, first: np.ndarray, second: np.ndarray) -> np.ndarray:
+        a = np.asarray(first, dtype=np.int64)
+        b = np.asarray(second, dtype=np.int64)
+        if a.size == 0:
+            return np.unique(b).astype(np.int64, copy=False)
+        if b.size == 0:
+            return np.unique(a).astype(np.int64, copy=False)
+        return np.unique(np.concatenate((a, b))).astype(np.int64, copy=False)
 
     def _validate_or_clip_state(self, state: SystemState) -> None:
         if not np.all(np.isfinite(state.x)):
@@ -1087,6 +1828,26 @@ class PDMPStepper(BaseStepper):
         np.maximum(values, 0.0, out=values)
         return values
 
+    def _discrete_event_method(self) -> str:
+        return str(getattr(self.config, "discrete_event_method", "nrm_heap" if self.config.use_discrete_event_heap else "nrm_scan"))
+
+    def _uses_discrete_event_heap(self) -> bool:
+        return self._discrete_event_method() == "nrm_heap"
+
+    def _uses_discrete_event_hazards(self) -> bool:
+        return self._discrete_event_method() == "nrm_scan"
+
+    def _uses_discrete_event_gillespie(self) -> bool:
+        return self._discrete_event_method() == "gillespie"
+
+    def _discrete_event_locator_label(self) -> str:
+        method = self._discrete_event_method()
+        if method == "nrm_heap":
+            return "heap"
+        if method == "nrm_scan":
+            return "scan"
+        return "gillespie"
+
     def _details(
         self,
         store: dict[str, Any],
@@ -1113,6 +1874,14 @@ class PDMPStepper(BaseStepper):
             "total_cle_propensity": max(float(total_continuous_propensity), 0.0),
             "total_continuous_propensity": max(float(total_continuous_propensity), 0.0),
             "continuous_channel_abs_increments": np.asarray(continuous_abs_total, dtype=float).copy(),
+            "discrete_event_method": self._discrete_event_method(),
+            "discrete_event_locator": self._discrete_event_locator_label(),
+            "propensity_update_mode": str(store.get("propensity_update_mode", "unknown")),
+            "propensity_update_channels": int(store.get("propensity_update_channels", 0)),
+            "heap_entries": int(len(store.get("event_heap", []))) if self._uses_discrete_event_heap() else 0,
+            "heap_stale_pops": int(store.get("heap_stale_pops", 0)) if self._uses_discrete_event_heap() else 0,
+            "heap_rebuilds": int(store.get("heap_rebuilds", 0)) if self._uses_discrete_event_heap() else 0,
+            "heap_batch_heapifies": int(store.get("heap_batch_heapifies", 0)) if self._uses_discrete_event_heap() else 0,
             "partition_metadata": metadata,
         }
 
@@ -1123,6 +1892,31 @@ class CLEStepper(BaseStepper):
     它只推进被 partition 标为 fast 的 channels。当前实现是显式 Euler-Maruyama
     风格的正态近似增量，并在状态出现负数时裁剪到 0。
     """
+
+    def __init__(
+        self,
+        *,
+        adaptive_dt: bool = True,
+        dt_min: float = 1e-12,
+        dt_shrink_factor: float = 0.5,
+        dt_growth_factor: float = 2.0,
+        max_retries: int = 20,
+    ):
+        self.adaptive_dt = bool(adaptive_dt)
+        self.dt_min = float(dt_min)
+        self.dt_shrink_factor = float(dt_shrink_factor)
+        self.dt_growth_factor = float(dt_growth_factor)
+        self.max_retries = int(max_retries)
+        if self.dt_min <= 0.0:
+            raise ValueError("dt_min must be > 0")
+        if not (0.0 < self.dt_shrink_factor < 1.0):
+            raise ValueError("dt_shrink_factor must be in (0, 1)")
+        if self.dt_growth_factor < 1.0:
+            raise ValueError("dt_growth_factor must be >= 1")
+        if self.max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        self._adaptive_dt: float | None = None
+        self._last_n_clipped = 0
 
     def step(self, state: SystemState, dt: float, context: StepperContext) -> StepResult:
         channels = self._selected_fast_channels(state, context)
@@ -1138,16 +1932,28 @@ class CLEStepper(BaseStepper):
                 },
             )
 
-        continuous_abs = self._apply_cle_increment(state, dt, context, channels)
-        state.t += float(dt)
+        advance = self._apply_cle_increment_adaptive(
+            state,
+            dt,
+            context,
+            channels,
+            grow_on_success=True,
+        )
+        state.t += float(advance.advanced_time)
         state.step_count += 1
         return StepResult(
-            advanced_time=float(dt),
+            advanced_time=float(advance.advanced_time),
             event_occurred=False,
             details={
                 "mode": "cle",
                 "n_fast_channels": int(channels.size),
-                "continuous_channel_abs_increments": continuous_abs,
+                "continuous_channel_abs_increments": advance.continuous_abs,
+                "cle_requested_dt": float(advance.requested_dt),
+                "cle_accepted_dt": float(advance.advanced_time),
+                "cle_rejected_attempts": int(advance.rejected_attempts),
+                "cle_dt_after": None if advance.dt_after is None else float(advance.dt_after),
+                "cle_dt_min_reached": bool(advance.min_dt_reached),
+                "n_clipped": int(advance.n_clipped),
             },
         )
 
@@ -1165,19 +1971,120 @@ class CLEStepper(BaseStepper):
         context: StepperContext,
         channels: np.ndarray,
     ) -> np.ndarray:
+        x_new, continuous_abs, n_clipped = self._cle_increment_candidate(state, dt, context, channels)
+        self._last_n_clipped = int(n_clipped)
+        state.x[:] = x_new
+        return continuous_abs
+
+    def _apply_cle_increment_adaptive(
+        self,
+        state: SystemState,
+        dt: float,
+        context: StepperContext,
+        channels: np.ndarray,
+        *,
+        grow_on_success: bool,
+    ) -> _FastCLEAdvanceResult:
+        requested_dt = max(float(dt), 0.0)
+        if requested_dt <= 0.0:
+            return _FastCLEAdvanceResult(
+                continuous_abs=np.zeros(context.network.n_channels, dtype=float),
+                advanced_time=0.0,
+                requested_dt=0.0,
+                rejected_attempts=0,
+                n_clipped=0,
+                dt_after=self._adaptive_dt,
+                min_dt_reached=False,
+            )
+
+        if not self.adaptive_dt:
+            continuous_abs = self._apply_cle_increment(state, requested_dt, context, channels)
+            return _FastCLEAdvanceResult(
+                continuous_abs=continuous_abs,
+                advanced_time=requested_dt,
+                requested_dt=requested_dt,
+                rejected_attempts=0,
+                n_clipped=self._last_n_clipped,
+                dt_after=None,
+                min_dt_reached=False,
+            )
+
+        if self._adaptive_dt is None:
+            self._adaptive_dt = requested_dt
+        current_dt = max(float(self._adaptive_dt), self.dt_min)
+        attempt_dt = min(requested_dt, current_dt)
+        rejected = 0
+
+        while True:
+            x_new, continuous_abs, n_clipped = self._cle_increment_candidate(state, attempt_dt, context, channels)
+            if n_clipped == 0:
+                state.x[:] = x_new
+                self._last_n_clipped = 0
+                if grow_on_success and rejected == 0 and attempt_dt >= current_dt - 1e-15:
+                    self._adaptive_dt = max(self.dt_min, current_dt * self.dt_growth_factor)
+                elif rejected:
+                    self._adaptive_dt = attempt_dt
+                return _FastCLEAdvanceResult(
+                    continuous_abs=continuous_abs,
+                    advanced_time=attempt_dt,
+                    requested_dt=requested_dt,
+                    rejected_attempts=rejected,
+                    n_clipped=0,
+                    dt_after=float(self._adaptive_dt),
+                    min_dt_reached=False,
+                )
+
+            if rejected >= self.max_retries or attempt_dt <= self.dt_min * (1.0 + 1e-12):
+                state.x[:] = x_new
+                self._last_n_clipped = int(n_clipped)
+                self._adaptive_dt = max(self.dt_min, attempt_dt)
+                return _FastCLEAdvanceResult(
+                    continuous_abs=continuous_abs,
+                    advanced_time=attempt_dt,
+                    requested_dt=requested_dt,
+                    rejected_attempts=rejected,
+                    n_clipped=int(n_clipped),
+                    dt_after=float(self._adaptive_dt),
+                    min_dt_reached=True,
+                )
+
+            rejected += 1
+            attempt_dt = max(self.dt_min, attempt_dt * self.dt_shrink_factor)
+            self._adaptive_dt = attempt_dt
+
+    def _cle_increment_candidate(
+        self,
+        state: SystemState,
+        dt: float,
+        context: StepperContext,
+        channels: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
         network = context.network
         rng = context.rng
+        candidate = np.asarray(state.x, dtype=float).copy()
+        trial_state = SystemState(
+            t=float(state.t),
+            x=candidate,
+            step_count=int(state.step_count),
+            event_count=int(state.event_count),
+            partition_state=state.partition_state,
+        )
         continuous_abs = np.zeros(network.n_channels, dtype=float)
         for channel_id in channels:
-            a = network.compute_propensity(int(channel_id), state)
+            a = network.compute_propensity(int(channel_id), trial_state)
             mean = a * float(dt)
             if mean <= 0.0:
                 continue
             amount = mean + np.sqrt(mean) * float(rng.normal())
             continuous_abs[int(channel_id)] += abs(float(amount))
-            network.apply_channel_delta(state.x, int(channel_id), amount)
-        np.maximum(state.x, 0.0, out=state.x)
-        return continuous_abs
+            network.apply_channel_delta(candidate, int(channel_id), amount)
+        if not np.all(np.isfinite(candidate)):
+            raise ValueError("CLE increment produced NaN or inf state values")
+        negative = candidate < 0.0
+        n_clipped = int(np.count_nonzero(negative))
+        if n_clipped:
+            candidate = np.maximum(candidate, 0.0)
+        return candidate, continuous_abs, n_clipped
 
 
 class HybridStepper(BaseStepper):
@@ -1210,34 +2117,51 @@ class HybridStepper(BaseStepper):
         slow_channels = partition.slow_channels
         slow_total = float(np.sum(propensities[slow_channels])) if slow_channels.size else 0.0
         if slow_total <= 0.0:
-            continuous_abs = self._advance_fast(state, dt, context, partition.fast_channels)
+            fast = self._advance_fast(state, dt, context, partition.fast_channels, grow_on_success=True)
             return StepResult(
-                advanced_time=float(dt),
+                advanced_time=float(fast.advanced_time),
                 event_occurred=False,
                 propensity_sum=0.0,
                 details={
                     "mode": "hybrid",
                     "n_fast_channels": int(partition.fast_channels.size),
-                    "continuous_channel_abs_increments": continuous_abs,
+                    "continuous_channel_abs_increments": fast.continuous_abs,
+                    **self._fast_cle_details(fast),
                 },
             )
 
         tau = float(context.rng.exponential(1.0 / slow_total))
         if tau > dt:
-            continuous_abs = self._advance_fast(state, dt, context, partition.fast_channels)
+            fast = self._advance_fast(state, dt, context, partition.fast_channels, grow_on_success=True)
             return StepResult(
-                advanced_time=float(dt),
+                advanced_time=float(fast.advanced_time),
                 event_occurred=False,
                 propensity_sum=slow_total,
                 tau=tau,
                 details={
                     "mode": "hybrid",
                     "n_fast_channels": int(partition.fast_channels.size),
-                    "continuous_channel_abs_increments": continuous_abs,
+                    "continuous_channel_abs_increments": fast.continuous_abs,
+                    **self._fast_cle_details(fast),
                 },
             )
 
-        continuous_abs = self._advance_fast(state, tau, context, partition.fast_channels)
+        fast = self._advance_fast(state, tau, context, partition.fast_channels, grow_on_success=False)
+        if fast.advanced_time < tau - 1e-15 or fast.rejected_attempts > 0:
+            return StepResult(
+                advanced_time=float(fast.advanced_time),
+                event_occurred=False,
+                propensity_sum=slow_total,
+                tau=tau,
+                details={
+                    "mode": "hybrid_cle_retry",
+                    "n_fast_channels": int(partition.fast_channels.size),
+                    "continuous_channel_abs_increments": fast.continuous_abs,
+                    "scheduled_slow_event_deferred": True,
+                    **self._fast_cle_details(fast),
+                },
+            )
+
         post_propensities = network.compute_all_propensities(state)
         post_slow_total = float(np.sum(post_propensities[slow_channels]))
         if post_slow_total <= 0.0:
@@ -1249,7 +2173,8 @@ class HybridStepper(BaseStepper):
                 details={
                     "mode": "hybrid",
                     "n_fast_channels": int(partition.fast_channels.size),
-                    "continuous_channel_abs_increments": continuous_abs,
+                    "continuous_channel_abs_increments": fast.continuous_abs,
+                    **self._fast_cle_details(fast),
                 },
             )
 
@@ -1266,7 +2191,8 @@ class HybridStepper(BaseStepper):
             "mode": "hybrid",
             "n_fast_channels": int(partition.fast_channels.size),
             "weights_shape": tuple(weights.shape),
-            "continuous_channel_abs_increments": continuous_abs,
+            "continuous_channel_abs_increments": fast.continuous_abs,
+            **self._fast_cle_details(fast),
             },
         )
 
@@ -1276,13 +2202,41 @@ class HybridStepper(BaseStepper):
         dt: float,
         context: StepperContext,
         fast_channels: np.ndarray,
-    ) -> np.ndarray:
+        *,
+        grow_on_success: bool,
+    ) -> _FastCLEAdvanceResult:
         continuous_abs = np.zeros(context.network.n_channels, dtype=float)
         if fast_channels.size:
-            continuous_abs = self._cle._apply_cle_increment(state, dt, context, fast_channels)
-        state.t += float(dt)
+            fast = self._cle._apply_cle_increment_adaptive(
+                state,
+                dt,
+                context,
+                fast_channels,
+                grow_on_success=grow_on_success,
+            )
+        else:
+            fast = _FastCLEAdvanceResult(
+                continuous_abs=continuous_abs,
+                advanced_time=float(dt),
+                requested_dt=float(dt),
+                rejected_attempts=0,
+                n_clipped=0,
+                dt_after=self._cle._adaptive_dt,
+                min_dt_reached=False,
+            )
+        state.t += float(fast.advanced_time)
         state.step_count += 1
-        return continuous_abs
+        return fast
+
+    def _fast_cle_details(self, fast: _FastCLEAdvanceResult) -> dict[str, Any]:
+        return {
+            "cle_requested_dt": float(fast.requested_dt),
+            "cle_accepted_dt": float(fast.advanced_time),
+            "cle_rejected_attempts": int(fast.rejected_attempts),
+            "cle_dt_after": None if fast.dt_after is None else float(fast.dt_after),
+            "cle_dt_min_reached": bool(fast.min_dt_reached),
+            "n_clipped": int(fast.n_clipped),
+        }
 
 
 class BlendedHybridStepper(BaseStepper):
@@ -1296,11 +2250,14 @@ class BlendedHybridStepper(BaseStepper):
     def __init__(self, config: BlendedHybridConfig | None = None):
         self.config = config or BlendedHybridConfig()
         self._nu_cache: dict[int, np.ndarray] = {}
+        self._beta_lookup_cache: dict[tuple[int, str], _ChannelBetaLookup] = {}
         self._last_n_clipped = 0
         self._last_n_low_count_rounded = 0
         self._last_total_cle_propensity = 0.0
         self._last_continuous_channel_abs_increments = np.empty(0, dtype=float)
         self._reaction_interval_dt: float | None = None
+        self._adaptive_dt_cle = self._clamp_cle_dt(self.config.dt_cle)
+        self._adaptive_dt_macro = self._clamp_cle_dt(self.config.effective_dt_macro)
 
     def step(self, state: SystemState, dt: float, context: StepperContext) -> StepResult:
         if dt <= 0.0:
@@ -1328,12 +2285,21 @@ class BlendedHybridStepper(BaseStepper):
         beta_min: float,
         beta_max: float,
     ) -> StepResult:
-        duration = min(self._current_dt_macro(), dt)
-        state.x[:] = self._cle_increment(context.network, state.x, beta, duration, context.rng)
-        state.t += duration
+        requested = min(self._current_dt_macro(), dt)
+        cle = self._adaptive_cle_increment(
+            context.network,
+            state.x,
+            beta,
+            requested,
+            context.rng,
+            kind="macro",
+            grow_on_success=True,
+        )
+        state.x[:] = cle.x
+        state.t += cle.dt
         state.step_count += 1
         return StepResult(
-            advanced_time=duration,
+            advanced_time=cle.dt,
             event_occurred=False,
             propensity_sum=self._last_total_cle_propensity,
             details={
@@ -1345,9 +2311,10 @@ class BlendedHybridStepper(BaseStepper):
                 "total_cle_propensity": self._last_total_cle_propensity,
                 "n_clipped": self._last_n_clipped,
                 "n_low_count_rounded": self._last_n_low_count_rounded,
-                "stepper_dt": duration,
+                "stepper_dt": cle.dt,
                 "reaction_interval_dt": self._reaction_interval_dt,
-                "continuous_channel_abs_increments": self._last_continuous_channel_abs_increments.copy(),
+                "continuous_channel_abs_increments": cle.continuous_abs.copy(),
+                **self._adaptive_cle_details(cle),
             },
         )
 
@@ -1442,7 +2409,43 @@ class BlendedHybridStepper(BaseStepper):
             )
 
         if tau < duration and sampled_channel is not None:
-            state.x[:] = self._cle_increment(network, state.x, beta, tau, context.rng)
+            cle = self._adaptive_cle_increment(
+                network,
+                state.x,
+                beta,
+                tau,
+                context.rng,
+                kind="cle",
+                grow_on_success=False,
+            )
+            state.x[:] = cle.x
+            if cle.dt < tau - self.config.beta_tol or cle.rejected_attempts > 0:
+                state.t += cle.dt
+                state.step_count += 1
+                return StepResult(
+                    advanced_time=cle.dt,
+                    event_occurred=False,
+                    propensity_sum=total_jump,
+                    tau=tau,
+                    details={
+                        "mode": "mixed_cle_retry",
+                        "fired_channel": None,
+                        "beta_min": beta_min,
+                        "beta_max": beta_max,
+                        "total_jump_propensity": total_jump,
+                        "total_cle_propensity": self._last_total_cle_propensity,
+                        "n_clipped": self._last_n_clipped,
+                        "n_low_count_rounded": self._last_n_low_count_rounded,
+                        "stepper_dt": cle.dt,
+                        "reaction_interval_dt": self._reaction_interval_dt,
+                        "scheduled_channel": int(sampled_channel),
+                        "scheduled_tau": float(tau),
+                        "scheduled_discrete_event_deferred": True,
+                        "continuous_channel_abs_increments": cle.continuous_abs.copy(),
+                        **self._adaptive_cle_details(cle),
+                    },
+                )
+
             applied = self._apply_jump_safely(network, state.x, sampled_channel)
             state.t += tau
             state.step_count += 1
@@ -1466,15 +2469,25 @@ class BlendedHybridStepper(BaseStepper):
                     "stepper_dt": tau,
                     "reaction_interval_dt": self._reaction_interval_dt,
                     "invalid_jump_skipped": not applied,
-                    "continuous_channel_abs_increments": self._last_continuous_channel_abs_increments.copy(),
+                    "continuous_channel_abs_increments": cle.continuous_abs.copy(),
+                    **self._adaptive_cle_details(cle),
                 },
             )
 
-        state.x[:] = self._cle_increment(network, state.x, beta, duration, context.rng)
-        state.t += duration
+        cle = self._adaptive_cle_increment(
+            network,
+            state.x,
+            beta,
+            duration,
+            context.rng,
+            kind="cle",
+            grow_on_success=True,
+        )
+        state.x[:] = cle.x
+        state.t += cle.dt
         state.step_count += 1
         return StepResult(
-            advanced_time=duration,
+            advanced_time=cle.dt,
             event_occurred=False,
             propensity_sum=total_jump,
             tau=None if np.isinf(tau) else tau,
@@ -1487,9 +2500,10 @@ class BlendedHybridStepper(BaseStepper):
                 "total_cle_propensity": self._last_total_cle_propensity,
                 "n_clipped": self._last_n_clipped,
                 "n_low_count_rounded": self._last_n_low_count_rounded,
-                "stepper_dt": duration,
+                "stepper_dt": cle.dt,
                 "reaction_interval_dt": self._reaction_interval_dt,
-                "continuous_channel_abs_increments": self._last_continuous_channel_abs_increments.copy(),
+                "continuous_channel_abs_increments": cle.continuous_abs.copy(),
+                **self._adaptive_cle_details(cle),
             },
         )
 
@@ -1533,21 +2547,133 @@ class BlendedHybridStepper(BaseStepper):
             x_new = self._round_low_count_changed_species(x_new, increment)
         return x_new
 
-    def _channel_betas(self, network: ReactionNetworkData, x: np.ndarray) -> np.ndarray:
-        beta = np.zeros(network.n_channels, dtype=float)
-        for channel_id in range(network.n_channels):
-            if network.get_channel_block(channel_id) == ChannelBlock.INFLOW:
-                beta[channel_id] = 0.0
-                continue
-            relevant_species = _channel_relevant_species(network, channel_id, self.config.beta_species_mode)
-            if not relevant_species:
-                beta[channel_id] = 0.0
-                continue
-            beta[channel_id] = max(
-                _species_beta(float(x[int(sid)]), self.config.i1, self.config.i2)
-                for sid in relevant_species
+    def _adaptive_cle_increment(
+        self,
+        network: ReactionNetworkData,
+        x_float: np.ndarray,
+        beta: np.ndarray,
+        requested_dt: float,
+        rng: np.random.Generator,
+        *,
+        kind: str,
+        grow_on_success: bool,
+    ) -> _AdaptiveCLEResult:
+        requested = max(float(requested_dt), 0.0)
+        if requested <= 0.0:
+            x_new = self._cle_increment(network, x_float, beta, 0.0, rng)
+            return _AdaptiveCLEResult(
+                x=x_new,
+                continuous_abs=self._last_continuous_channel_abs_increments.copy(),
+                dt=0.0,
+                requested_dt=0.0,
+                rejected_attempts=0,
+                n_clipped=0,
+                n_low_count_rounded=0,
+                total_cle_propensity=0.0,
+                dt_after=self._get_adaptive_dt(kind),
+                min_dt_reached=False,
             )
-        return beta
+
+        if not self.config.adaptive_cle_dt:
+            x_new = self._cle_increment(network, x_float, beta, requested, rng)
+            return _AdaptiveCLEResult(
+                x=x_new,
+                continuous_abs=self._last_continuous_channel_abs_increments.copy(),
+                dt=requested,
+                requested_dt=requested,
+                rejected_attempts=0,
+                n_clipped=self._last_n_clipped,
+                n_low_count_rounded=self._last_n_low_count_rounded,
+                total_cle_propensity=self._last_total_cle_propensity,
+                dt_after=requested,
+                min_dt_reached=False,
+            )
+
+        current_dt = self._get_adaptive_dt(kind)
+        attempt_dt = min(requested, current_dt)
+        rejected = 0
+
+        while True:
+            x_new = self._cle_increment(network, x_float, beta, attempt_dt, rng)
+            n_clipped = int(self._last_n_clipped)
+            n_low_count_rounded = int(self._last_n_low_count_rounded)
+            total_cle_propensity = float(self._last_total_cle_propensity)
+            continuous_abs = self._last_continuous_channel_abs_increments.copy()
+
+            if n_clipped == 0:
+                if rejected:
+                    self._set_adaptive_dt(kind, attempt_dt)
+                elif grow_on_success and attempt_dt >= current_dt - self.config.beta_tol:
+                    self._grow_adaptive_dt(kind, current_dt)
+                return _AdaptiveCLEResult(
+                    x=x_new,
+                    continuous_abs=continuous_abs,
+                    dt=attempt_dt,
+                    requested_dt=requested,
+                    rejected_attempts=rejected,
+                    n_clipped=0,
+                    n_low_count_rounded=n_low_count_rounded,
+                    total_cle_propensity=total_cle_propensity,
+                    dt_after=self._get_adaptive_dt(kind),
+                    min_dt_reached=False,
+                )
+
+            if rejected >= self.config.cle_dt_max_retries or attempt_dt <= self.config.cle_dt_min * (1.0 + 1e-12):
+                self._set_adaptive_dt(kind, attempt_dt)
+                return _AdaptiveCLEResult(
+                    x=x_new,
+                    continuous_abs=continuous_abs,
+                    dt=attempt_dt,
+                    requested_dt=requested,
+                    rejected_attempts=rejected,
+                    n_clipped=n_clipped,
+                    n_low_count_rounded=n_low_count_rounded,
+                    total_cle_propensity=total_cle_propensity,
+                    dt_after=self._get_adaptive_dt(kind),
+                    min_dt_reached=True,
+                )
+
+            rejected += 1
+            attempt_dt = self._shrink_adaptive_dt(kind, attempt_dt)
+
+    def _adaptive_cle_details(self, result: _AdaptiveCLEResult) -> dict[str, Any]:
+        return {
+            "cle_requested_dt": float(result.requested_dt),
+            "cle_accepted_dt": float(result.dt),
+            "cle_rejected_attempts": int(result.rejected_attempts),
+            "cle_dt_after": float(result.dt_after),
+            "cle_dt_min_reached": bool(result.min_dt_reached),
+        }
+
+    def _channel_betas(self, network: ReactionNetworkData, x: np.ndarray) -> np.ndarray:
+        lookup = self._channel_beta_lookup(network)
+        if lookup.n_channels == 0 or lookup.relevant_species.shape[1] == 0:
+            return np.zeros(lookup.n_channels, dtype=float)
+
+        values = np.asarray(x, dtype=float)
+        if values.shape[0] < lookup.n_species:
+            raise ValueError("state has fewer species than the reaction network")
+
+        species_beta = _species_beta_array(values[: lookup.n_species], self.config.i1, self.config.i2)
+        relevant_beta = species_beta[lookup.relevant_species]
+        relevant_beta *= lookup.relevant_mask
+        return np.max(relevant_beta, axis=1)
+
+    def _channel_beta_lookup(self, network: ReactionNetworkData) -> _ChannelBetaLookup:
+        mode = self.config.beta_species_mode
+        key = (id(network), mode)
+        cached = self._beta_lookup_cache.get(key)
+        if (
+            cached is not None
+            and cached.n_channels == int(network.n_channels)
+            and cached.n_species == int(network.n_species)
+            and cached.mode == mode
+        ):
+            return cached
+
+        lookup = _build_channel_beta_lookup(network, mode)
+        self._beta_lookup_cache[key] = lookup
+        return lookup
 
     def _stoichiometry_matrix(self, network: ReactionNetworkData) -> np.ndarray:
         key = id(network)
@@ -1628,16 +2754,58 @@ class BlendedHybridStepper(BaseStepper):
         )
         if np.isfinite(interval) and interval > 0.0:
             self._reaction_interval_dt = float(interval * self.config.reaction_interval_scale)
+            if self.config.adaptive_cle_dt:
+                self._adaptive_dt_cle = self._clamp_cle_dt(self._reaction_interval_dt)
+                self._adaptive_dt_macro = self._clamp_cle_dt(self._reaction_interval_dt)
 
     def _current_dt_cle(self) -> float:
+        if self.config.adaptive_cle_dt:
+            return self._get_adaptive_dt("cle")
+        return self._base_dt_cle()
+
+    def _current_dt_macro(self) -> float:
+        if self.config.adaptive_cle_dt:
+            return self._get_adaptive_dt("macro")
+        return self._base_dt_macro()
+
+    def _base_dt_cle(self) -> float:
         if self.config.use_reaction_interval_dt and self._reaction_interval_dt is not None:
             return self._reaction_interval_dt
         return self.config.dt_cle
 
-    def _current_dt_macro(self) -> float:
+    def _base_dt_macro(self) -> float:
         if self.config.use_reaction_interval_dt and self._reaction_interval_dt is not None:
             return self._reaction_interval_dt
         return self.config.effective_dt_macro
+
+    def _get_adaptive_dt(self, kind: str) -> float:
+        if kind == "macro":
+            return self._clamp_cle_dt(self._adaptive_dt_macro)
+        if kind == "cle":
+            return self._clamp_cle_dt(self._adaptive_dt_cle)
+        raise ValueError("kind must be 'cle' or 'macro'")
+
+    def _set_adaptive_dt(self, kind: str, value: float) -> float:
+        clamped = self._clamp_cle_dt(value)
+        if kind == "macro":
+            self._adaptive_dt_macro = clamped
+            return clamped
+        if kind == "cle":
+            self._adaptive_dt_cle = clamped
+            return clamped
+        raise ValueError("kind must be 'cle' or 'macro'")
+
+    def _shrink_adaptive_dt(self, kind: str, value: float) -> float:
+        return self._set_adaptive_dt(kind, float(value) * self.config.cle_dt_shrink_factor)
+
+    def _grow_adaptive_dt(self, kind: str, value: float) -> float:
+        return self._set_adaptive_dt(kind, float(value) * self.config.cle_dt_growth_factor)
+
+    def _clamp_cle_dt(self, value: float) -> float:
+        dt = max(float(value), self.config.cle_dt_min)
+        if self.config.cle_dt_max is not None:
+            dt = min(dt, self.config.cle_dt_max)
+        return dt
 
 
 class NRMBlendedHybridStepper(BlendedHybridStepper):
@@ -1768,16 +2936,36 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
         invalid_jumps = 0
         n_clipped_total = 0
         n_low_count_rounded_total = 0
+        cle_rejected_attempts_total = 0
+        cle_min_dt_reached = False
+        cle_stop_due_to_retry = False
+        cle_dt_after = self._get_adaptive_dt("cle")
         current_time = start_time
 
         for event_time, channel_id in scheduled_events:
             event_t = float(event_time)
             segment_dt = max(event_t - current_time, 0.0)
             if segment_dt > 0.0:
-                x_work = self._cle_increment(network, x_work, beta, segment_dt, rng)
-                continuous_abs_total += self._last_continuous_channel_abs_increments
-                n_clipped_total += self._last_n_clipped
-                n_low_count_rounded_total += self._last_n_low_count_rounded
+                cle = self._adaptive_cle_increment(
+                    network,
+                    x_work,
+                    beta,
+                    segment_dt,
+                    rng,
+                    kind="cle",
+                    grow_on_success=False,
+                )
+                x_work = cle.x
+                continuous_abs_total += cle.continuous_abs
+                n_clipped_total += cle.n_clipped
+                n_low_count_rounded_total += cle.n_low_count_rounded
+                cle_rejected_attempts_total += cle.rejected_attempts
+                cle_min_dt_reached = cle_min_dt_reached or cle.min_dt_reached
+                cle_dt_after = cle.dt_after
+                current_time += cle.dt
+                if cle.dt < segment_dt - self.config.beta_tol or cle.rejected_attempts > 0:
+                    cle_stop_due_to_retry = True
+                    break
             applied = self._apply_jump_safely(network, x_work, int(channel_id))
             if applied:
                 applied_event_ids.append(int(channel_id))
@@ -1786,15 +2974,31 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
                 invalid_jumps += 1
             current_time = event_t
 
-        tail_dt = max(end_time - current_time, 0.0)
-        if tail_dt > 0.0 or not scheduled_events:
-            x_work = self._cle_increment(network, x_work, beta, tail_dt, rng)
-            continuous_abs_total += self._last_continuous_channel_abs_increments
-            n_clipped_total += self._last_n_clipped
-            n_low_count_rounded_total += self._last_n_low_count_rounded
+        if not cle_stop_due_to_retry:
+            tail_dt = max(end_time - current_time, 0.0)
+            if tail_dt > 0.0 or not scheduled_events:
+                cle = self._adaptive_cle_increment(
+                    network,
+                    x_work,
+                    beta,
+                    tail_dt,
+                    rng,
+                    kind="cle",
+                    grow_on_success=not scheduled_events,
+                )
+                x_work = cle.x
+                continuous_abs_total += cle.continuous_abs
+                n_clipped_total += cle.n_clipped
+                n_low_count_rounded_total += cle.n_low_count_rounded
+                cle_rejected_attempts_total += cle.rejected_attempts
+                cle_min_dt_reached = cle_min_dt_reached or cle.min_dt_reached
+                cle_dt_after = cle.dt_after
+                current_time += cle.dt
+                if cle.dt < tail_dt - self.config.beta_tol or cle.rejected_attempts > 0:
+                    cle_stop_due_to_retry = True
 
         state.x[:] = self._float_nonnegative(x_work)
-        state.t = end_time
+        state.t = current_time
         state.step_count += 1
         state.event_count += len(applied_event_ids)
         self._nrm.invalidate_cache()
@@ -1806,8 +3010,9 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
 
         first_tau = None if not applied_event_times else float(applied_event_times[0] - start_time)
         first_channel = None if not applied_event_ids else int(applied_event_ids[0])
+        advanced_time = max(float(current_time) - start_time, 0.0)
         return StepResult(
-            advanced_time=duration,
+            advanced_time=advanced_time,
             event_occurred=bool(applied_event_ids),
             channel_id=first_channel,
             propensity_sum=total_jump_initial,
@@ -1821,13 +3026,19 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
                 "total_cle_propensity": total_cle_initial,
                 "n_clipped": self._last_n_clipped,
                 "n_low_count_rounded": self._last_n_low_count_rounded,
-                "stepper_dt": duration,
+                "stepper_dt": advanced_time,
                 "reaction_interval_dt": self._reaction_interval_dt,
                 "n_scheduled_discrete_events": int(len(scheduled_events)),
                 "n_applied_discrete_events": int(len(applied_event_ids)),
                 "n_invalid_jump_skipped": int(invalid_jumps),
                 "discrete_event_ids": list(applied_event_ids),
                 "discrete_event_times": list(applied_event_times),
+                "cle_requested_dt": float(duration),
+                "cle_accepted_dt": float(advanced_time),
+                "cle_rejected_attempts": int(cle_rejected_attempts_total),
+                "cle_dt_after": float(cle_dt_after),
+                "cle_dt_min_reached": bool(cle_min_dt_reached),
+                "cle_adaptive_stop": bool(cle_stop_due_to_retry),
                 "continuous_channel_abs_increments": continuous_abs_total.copy(),
                 **schedule_details,
             },
@@ -2035,6 +3246,28 @@ def estimate_mean_reaction_interval(network: ReactionNetworkData, state: SystemS
     return 1.0 / total
 
 
+def _normalize_pdmp_discrete_event_method(value: str, *, legacy_use_heap: bool) -> str:
+    method = str(value).strip().lower()
+    if method == "auto":
+        return "nrm_heap" if bool(legacy_use_heap) else "nrm_scan"
+    aliases = {
+        "heap": "nrm_heap",
+        "nrm-heap": "nrm_heap",
+        "nrm_heap": "nrm_heap",
+        "nrm": "nrm_heap",
+        "scan": "nrm_scan",
+        "nrm-scan": "nrm_scan",
+        "nrm_scan": "nrm_scan",
+        "gillespie": "gillespie",
+        "direct": "gillespie",
+        "direct_ssa": "gillespie",
+        "direct-ssa": "gillespie",
+    }
+    if method not in aliases:
+        raise ValueError("discrete_event_method must be 'auto', 'nrm_heap', 'nrm_scan', or 'gillespie'")
+    return aliases[method]
+
+
 def _species_beta(x: float, i1: float, i2: float) -> float:
     value = float(x)
     if value <= float(i1):
@@ -2042,6 +3275,49 @@ def _species_beta(x: float, i1: float, i2: float) -> float:
     if value >= float(i2):
         return 0.0
     return float((float(i2) - value) / (float(i2) - float(i1)))
+
+
+def _species_beta_array(x: np.ndarray, i1: float, i2: float) -> np.ndarray:
+    values = np.asarray(x, dtype=float)
+    beta = (float(i2) - values) / (float(i2) - float(i1))
+    return np.clip(beta, 0.0, 1.0)
+
+
+def _build_channel_beta_lookup(network: ReactionNetworkData, mode: str) -> _ChannelBetaLookup:
+    relevant_by_channel: list[list[int]] = []
+    max_width = 0
+    n_channels = int(network.n_channels)
+    n_species = int(network.n_species)
+
+    for channel_id in range(n_channels):
+        if network.get_channel_block(channel_id) == ChannelBlock.INFLOW:
+            relevant_species: list[int] = []
+        else:
+            relevant_species = _channel_relevant_species(network, channel_id, mode)
+        for sid in relevant_species:
+            if sid < 0 or sid >= n_species:
+                raise ValueError(f"channel {channel_id} references species outside network bounds: {sid}")
+        relevant_by_channel.append(relevant_species)
+        max_width = max(max_width, len(relevant_species))
+
+    species = np.zeros((n_channels, max_width), dtype=np.int64)
+    mask = np.zeros((n_channels, max_width), dtype=bool)
+    for channel_id, relevant_species in enumerate(relevant_by_channel):
+        if not relevant_species:
+            continue
+        width = len(relevant_species)
+        species[channel_id, :width] = np.asarray(relevant_species, dtype=np.int64)
+        mask[channel_id, :width] = True
+
+    species.setflags(write=False)
+    mask.setflags(write=False)
+    return _ChannelBetaLookup(
+        relevant_species=species,
+        relevant_mask=mask,
+        n_channels=n_channels,
+        n_species=n_species,
+        mode=str(mode),
+    )
 
 
 def _channel_relevant_species(network: ReactionNetworkData, channel_id: int, mode: str = "reactants_products") -> list[int]:

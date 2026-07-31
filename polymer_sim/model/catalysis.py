@@ -20,10 +20,82 @@ def clear_all_catalysis(network, *, rebuild: bool = True) -> None:
     if rebuild:
         network.rebuild_dependency_indices()
     else:
+        if hasattr(network, "_invalidate_catalysis_runtime_caches"):
+            network._invalidate_catalysis_runtime_caches()
         if hasattr(network, "channel_has_catalysts"):
             network.channel_has_catalysts.fill(False)
         if hasattr(network, "dependency_indices_dirty"):
             network.dependency_indices_dirty = True
+
+
+def set_catalytic_strengths_for_channels(
+    network,
+    channel_ids,
+    catalyst_sids,
+    strengths,
+    *,
+    mirror_reverse: bool = True,
+    rebuild: bool = True,
+) -> None:
+    """Assign catalytic strengths to many channels and rebuild indices once.
+
+    Use this for deterministic catalysis construction in examples/tests instead
+    of calling ``network.set_catalytic_strength`` inside a large loop.  Reverse
+    mirroring uses the network's precomputed reverse-channel cache.
+    """
+
+    if hasattr(network, "set_catalytic_strengths"):
+        network.set_catalytic_strengths(
+            channel_ids,
+            catalyst_sids=catalyst_sids,
+            strengths=strengths,
+            mirror_reverse=mirror_reverse,
+            rebuild=rebuild,
+        )
+        return
+
+    for channel_id, catalyst_sid, strength in _iter_catalysis_assignments(channel_ids, catalyst_sids, strengths):
+        network.set_catalytic_strength(
+            int(channel_id),
+            catalyst_sid=int(catalyst_sid),
+            strength=float(strength),
+            mirror_reverse=mirror_reverse,
+            rebuild=False,
+        )
+    if rebuild:
+        network.rebuild_dependency_indices()
+    else:
+        network.dependency_indices_dirty = True
+
+
+def scale_all_catalytic_strengths(network, factor: float, *, rebuild: bool = True) -> None:
+    """Multiply every existing catalytic matrix entry by one global factor.
+
+    This is intended for controlled parameter sweeps and profiling.  It does
+    not change which catalyst-channel pairs exist; it only rescales their
+    strengths.
+    """
+
+    scale = float(factor)
+    for block in _catalysis_blocks(network):
+        block *= scale
+    _finalize_global_catalysis_edit(network, rebuild=rebuild)
+
+
+def set_all_existing_catalytic_strengths(network, strength: float, *, rebuild: bool = True) -> None:
+    """Set all currently nonzero catalytic entries to the same value.
+
+    This testing helper preserves the sparse catalytic topology and replaces
+    only the coefficient values, which is useful when comparing algorithms
+    under identical catalytic graphs.
+    """
+
+    value = float(strength)
+    for block in _catalysis_blocks(network):
+        active = block != 0.0
+        if np.any(active):
+            block[active] = value
+    _finalize_global_catalysis_edit(network, rebuild=rebuild)
 
 
 def longest_polymer_species_ids(network) -> np.ndarray:
@@ -57,9 +129,14 @@ def assign_random_longest_catalyst_to_all_channels(
 
     catalyst_sid = int(rng.choice(candidates))
     strengths = np.exp(rng.normal(loc=float(log_mean), scale=float(log_sigma), size=network.n_channels))
-    for channel_id, strength in enumerate(strengths):
-        network.set_catalytic_strength(channel_id, catalyst_sid=catalyst_sid, strength=float(strength), rebuild=False)
-    network.rebuild_dependency_indices()
+    set_catalytic_strengths_for_channels(
+        network,
+        np.arange(network.n_channels, dtype=np.int64),
+        catalyst_sid,
+        strengths,
+        mirror_reverse=False,
+        rebuild=True,
+    )
     return {
         "method": "random_longest_catalyst_to_all_channels",
         "catalyst_sid": catalyst_sid,
@@ -102,12 +179,58 @@ def assign_random_longest_catalysts_to_distinct_channels(
     channel_ids = np.asarray(rng.choice(network.n_channels, size=n, replace=False), dtype=np.int64)
     strengths = np.exp(rng.normal(loc=float(log_mean), scale=float(log_sigma), size=n))
 
-    for catalyst_sid, channel_id, strength in zip(catalyst_sids, channel_ids, strengths):
-        network.set_catalytic_strength(int(channel_id), catalyst_sid=int(catalyst_sid), strength=float(strength), rebuild=False)
-    network.rebuild_dependency_indices()
+    set_catalytic_strengths_for_channels(
+        network,
+        channel_ids,
+        catalyst_sids,
+        strengths,
+        mirror_reverse=True,
+        rebuild=True,
+    )
     return {
         "method": "random_longest_catalysts_to_distinct_channels",
         "catalyst_sids": catalyst_sids,
         "channel_ids": channel_ids,
         "strengths": strengths,
     }
+
+
+def _catalysis_blocks(network) -> tuple[np.ndarray, ...]:
+    blocks = [
+        network.cat_left_add,
+        network.cat_right_add,
+        network.cat_left_split,
+        network.cat_right_split,
+        network.cat_outflow,
+    ]
+    if hasattr(network, "cat_inflow"):
+        blocks.append(network.cat_inflow)
+    return tuple(blocks)
+
+
+def _finalize_global_catalysis_edit(network, *, rebuild: bool) -> None:
+    if rebuild:
+        network.rebuild_dependency_indices()
+        return
+    if hasattr(network, "_invalidate_catalysis_runtime_caches"):
+        network._invalidate_catalysis_runtime_caches()
+    if hasattr(network, "dependency_indices_dirty"):
+        network.dependency_indices_dirty = True
+
+
+def _iter_catalysis_assignments(channel_ids, catalyst_sids, strengths):
+    channels = np.asarray(channel_ids, dtype=np.int64)
+    if channels.ndim != 1:
+        raise ValueError("channel_ids must be a 1D array")
+    catalysts = _broadcast_1d(catalyst_sids, channels.size, "catalyst_sids", np.int64)
+    values = _broadcast_1d(strengths, channels.size, "strengths", float)
+    return zip(channels, catalysts, values)
+
+
+def _broadcast_1d(value, n: int, name: str, dtype) -> np.ndarray:
+    arr = np.asarray(value, dtype=dtype)
+    if arr.ndim == 0:
+        return np.full(int(n), arr.item(), dtype=dtype)
+    if arr.shape != (int(n),):
+        raise ValueError(f"{name} must be scalar or shape ({int(n)},)")
+    return np.asarray(arr, dtype=dtype)

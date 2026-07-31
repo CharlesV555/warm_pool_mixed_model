@@ -20,6 +20,7 @@ from polymer_sim import (
     ReactionNetworkData,
     ScalingPDMPConfig,
     ScalingPDMPPartitionStrategy,
+    StepperContext,
     SummaryRecorder,
     SystemState,
     analyze_fast_network,
@@ -455,6 +456,130 @@ def test_pdmp_stepper_runs_through_experiment_runner():
     assert result.summary.n_steps >= 1
     assert result.summary.metadata["stepper_name"] == "PDMPStepper"
     assert result.state.x[elementary.species_idx("A")] > elementary.x0[elementary.species_idx("A")]
+
+
+def test_pdmp_stepper_can_use_heap_discrete_event_locator():
+    network = make_polymer_network(
+        k_poly_left=0.0,
+        k_poly_right=0.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+        k_inflow=1000.0,
+        inflow_species_ids=[0],
+    )
+    state = SystemState.from_x0(network.x0)
+    stepper = PDMPStepper(
+        partition_strategy=FixedPDMPPartitionStrategy(continuous_channels=[]),
+        config=PDMPConfig(
+            ode_step=0.1,
+            use_discrete_event_heap=True,
+            use_local_propensity_updates=True,
+        ),
+    )
+
+    result = stepper.step(
+        state,
+        0.1,
+        StepperContext(network=network, rng=np.random.default_rng(123)),
+    )
+
+    assert result.event_occurred
+    assert result.details["discrete_event_locator"] == "heap"
+    assert result.details["heap_entries"] >= 0
+    assert state.x[network.species_idx("A")] > network.x0[network.species_idx("A")]
+
+
+def test_pdmp_stepper_can_use_gillespie_discrete_event_locator():
+    network = make_polymer_network(
+        k_poly_left=0.0,
+        k_poly_right=0.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+        k_inflow=1000.0,
+        inflow_species_ids=[0],
+    )
+    state = SystemState.from_x0(network.x0)
+    stepper = PDMPStepper(
+        partition_strategy=FixedPDMPPartitionStrategy(continuous_channels=[]),
+        config=PDMPConfig(
+            ode_step=0.1,
+            discrete_event_method="gillespie",
+            use_discrete_event_heap=True,
+            use_local_propensity_updates=True,
+        ),
+    )
+
+    result = stepper.step(
+        state,
+        0.1,
+        StepperContext(network=network, rng=np.random.default_rng(123)),
+    )
+
+    assert result.event_occurred
+    assert stepper.config.discrete_event_method == "gillespie"
+    assert stepper.config.use_discrete_event_heap is False
+    assert result.details["discrete_event_method"] == "gillespie"
+    assert result.details["discrete_event_locator"] == "gillespie"
+    assert state.x[network.species_idx("A")] > network.x0[network.species_idx("A")]
+
+
+def test_pdmp_gillespie_discrete_locator_checks_event_state_reactant_availability():
+    network = make_polymer_network(
+        k_poly_left=1000.0,
+        k_poly_right=1000.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+        k_outflow=600.0,
+        outflow_species_ids=[0],
+    )
+    a = network.species_idx("A")
+    outflow_channel = network.channel_id(ChannelBlock.OUTFLOW, int(network.outflow_local_id_by_source[a]))
+    x0 = np.zeros(network.n_species, dtype=float)
+    x0[a] = 2.0
+    state = SystemState.from_x0(x0)
+    stepper = PDMPStepper(
+        partition_strategy=FixedPDMPPartitionStrategy(continuous_channels=[outflow_channel]),
+        config=PDMPConfig(
+            ode_step=0.0005,
+            discrete_event_method="gillespie",
+            validate_nonnegative=True,
+        ),
+    )
+
+    result = stepper.step(
+        state,
+        0.0005,
+        StepperContext(network=network, rng=np.random.default_rng(123)),
+    )
+
+    assert result.details["discrete_event_method"] == "gillespie"
+    assert np.all(state.x >= 0.0)
+    assert state.x[a] < 2.0
+
+
+def test_pdmp_available_channel_mask_uses_precomputed_reactant_terms():
+    network = make_polymer_network(k_poly_left=1.0, k_poly_right=1.0, k_frag_left=1.0, k_frag_right=1.0)
+    a = network.species_idx("A")
+    b = network.species_idx("B")
+    aa = network.species_idx("AA")
+    same = network.channel_id(ChannelBlock.LEFT_ADD, int(network.left_add_local_id[a, a]))
+    hetero = network.channel_id(ChannelBlock.LEFT_ADD, int(network.left_add_local_id[a, b]))
+    split = network.channel_id(ChannelBlock.LEFT_SPLIT, int(network.left_split_local_id_by_source[aa]))
+
+    x = np.zeros(network.n_species, dtype=float)
+    x[a] = 1.5
+    x[b] = 1.0
+    x[aa] = 0.5
+    state = SystemState.from_x0(x)
+    stepper = PDMPStepper(config=PDMPConfig(discrete_event_method="gillespie"))
+
+    mask = stepper._available_channel_mask(
+        network,
+        state,
+        np.asarray([same, hetero, split], dtype=np.int64),
+    )
+
+    assert mask.tolist() == [False, True, False]
 
 
 def test_pdmp_stepper_can_select_linear_catalysis_partition_method_on_polymer_network():

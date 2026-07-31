@@ -1,6 +1,7 @@
 import numpy as np
 
 from polymer_sim import (
+    ChannelBlock,
     ReactionNetworkData,
     assign_random_longest_catalyst_to_all_channels,
     assign_random_longest_catalysts_to_distinct_channels,
@@ -8,6 +9,9 @@ from polymer_sim import (
     clear_all_catalysis,
     generate_fixed_species_space,
     longest_polymer_species_ids,
+    scale_all_catalytic_strengths,
+    set_all_existing_catalytic_strengths,
+    set_catalytic_strengths_for_channels,
 )
 
 
@@ -97,3 +101,57 @@ def test_clear_all_catalysis():
     clear_all_catalysis(network)
     for channel_id in range(network.n_channels):
         assert network.get_channel_catalysts(channel_id).size == 0
+
+
+def test_reverse_lookup_is_cached_and_bulk_assignment_mirrors_reverse_channels():
+    network = make_network()
+    catalyst = network.species_idx("BBB")
+    source = network.species_idx("BA")
+    monomer = network.species_idx("A")
+    product = network.species_idx("BAA")
+    local = int(network.right_add_local_id[source, monomer])
+    channel = network.channel_id(ChannelBlock.RIGHT_ADD, local)
+    reverse_channel = network.channel_id(
+        ChannelBlock.RIGHT_SPLIT,
+        int(network.right_split_local_id_by_source[product]),
+    )
+
+    reverse_ids = network.get_reverse_channel_ids(channel)
+    assert reverse_ids.flags.writeable is False
+    assert network.get_reverse_channel_ids(channel) is reverse_ids
+    assert reverse_channel in reverse_ids
+
+    set_catalytic_strengths_for_channels(
+        network,
+        np.asarray([channel], dtype=np.int64),
+        catalyst,
+        0.75,
+        mirror_reverse=True,
+    )
+
+    assert network.get_catalytic_strength(channel, catalyst) == 0.75
+    assert network.get_catalytic_strength(reverse_channel, catalyst) == 0.75
+    assert catalyst in network.get_channel_catalysts(reverse_channel)
+
+
+def test_global_catalytic_strength_adjustments_preserve_existing_topology():
+    network = make_network()
+    catalyst = network.species_idx("AAA")
+    channels = np.asarray([0, 1], dtype=np.int64)
+    set_catalytic_strengths_for_channels(
+        network,
+        channels,
+        catalyst,
+        np.asarray([0.2, 0.4], dtype=float),
+        mirror_reverse=False,
+    )
+
+    scale_all_catalytic_strengths(network, 2.0)
+    assert np.isclose(network.get_catalytic_strength(0, catalyst), 0.4)
+    assert np.isclose(network.get_catalytic_strength(1, catalyst), 0.8)
+    assert network.get_channel_catalysts(2).size == 0
+
+    set_all_existing_catalytic_strengths(network, 3.0)
+    assert np.isclose(network.get_catalytic_strength(0, catalyst), 3.0)
+    assert np.isclose(network.get_catalytic_strength(1, catalyst), 3.0)
+    assert network.get_channel_catalysts(2).size == 0

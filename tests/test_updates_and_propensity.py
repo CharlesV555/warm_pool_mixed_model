@@ -81,6 +81,36 @@ def test_right_split_update():
     assert state.x[network.species_idx("A")] == 1
 
 
+def test_channel_reactant_terms_match_channel_reactants():
+    network = make_network(
+        k_poly=1.0,
+        k_frag=1.0,
+        k_outflow=1.0,
+        outflow_species_ids=[0],
+        k_inflow=1.0,
+        inflow_species_ids=[1],
+    )
+
+    assert network.reaction_order.shape == (network.n_channels,)
+    assert network.reactant1.shape == (network.n_channels,)
+    assert network.reactant2.shape == (network.n_channels,)
+    assert network.homo_second_order.shape == (network.n_channels,)
+
+    for channel_id in range(network.n_channels):
+        reactants = network.get_channel_reactants(channel_id)
+        assert int(network.reaction_order[channel_id]) == len(reactants)
+        if len(reactants) == 0:
+            assert int(network.reactant1[channel_id]) == -1
+            assert int(network.reactant2[channel_id]) == -1
+        elif len(reactants) == 1:
+            assert int(network.reactant1[channel_id]) == int(reactants[0])
+            assert int(network.reactant2[channel_id]) == -1
+        else:
+            assert int(network.reactant1[channel_id]) == int(reactants[0])
+            assert int(network.reactant2[channel_id]) == int(reactants[1])
+            assert bool(network.homo_second_order[channel_id]) == (int(reactants[0]) == int(reactants[1]))
+
+
 def test_inflow_update_and_fixed_propensity():
     network = make_network(k_inflow=3.5, inflow_species_ids=[0])
     target = network.species_idx("A")
@@ -213,6 +243,31 @@ def test_block_vectorized_substrate_saturating_propensities_match_scalar_channel
     assert vectorized[same_species_channel] == 0.0
     assert vectorized[mixed_channel] > 0.0
     assert aa in network.get_channel_products(same_species_channel)
+
+
+def test_sparse_catalysis_cache_matches_dense_fallback():
+    network = make_network(k_poly=2.0, catalysis_mode="substrate_saturating", saturation_alpha=0.25)
+    a = network.species_idx("A")
+    b = network.species_idx("B")
+    ab = network.species_idx("AB")
+    ba = network.species_idx("BA")
+    bb = network.species_idx("BB")
+    left_channel = network.channel_id(ChannelBlock.LEFT_ADD, int(network.left_add_local_id[a, b]))
+    right_channel = network.channel_id(ChannelBlock.RIGHT_ADD, int(network.right_add_local_id[ba, a]))
+    network.set_catalytic_strength(left_channel, catalyst_sid=ab, strength=0.5, rebuild=False, mirror_reverse=False)
+    network.set_catalytic_strength(left_channel, catalyst_sid=bb, strength=0.25, rebuild=False, mirror_reverse=False)
+    network.set_catalytic_strength(right_channel, catalyst_sid=ab, strength=0.75, rebuild=True, mirror_reverse=False)
+
+    state = SystemState.from_x0(np.arange(network.n_species, dtype=float) + 3.0)
+    sparse = network.compute_all_propensities(state)
+    assert network._sparse_catalysis_ready
+    assert network._block_local_ids_cache[ChannelBlock.LEFT_ADD] is network._local_ids_for_block(ChannelBlock.LEFT_ADD, None)
+    assert bool(network._block_any_catalysts_cache[ChannelBlock.LEFT_ADD])
+
+    network._sparse_catalysis_ready = False
+    dense = network.compute_all_propensities(state)
+
+    assert np.allclose(sparse, dense)
 
 
 def test_local_propensity_update_matches_full_recompute():

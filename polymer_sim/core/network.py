@@ -82,9 +82,28 @@ class ReactionNetworkData:
     channel_to_catalysts: list[np.ndarray]
     channel_has_catalysts: np.ndarray
     dependency_indices_dirty: bool
+    channel_to_catalyst_strengths: list[np.ndarray] = field(default_factory=list, init=False, repr=False)
     _nu_minus_cache: np.ndarray | None = field(default=None, init=False, repr=False)
     _nu_plus_cache: np.ndarray | None = field(default=None, init=False, repr=False)
     _nu_cache: np.ndarray | None = field(default=None, init=False, repr=False)
+    _block_local_ids_cache: dict[ChannelBlock, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _block_has_catalysts_cache: dict[ChannelBlock, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _block_any_catalysts_cache: dict[ChannelBlock, bool] = field(default_factory=dict, init=False, repr=False)
+    _block_catalyst_local_ids: dict[ChannelBlock, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _block_catalyst_species_ids: dict[ChannelBlock, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _block_catalyst_strengths: dict[ChannelBlock, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _block_catalyst_row_ptr: dict[ChannelBlock, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _sparse_catalysis_ready: bool = field(default=False, init=False, repr=False)
+    _all_inflow_capacity_infinite: bool = field(default=True, init=False, repr=False)
+    channel_reverse_ids: list[np.ndarray] = field(default_factory=list, init=False, repr=False)
+    reaction_order: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int8), init=False, repr=False)
+    reactant1: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
+    reactant2: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
+    homo_second_order: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool), init=False, repr=False)
+    zero_order_channels: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
+    first_order_channels: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
+    second_order_channels: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
+    all_channels: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
 
     @classmethod
     def from_species_space(
@@ -284,9 +303,28 @@ class ReactionNetworkData:
             channel_has_catalysts=np.zeros(cursor, dtype=bool),
             dependency_indices_dirty=False,
         )
+        network._initialize_runtime_caches()
         network.rebuild_dependency_indices()
         network.precompute_stoichiometry_matrices()
         return network
+
+    def _initialize_runtime_caches(self) -> None:
+        """Initialize structural caches used by vectorized hot paths.
+
+        These arrays are derived from channel sizes and inflow configuration,
+        not from the current state.  Catalytic sparse caches are rebuilt later
+        by ``rebuild_dependency_indices`` because they depend on the current
+        catalytic assignments.
+        """
+
+        self._block_local_ids_cache = {}
+        for block in BLOCK_ORDER:
+            ids = np.arange(int(self.channel_sizes[block]), dtype=np.int64)
+            ids.setflags(write=False)
+            self._block_local_ids_cache[block] = ids
+        self._all_inflow_capacity_infinite = bool(np.all(~np.isfinite(self.inflow_capacity))) if self.inflow_capacity.size else True
+        self._rebuild_reverse_channel_cache()
+        self._precompute_channel_reactant_terms()
 
     @property
     def n_species(self) -> int:
@@ -533,6 +571,73 @@ class ReactionNetworkData:
             for reverse_channel_id in self.get_reverse_channel_ids(channel_id):
                 self._set_catalytic_strength_no_rebuild(int(reverse_channel_id), sid, float(strength))
                 self._refresh_channel_has_catalysts(int(reverse_channel_id))
+        self._invalidate_catalysis_runtime_caches()
+        if rebuild:
+            self.rebuild_dependency_indices()
+        else:
+            self.dependency_indices_dirty = True
+
+    def set_catalytic_strengths(
+        self,
+        channel_ids: np.ndarray | Sequence[int],
+        catalyst_sids: int | np.integer | np.ndarray | Sequence[int],
+        strengths: float | np.floating | np.ndarray | Sequence[float],
+        *,
+        rebuild: bool = True,
+        mirror_reverse: bool = True,
+    ) -> None:
+        """Assign catalytic strengths for many channels in one structural edit.
+
+        This is the preferred construction-time path for deterministic or
+        large catalytic networks.  It keeps the dense per-block matrices as the
+        authoritative storage, mirrors reverse reactions through the cached
+        structural reverse lookup, and rebuilds sparse dependency/catalysis
+        indices once at the end instead of once per channel.
+        """
+
+        channels = np.asarray(channel_ids, dtype=np.int64)
+        if channels.ndim != 1:
+            raise ValueError("channel_ids must be a 1D array")
+        if channels.size == 0:
+            if rebuild:
+                self.rebuild_dependency_indices()
+            return
+        if np.any((channels < 0) | (channels >= self.n_channels)):
+            raise IndexError("channel_ids contain out-of-range values")
+
+        catalysts = _broadcast_1d(catalyst_sids, channels.size, "catalyst_sids", np.int64)
+        if np.any((catalysts < 0) | (catalysts >= self.n_species)):
+            raise IndexError("catalyst_sids contain out-of-range values")
+        values = _broadcast_1d(strengths, channels.size, "strengths", float)
+
+        expanded_channels = channels
+        expanded_catalysts = catalysts
+        expanded_values = values
+        if mirror_reverse:
+            reverse_ids_by_channel = [self.get_reverse_channel_ids(int(channel_id)) for channel_id in channels]
+            reverse_count = int(sum(reverse_ids.size for reverse_ids in reverse_ids_by_channel))
+            if reverse_count:
+                total = int(channels.size + reverse_count)
+                expanded_channels = np.empty(total, dtype=np.int64)
+                expanded_catalysts = np.empty(total, dtype=np.int64)
+                expanded_values = np.empty(total, dtype=float)
+                expanded_channels[: channels.size] = channels
+                expanded_catalysts[: channels.size] = catalysts
+                expanded_values[: channels.size] = values
+                cursor = int(channels.size)
+                for index, reverse_ids in enumerate(reverse_ids_by_channel):
+                    n_reverse = int(reverse_ids.size)
+                    if n_reverse == 0:
+                        continue
+                    end = cursor + n_reverse
+                    expanded_channels[cursor:end] = reverse_ids
+                    expanded_catalysts[cursor:end] = catalysts[index]
+                    expanded_values[cursor:end] = values[index]
+                    cursor = end
+
+        self._set_catalytic_strengths_no_rebuild(expanded_channels, expanded_catalysts, expanded_values)
+        self._refresh_channel_has_catalysts_many(expanded_channels)
+        self._invalidate_catalysis_runtime_caches()
         if rebuild:
             self.rebuild_dependency_indices()
         else:
@@ -540,18 +645,9 @@ class ReactionNetworkData:
 
     def get_reverse_channel_ids(self, channel_id: int) -> np.ndarray:
         self._check_channel(channel_id)
-        reactants_key = _species_tuple_key(self.get_channel_reactants(channel_id))
-        products_key = _species_tuple_key(self.get_channel_products(channel_id))
-        reverse_channel_ids: list[int] = []
-        for other_channel_id in range(self.n_channels):
-            if other_channel_id == int(channel_id):
-                continue
-            if _species_tuple_key(self.get_channel_reactants(other_channel_id)) != products_key:
-                continue
-            if _species_tuple_key(self.get_channel_products(other_channel_id)) != reactants_key:
-                continue
-            reverse_channel_ids.append(other_channel_id)
-        return np.asarray(reverse_channel_ids, dtype=np.int64)
+        if len(self.channel_reverse_ids) != self.n_channels:
+            self._rebuild_reverse_channel_cache()
+        return self.channel_reverse_ids[int(channel_id)]
 
     def get_channel_catalysts(self, channel_id: int) -> np.ndarray:
         self._check_channel(channel_id)
@@ -563,13 +659,23 @@ class ReactionNetworkData:
         row = self._cat_row(channel_id)
         return float(row[int(catalyst_sid)])
 
+    def _channel_catalyst_strengths(self, channel_id: int, catalysts: np.ndarray) -> np.ndarray:
+        if (
+            not self.dependency_indices_dirty
+            and len(self.channel_to_catalyst_strengths) == self.n_channels
+        ):
+            return self.channel_to_catalyst_strengths[int(channel_id)]
+        row = self._cat_row(channel_id)
+        return row[np.asarray(catalysts, dtype=np.int64)]
+
     def get_catalytic_factor(self, channel_id: int, state: SystemState) -> float:
+        cid = int(channel_id)
         cats = self.get_channel_catalysts(channel_id)
         if cats.size == 0:
             return 1.0
-        row = self._cat_row(channel_id)
+        strengths = self._channel_catalyst_strengths(cid, cats)
         if self.catalysis_mode == "linear" or not self._uses_substrate_saturating_catalysis(channel_id):
-            return float(1.0 + np.dot(row[cats], state.x[cats]))
+            return float(1.0 + np.dot(strengths, state.x[cats]))
 
         substrate_capacity = self._substrate_capacity(channel_id, state)
         if substrate_capacity <= 0.0:
@@ -577,11 +683,11 @@ class ReactionNetworkData:
 
         contribution = 0.0
         denominator_base = self.saturation_alpha * substrate_capacity
-        for catalyst_sid in cats:
+        for position, catalyst_sid in enumerate(cats):
             x_c = max(float(state.x[int(catalyst_sid)]), 0.0)
             if x_c <= 0.0:
                 continue
-            strength = float(row[int(catalyst_sid)])
+            strength = float(strengths[position])
             contribution += strength * substrate_capacity * x_c / (denominator_base + x_c)
         return float(1.0 + contribution)
 
@@ -705,24 +811,95 @@ class ReactionNetworkData:
     def rebuild_dependency_indices(self) -> None:
         channel_to_species: list[np.ndarray] = []
         channel_to_catalysts: list[np.ndarray] = []
+        channel_to_catalyst_strengths: list[np.ndarray] = []
         reverse: list[set[int]] = [set() for _ in range(self.n_species)]
         channel_has_catalysts = np.zeros(self.n_channels, dtype=bool)
 
         for channel_id in range(self.n_channels):
             base_deps = self._base_dependency_species(channel_id)
             cats = self._scan_channel_catalysts(channel_id)
+            strengths = self._cat_row(channel_id)[cats].astype(float, copy=True)
+            cats.setflags(write=False)
+            strengths.setflags(write=False)
             deps = _unique_concat(base_deps, cats)
+            deps.setflags(write=False)
             channel_to_species.append(deps)
             channel_to_catalysts.append(cats)
+            channel_to_catalyst_strengths.append(strengths)
             channel_has_catalysts[channel_id] = bool(cats.size)
             for sid in deps:
                 reverse[int(sid)].add(channel_id)
 
         self.channel_to_species = channel_to_species
         self.channel_to_catalysts = channel_to_catalysts
+        self.channel_to_catalyst_strengths = channel_to_catalyst_strengths
         self.channel_has_catalysts = channel_has_catalysts
         self.species_to_channels = [np.asarray(sorted(channels), dtype=np.int64) for channels in reverse]
+        for channels in self.species_to_channels:
+            channels.setflags(write=False)
+        self._rebuild_catalysis_runtime_caches(channel_has_catalysts)
         self.dependency_indices_dirty = False
+
+    def _rebuild_catalysis_runtime_caches(self, channel_has_catalysts: np.ndarray) -> None:
+        """Build per-block sparse catalyst indices from the dense assignment blocks.
+
+        Dense ``cat_*`` matrices remain the authoritative assignment store
+        because they are convenient for deterministic construction.  The
+        propensity hot path uses the sparse CSR-like arrays below after a clean
+        rebuild:
+
+        - ``_block_catalyst_row_ptr[block][local_id:local_id+2]`` gives the
+          slice into the flattened catalyst arrays for one local channel;
+        - ``_block_catalyst_species_ids`` and ``_block_catalyst_strengths`` hold
+          only nonzero catalytic entries;
+        - ``_block_has_catalysts_cache`` and ``_block_any_catalysts_cache`` avoid
+          repeated ``np.any`` calls for blocks without catalysts.
+        """
+
+        self._block_has_catalysts_cache = {}
+        self._block_any_catalysts_cache = {}
+        self._block_catalyst_local_ids = {}
+        self._block_catalyst_species_ids = {}
+        self._block_catalyst_strengths = {}
+        self._block_catalyst_row_ptr = {}
+
+        for block in BLOCK_ORDER:
+            start, end = self._block_bounds(block)
+            mask = np.array(channel_has_catalysts[start:end], dtype=bool, copy=True)
+            mask.setflags(write=False)
+            self._block_has_catalysts_cache[block] = mask
+            self._block_any_catalysts_cache[block] = bool(mask.any())
+
+            cat_block = self._cat_block(block)
+            local_ids, catalyst_ids = np.nonzero(cat_block)
+            local_ids = local_ids.astype(np.int64, copy=False)
+            catalyst_ids = catalyst_ids.astype(np.int64, copy=False)
+            strengths = cat_block[local_ids, catalyst_ids].astype(float, copy=True)
+
+            row_counts = np.bincount(local_ids, minlength=int(self.channel_sizes[block]))
+            row_ptr = np.empty(int(self.channel_sizes[block]) + 1, dtype=np.int64)
+            row_ptr[0] = 0
+            np.cumsum(row_counts, out=row_ptr[1:])
+
+            for arr in (local_ids, catalyst_ids, strengths, row_ptr):
+                arr.setflags(write=False)
+            self._block_catalyst_local_ids[block] = local_ids
+            self._block_catalyst_species_ids[block] = catalyst_ids
+            self._block_catalyst_strengths[block] = strengths
+            self._block_catalyst_row_ptr[block] = row_ptr
+
+        self._sparse_catalysis_ready = True
+
+    def _invalidate_catalysis_runtime_caches(self) -> None:
+        """Mark sparse catalyst caches stale after direct catalytic assignment edits."""
+
+        self._sparse_catalysis_ready = False
+        self._block_has_catalysts_cache.clear()
+        self._block_any_catalysts_cache.clear()
+        self._block_catalyst_local_ids.clear()
+        self._block_catalyst_species_ids.clear()
+        self._block_catalyst_strengths.clear()
+        self._block_catalyst_row_ptr.clear()
 
     def _base_dependency_species(self, channel_id: int) -> np.ndarray:
         block, local = self._block_and_local(channel_id)
@@ -753,11 +930,159 @@ class ReactionNetworkData:
         row = self._cat_row(channel_id)
         row[int(catalyst_sid)] = float(strength)
 
+    def _set_catalytic_strengths_no_rebuild(
+        self,
+        channel_ids: np.ndarray,
+        catalyst_sids: np.ndarray,
+        strengths: np.ndarray,
+    ) -> None:
+        channels = np.asarray(channel_ids, dtype=np.int64)
+        catalysts = np.asarray(catalyst_sids, dtype=np.int64)
+        values = np.asarray(strengths, dtype=float)
+        block_types = self.channel_block_type[channels]
+        for block in BLOCK_ORDER:
+            mask = block_types == int(block)
+            if not np.any(mask):
+                continue
+            local_ids = self.channel_local_id[channels[mask]]
+            self._cat_block(block)[local_ids, catalysts[mask]] = values[mask]
+
     def _refresh_channel_has_catalysts(self, channel_id: int) -> None:
         cid = int(channel_id)
         if self.channel_has_catalysts.shape != (self.n_channels,):
             self.channel_has_catalysts = np.zeros(self.n_channels, dtype=bool)
         self.channel_has_catalysts[cid] = bool(np.any(self._cat_row(cid) != 0.0))
+
+    def _refresh_channel_has_catalysts_many(self, channel_ids: np.ndarray) -> None:
+        channels = np.unique(np.asarray(channel_ids, dtype=np.int64))
+        if channels.size == 0:
+            return
+        if self.channel_has_catalysts.shape != (self.n_channels,):
+            self.channel_has_catalysts = np.zeros(self.n_channels, dtype=bool)
+        block_types = self.channel_block_type[channels]
+        for block in BLOCK_ORDER:
+            mask = block_types == int(block)
+            if not np.any(mask):
+                continue
+            block_channels = channels[mask]
+            local_ids = self.channel_local_id[block_channels]
+            self.channel_has_catalysts[block_channels] = np.any(self._cat_block(block)[local_ids] != 0.0, axis=1)
+
+    def _rebuild_reverse_channel_cache(self) -> None:
+        """Build channel -> reverse-channel ids once from structural stoichiometry.
+
+        Reverse lookup is used heavily when catalytic assignments mirror forward
+        reactions to their fragmentation partners.  The mapping depends only on
+        reactant/product species ids, so it should not be rebuilt during normal
+        simulation or catalytic-strength sweeps.
+        """
+
+        keys: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+        lookup: dict[tuple[tuple[int, ...], tuple[int, ...]], list[int]] = {}
+        for channel_id in range(self.n_channels):
+            reactants_key = _species_tuple_key(self.get_channel_reactants(channel_id))
+            products_key = _species_tuple_key(self.get_channel_products(channel_id))
+            key = (reactants_key, products_key)
+            keys.append(key)
+            lookup.setdefault(key, []).append(int(channel_id))
+
+        reverse_ids: list[np.ndarray] = []
+        for channel_id, (reactants_key, products_key) in enumerate(keys):
+            candidates = [
+                int(other_channel_id)
+                for other_channel_id in lookup.get((products_key, reactants_key), [])
+                if int(other_channel_id) != int(channel_id)
+            ]
+            arr = np.asarray(candidates, dtype=np.int64)
+            arr.setflags(write=False)
+            reverse_ids.append(arr)
+        self.channel_reverse_ids = reverse_ids
+
+    def _precompute_channel_reactant_terms(self) -> None:
+        """Precompute elementary reactant terms for vectorized availability checks.
+
+        PDMP-Gillespie needs to reject discrete channels whose mass-action
+        propensity is positive on a fractional continuous state but whose
+        reactants cannot be consumed by one discrete firing.  Calling
+        ``get_channel_reactants`` for every candidate channel is too expensive,
+        so the hot path reads these arrays directly.
+        """
+
+        n_channels = self.n_channels
+        order = np.zeros(n_channels, dtype=np.int8)
+        reactant1 = np.full(n_channels, -1, dtype=np.int64)
+        reactant2 = np.full(n_channels, -1, dtype=np.int64)
+        homo_second_order = np.zeros(n_channels, dtype=bool)
+
+        def assign(block: ChannelBlock, local_ids: np.ndarray, values_order: int, r1: np.ndarray | None, r2: np.ndarray | None = None) -> None:
+            if local_ids.size == 0:
+                return
+            start = int(self.channel_offsets[block])
+            channels = start + np.asarray(local_ids, dtype=np.int64)
+            order[channels] = int(values_order)
+            if r1 is not None:
+                reactant1[channels] = np.asarray(r1, dtype=np.int64)
+            if r2 is not None:
+                r2_values = np.asarray(r2, dtype=np.int64)
+                reactant2[channels] = r2_values
+                homo_second_order[channels] = reactant1[channels] == r2_values
+
+        assign(
+            ChannelBlock.LEFT_ADD,
+            self._block_local_ids_cache[ChannelBlock.LEFT_ADD],
+            2,
+            self.left_add_monomer,
+            self.left_add_species,
+        )
+        assign(
+            ChannelBlock.RIGHT_ADD,
+            self._block_local_ids_cache[ChannelBlock.RIGHT_ADD],
+            2,
+            self.right_add_species,
+            self.right_add_monomer,
+        )
+        assign(
+            ChannelBlock.LEFT_SPLIT,
+            self._block_local_ids_cache[ChannelBlock.LEFT_SPLIT],
+            1,
+            self.left_split_source,
+        )
+        assign(
+            ChannelBlock.RIGHT_SPLIT,
+            self._block_local_ids_cache[ChannelBlock.RIGHT_SPLIT],
+            1,
+            self.right_split_source,
+        )
+        assign(
+            ChannelBlock.OUTFLOW,
+            self._block_local_ids_cache[ChannelBlock.OUTFLOW],
+            1,
+            self.outflow_source,
+        )
+
+        all_channels = np.arange(n_channels, dtype=np.int64)
+        zero_order_channels = np.flatnonzero(order == 0).astype(np.int64, copy=False)
+        first_order_channels = np.flatnonzero(order == 1).astype(np.int64, copy=False)
+        second_order_channels = np.flatnonzero(order == 2).astype(np.int64, copy=False)
+        for arr in (
+            order,
+            reactant1,
+            reactant2,
+            homo_second_order,
+            all_channels,
+            zero_order_channels,
+            first_order_channels,
+            second_order_channels,
+        ):
+            arr.setflags(write=False)
+        self.reaction_order = order
+        self.reactant1 = reactant1
+        self.reactant2 = reactant2
+        self.homo_second_order = homo_second_order
+        self.all_channels = all_channels
+        self.zero_order_channels = zero_order_channels
+        self.first_order_channels = first_order_channels
+        self.second_order_channels = second_order_channels
 
     def _uses_substrate_saturating_catalysis(self, channel_id: int) -> bool:
         if self.catalysis_mode != "substrate_saturating":
@@ -847,32 +1172,56 @@ class ReactionNetworkData:
             return values
 
         ids = self._local_ids_for_block(block_e, local_ids)
-        active = self._has_catalysts_for_local_ids(block_e, ids)
+        use_sparse = self._can_use_sparse_catalysis(block_e)
+        block_has_catalysts = (
+            bool(self._block_any_catalysts_cache.get(block_e, False)) if use_sparse else True
+        )
 
         if self.catalysis_mode == "substrate_saturating" and block_e in (
             ChannelBlock.LEFT_ADD,
             ChannelBlock.RIGHT_ADD,
         ):
             capacity = self._substrate_capacity_values(block_e, ids, x)
-            values = np.where(capacity > 0.0, values, 0.0)
+            values[capacity <= 0.0] = 0.0
+            if not block_has_catalysts:
+                np.maximum(values, 0.0, out=values)
+                return values
+            active = self._has_catalysts_for_local_ids(block_e, ids)
             active = active & (values > 0.0)
             if np.any(active):
-                cat_block = self._cat_block(block_e)
-                factors = self._substrate_saturating_factors(cat_block[ids[active]], capacity[active], x)
-                values[active] *= factors
+                if use_sparse:
+                    factors = self._sparse_substrate_saturating_factors(block_e, ids, capacity, x)
+                    values[active] *= factors[active]
+                else:
+                    cat_block = self._cat_block(block_e)
+                    factors = self._substrate_saturating_factors(cat_block[ids[active]], capacity[active], x)
+                    values[active] *= factors
             np.maximum(values, 0.0, out=values)
             return values
 
+        if not block_has_catalysts:
+            np.maximum(values, 0.0, out=values)
+            return values
+        active = self._has_catalysts_for_local_ids(block_e, ids)
         active = active & (values > 0.0)
         if np.any(active):
-            cat_block = self._cat_block(block_e)
-            values[active] *= 1.0 + cat_block[ids[active]] @ x
+            if use_sparse:
+                factors = self._sparse_linear_catalytic_factors(block_e, ids, x)
+                values[active] *= factors[active]
+            else:
+                cat_block = self._cat_block(block_e)
+                values[active] *= 1.0 + cat_block[ids[active]] @ x
         np.maximum(values, 0.0, out=values)
         return values
 
     def _local_ids_for_block(self, block: ChannelBlock, local_ids: np.ndarray | None) -> np.ndarray:
         if local_ids is None:
-            return np.arange(self.channel_sizes[block], dtype=np.int64)
+            ids = self._block_local_ids_cache.get(block)
+            if ids is None or ids.shape != (int(self.channel_sizes[block]),):
+                ids = np.arange(int(self.channel_sizes[block]), dtype=np.int64)
+                ids.setflags(write=False)
+                self._block_local_ids_cache[block] = ids
+            return ids
         ids = np.asarray(local_ids, dtype=np.int64)
         if ids.ndim != 1:
             raise ValueError("local_ids must be a 1D array")
@@ -881,10 +1230,115 @@ class ReactionNetworkData:
     def _has_catalysts_for_local_ids(self, block: ChannelBlock, local_ids: np.ndarray) -> np.ndarray:
         if local_ids.size == 0:
             return np.zeros(0, dtype=bool)
+        if not self.dependency_indices_dirty:
+            mask = self._block_has_catalysts_cache.get(block)
+            if mask is not None:
+                all_ids = self._block_local_ids_cache.get(block)
+                if local_ids is all_ids:
+                    return mask
+                return mask[local_ids]
         if self.channel_has_catalysts.shape != (self.n_channels,):
             self.rebuild_dependency_indices()
         offset = int(self.channel_offsets[block])
         return self.channel_has_catalysts[offset + local_ids]
+
+    def _can_use_sparse_catalysis(self, block: ChannelBlock) -> bool:
+        return (
+            self._sparse_catalysis_ready
+            and not self.dependency_indices_dirty
+            and block in self._block_catalyst_row_ptr
+        )
+
+    def _sparse_linear_catalytic_factors(
+        self,
+        block: ChannelBlock,
+        local_ids: np.ndarray,
+        x: np.ndarray,
+    ) -> np.ndarray:
+        row_ptr = self._block_catalyst_row_ptr[block]
+        cat_local_ids = self._block_catalyst_local_ids[block]
+        cat_species_ids = self._block_catalyst_species_ids[block]
+        strengths = self._block_catalyst_strengths[block]
+        factors = np.ones(local_ids.shape, dtype=float)
+        if cat_species_ids.size == 0:
+            return factors
+
+        all_ids = self._block_local_ids_cache.get(block)
+        if local_ids is all_ids:
+            contribution = np.bincount(
+                cat_local_ids,
+                weights=strengths * np.asarray(x, dtype=float)[cat_species_ids],
+                minlength=int(self.channel_sizes[block]),
+            )
+            factors += contribution
+            return factors
+
+        x_values = np.asarray(x, dtype=float)
+        for position, local_id in enumerate(local_ids):
+            start = int(row_ptr[int(local_id)])
+            end = int(row_ptr[int(local_id) + 1])
+            if start == end:
+                continue
+            cats = cat_species_ids[start:end]
+            factors[position] += float(np.dot(strengths[start:end], x_values[cats]))
+        return factors
+
+    def _sparse_substrate_saturating_factors(
+        self,
+        block: ChannelBlock,
+        local_ids: np.ndarray,
+        capacity: np.ndarray,
+        x: np.ndarray,
+    ) -> np.ndarray:
+        row_ptr = self._block_catalyst_row_ptr[block]
+        cat_local_ids = self._block_catalyst_local_ids[block]
+        cat_species_ids = self._block_catalyst_species_ids[block]
+        strengths = self._block_catalyst_strengths[block]
+        factors = np.ones(local_ids.shape, dtype=float)
+        if cat_species_ids.size == 0:
+            return factors
+
+        x_values = np.maximum(np.asarray(x, dtype=float), 0.0)
+        all_ids = self._block_local_ids_cache.get(block)
+        if local_ids is all_ids:
+            cap_by_entry = np.asarray(capacity, dtype=float)[cat_local_ids]
+            x_c = x_values[cat_species_ids]
+            denom = self.saturation_alpha * cap_by_entry + x_c
+            weights = np.zeros(cat_species_ids.shape, dtype=float)
+            np.divide(
+                strengths * cap_by_entry * x_c,
+                denom,
+                out=weights,
+                where=denom > 0.0,
+            )
+            contribution = np.bincount(
+                cat_local_ids,
+                weights=weights,
+                minlength=int(self.channel_sizes[block]),
+            )
+            factors += contribution
+            return factors
+
+        for position, local_id in enumerate(local_ids):
+            cap = float(capacity[position])
+            if cap <= 0.0:
+                continue
+            start = int(row_ptr[int(local_id)])
+            end = int(row_ptr[int(local_id) + 1])
+            if start == end:
+                continue
+            cats = cat_species_ids[start:end]
+            x_c = x_values[cats]
+            denom = self.saturation_alpha * cap + x_c
+            terms = np.zeros(cats.shape, dtype=float)
+            np.divide(
+                strengths[start:end] * cap * x_c,
+                denom,
+                out=terms,
+                where=denom > 0.0,
+            )
+            factors[position] += float(np.sum(terms))
+        return factors
 
     def _substrate_capacity_values(self, block: ChannelBlock, local_ids: np.ndarray, x: np.ndarray) -> np.ndarray:
         if block == ChannelBlock.LEFT_ADD:
@@ -937,6 +1391,8 @@ class ReactionNetworkData:
         ids = np.asarray(local_ids, dtype=np.int64)
         factors = np.ones(ids.shape, dtype=float)
         if ids.size == 0:
+            return factors
+        if self._all_inflow_capacity_infinite:
             return factors
         capacities = self.inflow_capacity[ids]
         finite = np.isfinite(capacities)
@@ -994,6 +1450,15 @@ def _unique_ints(*values: int) -> np.ndarray:
 
 def _species_tuple_key(species_ids: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(sorted(int(sid) for sid in species_ids))
+
+
+def _broadcast_1d(value, n: int, name: str, dtype) -> np.ndarray:
+    arr = np.asarray(value, dtype=dtype)
+    if arr.ndim == 0:
+        return np.full(int(n), arr.item(), dtype=dtype)
+    if arr.shape != (int(n),):
+        raise ValueError(f"{name} must be scalar or shape ({int(n)},)")
+    return np.asarray(arr, dtype=dtype)
 
 
 def _validate_catalysis_mode(value: str) -> str:

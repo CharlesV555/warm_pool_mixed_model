@@ -69,6 +69,71 @@ def test_blended_hybrid_pure_cle_branch_has_no_discrete_event():
     assert np.all(state.x >= 0.0)
 
 
+def test_blended_hybrid_halves_cle_dt_when_trial_goes_negative():
+    space = generate_fixed_species_space(["A"], max_len=1, initial_counts={"A": 1.0})
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_outflow=1_000.0,
+        outflow_species_ids=[space.idx("A")],
+    )
+    state = SystemState.from_x0(network.x0)
+    stepper = BlendedHybridStepper(
+        BlendedHybridConfig(
+            i1=-2.0,
+            i2=-1.0,
+            dt_cle=1.0,
+            cle_dt_min=1e-9,
+            round_low_counts_after_cle=False,
+        )
+    )
+
+    result = stepper.step(
+        state,
+        1.0,
+        StepperContext(network=network, rng=np.random.default_rng(123)),
+    )
+
+    assert result.details["mode"] == "cle"
+    assert result.details["cle_rejected_attempts"] > 0
+    assert result.details["cle_accepted_dt"] < result.details["cle_requested_dt"]
+    assert result.advanced_time == result.details["cle_accepted_dt"]
+    assert state.t == result.advanced_time
+    assert np.all(np.isfinite(state.x))
+    assert np.all(state.x >= 0.0)
+
+
+def test_blended_hybrid_doubles_cle_dt_without_discrete_interruption():
+    space = generate_fixed_species_space(["A"], max_len=1, initial_counts={"A": 0.0})
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(space, tables)
+    state = SystemState.from_x0(network.x0)
+    stepper = BlendedHybridStepper(
+        BlendedHybridConfig(
+            i1=-2.0,
+            i2=-1.0,
+            dt_cle=0.01,
+            dt_macro=0.01,
+            cle_dt_max=0.04,
+            round_low_counts_after_cle=False,
+        )
+    )
+
+    result = stepper.step(
+        state,
+        1.0,
+        StepperContext(network=network, rng=np.random.default_rng(124)),
+    )
+
+    assert result.details["mode"] == "cle"
+    assert result.details["cle_rejected_attempts"] == 0
+    assert np.isclose(result.details["cle_accepted_dt"], 0.01)
+    assert np.isclose(result.details["cle_dt_after"], 0.02)
+    assert np.all(np.isfinite(state.x))
+    assert np.all(state.x >= 0.0)
+
+
 def test_blended_hybrid_mixed_branch_smoke():
     network = make_network(initial_count=20.0)
     state = SystemState.from_x0(network.x0)
@@ -95,6 +160,39 @@ def test_nrm_blended_pure_cle_branch_has_no_discrete_event():
     assert result.details["mode"] == "nrm_blended_cle"
     assert result.channel_id is None
     assert not result.event_occurred
+    assert np.all(np.isfinite(state.x))
+    assert np.all(state.x >= 0.0)
+
+
+def test_nrm_blended_pure_cle_uses_adaptive_dt_guard():
+    space = generate_fixed_species_space(["A"], max_len=1, initial_counts={"A": 1.0})
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_outflow=1_000.0,
+        outflow_species_ids=[space.idx("A")],
+    )
+    state = SystemState.from_x0(network.x0)
+    stepper = NRMBlendedHybridStepper(
+        BlendedHybridConfig(
+            i1=-2.0,
+            i2=-1.0,
+            dt_cle=1.0,
+            cle_dt_min=1e-9,
+            round_low_counts_after_cle=False,
+        )
+    )
+
+    result = stepper.step(
+        state,
+        1.0,
+        StepperContext(network=network, rng=np.random.default_rng(125)),
+    )
+
+    assert result.details["mode"] == "nrm_blended_cle"
+    assert result.details["cle_rejected_attempts"] > 0
+    assert result.details["cle_accepted_dt"] < result.details["cle_requested_dt"]
     assert np.all(np.isfinite(state.x))
     assert np.all(state.x >= 0.0)
 

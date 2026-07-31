@@ -29,6 +29,7 @@ from polymer_sim import (
     format_stepper_info,
     generate_fixed_species_space,
     save_trajectory_record,
+    set_catalytic_strengths_for_channels,
 )
 
 # 其它模拟模式保留为注释，便于对照时手动切换。
@@ -37,10 +38,9 @@ from polymer_sim import (
 #     BlendedHybridStepper,
 #     NRMBlendedHybridStepper,
 #     OptimizedNRMStepper,
-#     SSAStepper,
 # )
 
-MAX_LEN = 4
+MAX_LEN = 10
 ALPHABET = ("0", "1")
 T_END = 200.0
 SEED = 123
@@ -73,7 +73,7 @@ K_RIGHT_SPLIT = 0.011
 
 CROSS_CATALYSIS_RULES = {
     # "1111": "1",
-    "0000": "0",
+    "0000000000": "0",
 }
 
 # Catalytic quasi-steady-state parameterization used by the PDMP elementary view:
@@ -137,12 +137,25 @@ PDMP_REACTION_RELAXATION_DELTA = 0.9
 PDMP_SPECIES_EXPONENT_THRESHOLD = PDMP_CONTINUOUS_COPY_NUMBER_SCALE_THRESHOLD_MU
 PDMP_REACTION_EXPONENT_THRESHOLD = PDMP_REACTION_RELAXATION_DELTA
 PDMP_BOUND_FACTOR = PDMP_N0 ** PDMP_ADAPTATION_SCALE_THRESHOLD_ETA
-PDMP_USE_LP = True
+PDMP_USE_LP = False
 PDMP_REPARTITION_ON_EVENT = False
 PDMP_REPARTITION_ON_BOUNDS = True
 PDMP_ENABLE_FAST_SUBNETWORKS = False
 PDMP_FAST_SUBNETWORK_THRESHOLD = 1.0
 PDMP_FAST_SUBNETWORK_MAX_SIZE = 3
+# Select how the PDMP discrete reaction subset RD is simulated.
+# The overall simulator remains PDMPStepper in all modes below.
+# - "nrm_heap": Next Reaction Method with scheduled firing-time heap.
+# - "nrm_scan": Next Reaction Method with per-channel thresholds and linear scan.
+# - "gillespie": Direct SSA over RD inside each PDMP micro-step.
+#
+# Change this variable to compare NRM and Gillespie for the discrete part
+# without changing the continuous PDMP drift or partition strategy.
+PDMP_DISCRETE_EVENT_METHOD = "gillespie"
+PDMP_USE_DISCRETE_EVENT_HEAP = PDMP_DISCRETE_EVENT_METHOD == "nrm_heap"
+PDMP_USE_LOCAL_PROPENSITY_UPDATES = True
+PDMP_LOCAL_PROPENSITY_FULL_RECOMPUTE_FRACTION = 0.5
+PDMP_HEAP_REBUILD_FACTOR = 4.0
 
 OUTPUT_PATH = EXAMPLES_DIR / "cross_catalysis_PDMP_linear_trajectory.npz"
 FAST_NETWORK_REPORT_PATH = EXAMPLES_DIR / "cross_catalysis_PDMP_linear_fast_network_report.txt"
@@ -207,6 +220,8 @@ def assign_cross_terminal_catalysis(network: ReactionNetworkData, *, rng: np.ran
             added_monomer_sid,
             added_monomer_name,
         )
+        primary_channels = [int(channel_id) for channel_id in catalyzed_channels]
+        primary_strengths: list[float] = []
         for channel_id in catalyzed_channels:
             substrate_sid = int(network.get_channel_main_species(int(channel_id)))
             substrate_name = network.species_names[substrate_sid]
@@ -214,15 +229,16 @@ def assign_cross_terminal_catalysis(network: ReactionNetworkData, *, rng: np.ran
             if pair_key not in gamma_by_complex_pair:
                 gamma_by_complex_pair[pair_key] = _sample_catalytic_gamma(rng)
             gamma = float(gamma_by_complex_pair[pair_key])
-            network.set_catalytic_strength(
-                int(channel_id),
-                catalyst_sid=catalyst_sid,
-                strength=gamma,
-                rebuild=False,
-                mirror_reverse=True,
-            )
+            primary_strengths.append(gamma)
             gamma_by_primary_channel[int(channel_id)] = gamma
-        primary_channels = [int(channel_id) for channel_id in catalyzed_channels]
+        set_catalytic_strengths_for_channels(
+            network,
+            np.asarray(primary_channels, dtype=np.int64),
+            catalyst_sid,
+            np.asarray(primary_strengths, dtype=float),
+            mirror_reverse=True,
+            rebuild=False,
+        )
         mirrored_channels = [
             int(reverse_channel_id)
             for channel_id in primary_channels
@@ -381,6 +397,11 @@ def example_parameters() -> dict:
         "pdmp_enable_fast_subnetworks": PDMP_ENABLE_FAST_SUBNETWORKS,
         "pdmp_fast_subnetwork_threshold": PDMP_FAST_SUBNETWORK_THRESHOLD,
         "pdmp_fast_subnetwork_max_size": PDMP_FAST_SUBNETWORK_MAX_SIZE,
+        "pdmp_discrete_event_method": PDMP_DISCRETE_EVENT_METHOD,
+        "pdmp_use_discrete_event_heap": PDMP_USE_DISCRETE_EVENT_HEAP,
+        "pdmp_use_local_propensity_updates": PDMP_USE_LOCAL_PROPENSITY_UPDATES,
+        "pdmp_local_propensity_full_recompute_fraction": PDMP_LOCAL_PROPENSITY_FULL_RECOMPUTE_FRACTION,
+        "pdmp_heap_rebuild_factor": PDMP_HEAP_REBUILD_FACTOR,
         "blended_i1": BLENDED_I1,
         "blended_i2": BLENDED_I2,
         "blended_dt_cle": BLENDED_DT_CLE,
@@ -394,7 +415,7 @@ def example_parameters() -> dict:
 
 
 def print_run_summary(run_result, trajectory_record) -> None:
-    print("\nPDMP Algorithm 2 summary:")
+    print("\nSimulation summary:")
     print(format_stepper_info(run_result.summary.metadata))
     print(
         f"t={run_result.summary.final_time:.4f}, "
@@ -410,13 +431,13 @@ def print_run_summary(run_result, trajectory_record) -> None:
 
 
 def main() -> None:
-    build_started_at = perf_counter()
+    # build_started_at = perf_counter()
     network, catalysis_result = build_cross_catalysis_network()
 
     # Keep the original polymer ReactionNetworkData. The selected PDMP partition
     # method accounts for linear catalyst copy-number and strength scales without
     # expanding catalytic reactions into elementary channels.
-    build_elapsed = perf_counter() - build_started_at
+    # build_elapsed = perf_counter() - build_started_at
 
     # restriction = build_food_upper_limit_restriction(network)
 
@@ -467,6 +488,11 @@ def main() -> None:
             adaptive=True,
             repartition_on_event=PDMP_REPARTITION_ON_EVENT,
             repartition_on_bounds=PDMP_REPARTITION_ON_BOUNDS,
+            discrete_event_method=PDMP_DISCRETE_EVENT_METHOD,
+            use_discrete_event_heap=PDMP_USE_DISCRETE_EVENT_HEAP,
+            use_local_propensity_updates=PDMP_USE_LOCAL_PROPENSITY_UPDATES,
+            local_propensity_full_recompute_fraction=PDMP_LOCAL_PROPENSITY_FULL_RECOMPUTE_FRACTION,
+            heap_rebuild_factor=PDMP_HEAP_REBUILD_FACTOR,
         ),
     )
     partition_strategy = stepper.partition_strategy
@@ -474,12 +500,13 @@ def main() -> None:
         raise RuntimeError("PDMPStepper did not select the linear-catalysis partition strategy")
 
     print("Cross-catalysis reaction system")
+    print(f"stepper={stepper.__class__.__name__}, pdmp_discrete_event_method={PDMP_DISCRETE_EVENT_METHOD}")
     print(f"alphabet={ALPHABET}, max_len={MAX_LEN}")
     print(f"base n_species={network.n_species}, base n_channels={network.n_channels}")
     print(f"pdmp network n_species={network.n_species}, n_channels={network.n_channels}")
     print(f"catalysis_mode={network.catalysis_mode}, saturation_alpha={network.saturation_alpha}")
     print(f"background_rate={BACKGROUND_RATE}, catalytic_gamma={CATALYTIC_GAMMA}")
-    print(f"pdmp_partition_method={stepper.partition_method}")
+    print(f"pdmp_partition_method={getattr(stepper, 'partition_method', None)}")
     print(
         f"initial_food_count={INITIAL_FOOD_COUNT}, "
         f"k_food_zero_order_inflow={K_FOOD_ZERO_ORDER_INFLOW}, "
@@ -492,6 +519,13 @@ def main() -> None:
         f"algorithm3 mu={PDMP_CONTINUOUS_COPY_NUMBER_SCALE_THRESHOLD_MU}, "
         f"eta={PDMP_ADAPTATION_SCALE_THRESHOLD_ETA}, "
         f"delta={PDMP_REACTION_RELAXATION_DELTA}"
+    )
+    print(
+        f"pdmp_discrete_event_method={PDMP_DISCRETE_EVENT_METHOD}, "
+        f"pdmp_discrete_event_heap={PDMP_USE_DISCRETE_EVENT_HEAP}, "
+        f"local_propensity_updates={PDMP_USE_LOCAL_PROPENSITY_UPDATES}, "
+        f"local_full_recompute_fraction={PDMP_LOCAL_PROPENSITY_FULL_RECOMPUTE_FRACTION}, "
+        f"heap_rebuild_factor={PDMP_HEAP_REBUILD_FACTOR}"
     )
     print(f"catalyst species={catalyst_species_names(network)}")
     print(f"catalyzed channels={catalyzed_channel_count(network)}")
@@ -520,9 +554,9 @@ def main() -> None:
         # restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
-        timing_report=True,
-        timing_report_dir="timing_reports",
-        network_build_elapsed_seconds=build_elapsed,
+        # timing_report=True,
+        # timing_report_dir="timing_reports",
+        # network_build_elapsed_seconds=build_elapsed,
     )
 
     trajectory_record = recorder.finalize()
@@ -534,6 +568,7 @@ def main() -> None:
         "n_channels": int(network.n_channels),
         "network_type": "ReactionNetworkData",
         "partition_strategy": partition_strategy.__class__.__name__,
+        "pdmp_discrete_event_method": PDMP_DISCRETE_EVENT_METHOD,
     }
     save_trajectory_record(OUTPUT_PATH, trajectory_record)
 
