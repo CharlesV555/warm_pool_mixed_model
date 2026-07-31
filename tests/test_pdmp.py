@@ -520,7 +520,62 @@ def test_pdmp_stepper_can_use_gillespie_discrete_event_locator():
     assert stepper.config.use_discrete_event_heap is False
     assert result.details["discrete_event_method"] == "gillespie"
     assert result.details["discrete_event_locator"] == "gillespie"
+    assert result.details["discrete_hazard_mode"] == "scalar_integrated"
     assert state.x[network.species_idx("A")] > network.x0[network.species_idx("A")]
+
+
+def test_fixed_pdmp_partition_marks_rq_discrete_channels_that_change_continuous_species():
+    network = ElementaryMassActionNetwork(
+        species_names=["S0", "S1"],
+        name_to_idx={"S0": 0, "S1": 1},
+        x0=np.array([10.0, 0.0]),
+        nu_minus=np.array([[1.0, 0.0]], dtype=float),
+        nu_plus=np.array([[0.0, 1.0]], dtype=float),
+        rate_constants=np.array([1.0], dtype=float),
+    )
+
+    partition = FixedPDMPPartitionStrategy(
+        continuous_channels=[],
+        continuous_species=[1],
+    ).partition(network, SystemState.from_x0(network.x0))
+
+    assert partition.rq_channels.tolist() == [0]
+
+
+def test_pdmp_gillespie_rq_event_forces_adaptation():
+    network = ElementaryMassActionNetwork(
+        species_names=["S0", "S1"],
+        name_to_idx={"S0": 0, "S1": 1},
+        x0=np.array([10.0, 0.0]),
+        nu_minus=np.array([[1.0, 0.0]], dtype=float),
+        nu_plus=np.array([[0.0, 1.0]], dtype=float),
+        rate_constants=np.array([1000.0], dtype=float),
+    )
+    state = SystemState.from_x0(network.x0)
+    stepper = PDMPStepper(
+        partition_strategy=FixedPDMPPartitionStrategy(
+            continuous_channels=[],
+            continuous_species=[1],
+        ),
+        config=PDMPConfig(
+            ode_step=0.1,
+            discrete_event_method="gillespie",
+            repartition_on_event=False,
+        ),
+    )
+
+    result = stepper.step(
+        state,
+        0.1,
+        StepperContext(network=network, rng=np.random.default_rng(123)),
+    )
+
+    assert result.event_occurred
+    assert result.details["rq_event_count"] == 1
+    assert result.details["n_repartitions"] == 2
+    assert state.event_count == 1
+    assert state.x[0] == 9.0
+    assert state.x[1] == 1.0
 
 
 def test_pdmp_gillespie_discrete_locator_checks_event_state_reactant_availability():

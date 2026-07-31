@@ -731,7 +731,8 @@ class PDMPStepper(BaseStepper):
         #   For Algorithm 3 this is ScalingPDMPPartitionStrategy.partition(...).
         #   The result stores RC as continuous_channels, RD as discrete_channels,
         #   SC/SD as continuous_species/discrete_species, and scale bounds.
-        #   RQ is not represented as a separate set yet.
+        #   RQ is stored as rq_channels: discrete jumps that change a
+        #   continuous species and therefore force immediate adaptation.
         if self._invalidated or store.get("partition") is None:
             # External invalidation means either the caller changed the state or
             # the network/stepper configuration changed.  Do not trust any
@@ -743,6 +744,17 @@ class PDMPStepper(BaseStepper):
             self._install_partition(store, partition, rng, current_time=float(state.t), propensities=propensities, reset_all=True)
             self._invalidated = False
             repartitions += 1
+
+        if self._uses_discrete_event_gillespie():
+            return self._step_gillespie_integrated_hazard(
+                state,
+                duration,
+                context,
+                network,
+                store,
+                rng,
+                initial_repartitions=repartitions,
+            )
 
         start_time = float(state.t)
         end_time = start_time + duration
@@ -1006,6 +1018,254 @@ class PDMPStepper(BaseStepper):
             ),
         )
 
+    def _step_gillespie_integrated_hazard(
+        self,
+        state: SystemState,
+        duration: float,
+        context: StepperContext,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        store: dict[str, Any],
+        rng: np.random.Generator,
+        *,
+        initial_repartitions: int,
+    ) -> StepResult:
+        """Algorithm-2 scalar discrete-hazard loop for RD.
+
+        This is the paper-style handling for the Direct/Gillespie discrete
+        part.  The stepper maintains a scalar integrated hazard ``w`` for the
+        current discrete reaction set RD and an absolute threshold ``u``.  Over
+        each Euler ODE segment we test whether ``w + a_D * dt`` crosses ``u``;
+        at a crossing time the concrete channel is sampled from the current RD
+        propensity distribution.
+
+        The continuous ODE solve is still the existing explicit Euler segment,
+        so this is not yet a dense-output ODE solver.  The stochastic event
+        clock, threshold update, and adaptation reset semantics match the
+        Algorithm-2 structure.
+        """
+
+        start_time = float(state.t)
+        end_time = start_time + float(duration)
+        continuous_abs_total = np.zeros(network.n_channels, dtype=float)
+        last_total_discrete_propensity = 0.0
+        last_total_continuous_propensity = 0.0
+        repartitions = int(initial_repartitions)
+        rq_event_count = 0
+        disabled_event_candidates = 0
+        applied_event_ids: list[int] = []
+        event_times: list[float] = []
+
+        while float(state.t) < end_time - self.config.hazard_tol:
+            micro_end = min(float(state.t) + float(self.config.ode_step), end_time)
+            stop_after_event_or_adaptation = False
+
+            while float(state.t) < micro_end - self.config.hazard_tol:
+                segment_dt = max(float(micro_end) - float(state.t), 0.0)
+                if segment_dt <= 0.0:
+                    break
+
+                partition = self._require_partition(store)
+                propensities = self._get_propensities(network, state, store, reason="gillespie hazard segment")
+                continuous_channels = partition.continuous_channels
+                discrete_channels = partition.discrete_channels
+                last_total_continuous_propensity = (
+                    float(np.sum(propensities[continuous_channels])) if continuous_channels.size else 0.0
+                )
+                last_total_discrete_propensity = self._available_discrete_propensity_total(
+                    network,
+                    state,
+                    discrete_channels,
+                    propensities,
+                )
+
+                if last_total_discrete_propensity <= self.config.hazard_tol:
+                    continuous_abs_total += self._advance_continuous(
+                        network,
+                        state,
+                        propensities,
+                        continuous_channels,
+                        segment_dt,
+                    )
+                    state.t += segment_dt
+                    if continuous_channels.size:
+                        changed_species = self._changed_species_for_channels(network, continuous_channels)
+                        self._refresh_propensities_after_state_change(
+                            network,
+                            state,
+                            store,
+                            changed_species,
+                            rng,
+                            reason="continuous drift changed state",
+                        )
+                    break
+
+                hazard = self._scalar_discrete_hazard(store)
+                threshold = self._scalar_discrete_threshold(store, rng)
+                remaining_hazard = max(float(threshold) - float(hazard), 0.0)
+                event_dt = remaining_hazard / max(float(last_total_discrete_propensity), self.config.hazard_tol)
+
+                if not np.isfinite(event_dt) or event_dt > segment_dt + self.config.hazard_tol:
+                    continuous_abs_total += self._advance_continuous(
+                        network,
+                        state,
+                        propensities,
+                        continuous_channels,
+                        segment_dt,
+                    )
+                    self._advance_scalar_discrete_hazard(store, last_total_discrete_propensity, segment_dt)
+                    state.t += segment_dt
+                    if continuous_channels.size:
+                        changed_species = self._changed_species_for_channels(network, continuous_channels)
+                        self._refresh_propensities_after_state_change(
+                            network,
+                            state,
+                            store,
+                            changed_species,
+                            rng,
+                            reason="continuous drift changed state",
+                        )
+                    break
+
+                event_dt = max(float(event_dt), 0.0)
+                continuous_abs_total += self._advance_continuous(
+                    network,
+                    state,
+                    propensities,
+                    continuous_channels,
+                    event_dt,
+                )
+                state.t += event_dt
+                store["discrete_total_hazard"] = float(threshold)
+                changed_species = (
+                    self._changed_species_for_channels(network, continuous_channels)
+                    if continuous_channels.size and event_dt > 0.0
+                    else np.empty(0, dtype=np.int64)
+                )
+                if changed_species.size:
+                    self._refresh_propensities_after_state_change(
+                        network,
+                        state,
+                        store,
+                        changed_species,
+                        rng,
+                        reason="continuous drift before gillespie event",
+                    )
+
+                partition = self._require_partition(store)
+                sampled_channel, event_total = self._sample_gillespie_channel_at_current_state(
+                    network,
+                    state,
+                    partition.discrete_channels,
+                    rng,
+                )
+                last_total_discrete_propensity = float(event_total)
+                self._advance_scalar_discrete_threshold(store, rng)
+
+                if sampled_channel is None:
+                    disabled_event_candidates += 1
+                    store["gillespie_disabled_event_candidates"] = int(
+                        store.get("gillespie_disabled_event_candidates", 0)
+                    ) + 1
+                    self._mark_propensities_dirty(
+                        store,
+                        "gillespie hazard crossing had no available event",
+                        changed_species,
+                    )
+                    continue
+
+                fired_channel = int(sampled_channel)
+                jump_changed_species = network.get_channel_changed_species(fired_channel)
+                network.apply_channel_update(state, fired_channel)
+                self._validate_or_clip_state(state)
+                changed_species = self._merge_species_ids(changed_species, jump_changed_species)
+                applied_event_ids.append(fired_channel)
+                event_times.append(float(state.t))
+
+                self._refresh_propensities_after_state_change(
+                    network,
+                    state,
+                    store,
+                    changed_species,
+                    rng,
+                    reason="gillespie discrete event changed state",
+                    fired_channel=fired_channel,
+                )
+
+                force_adaptation = self._channel_is_rq(store, fired_channel)
+                if force_adaptation:
+                    rq_event_count += 1
+
+                if (
+                    force_adaptation
+                    or (self.config.adaptive and self.config.repartition_on_event)
+                    or (
+                        self.config.adaptive
+                        and self.config.repartition_on_bounds
+                        and not self._require_partition(store).is_within_bounds(state.x)
+                    )
+                ):
+                    propensities = self._get_propensities(network, state, store, reason="gillespie adaptation")
+                    partition = self._compute_partition(network, state, propensities, context)
+                    self._install_partition(
+                        store,
+                        partition,
+                        rng,
+                        current_time=float(state.t),
+                        propensities=propensities,
+                        reset_all=True,
+                    )
+                    repartitions += 1
+                    stop_after_event_or_adaptation = True
+                    break
+
+            if stop_after_event_or_adaptation:
+                break
+
+            if (
+                self.config.adaptive
+                and self.config.repartition_on_bounds
+                and not self._require_partition(store).is_within_bounds(state.x)
+            ):
+                propensities = self._get_propensities(network, state, store, reason="bounds repartition")
+                partition = self._compute_partition(network, state, propensities, context)
+                self._install_partition(
+                    store,
+                    partition,
+                    rng,
+                    current_time=float(state.t),
+                    propensities=propensities,
+                    reset_all=True,
+                )
+                repartitions += 1
+                break
+
+        state.step_count += 1
+        state.event_count += len(applied_event_ids)
+        details = self._details(
+            store,
+            total_discrete_propensity=last_total_discrete_propensity,
+            total_continuous_propensity=last_total_continuous_propensity,
+            continuous_abs_total=continuous_abs_total,
+            repartitions=repartitions,
+        )
+        if details is not None:
+            details["discrete_hazard_mode"] = "scalar_integrated"
+            details["discrete_event_ids"] = np.asarray(applied_event_ids, dtype=np.int64)
+            details["discrete_event_times"] = np.asarray(event_times, dtype=float)
+            details["rq_event_count"] = int(rq_event_count)
+            details["disabled_discrete_event_candidates"] = int(disabled_event_candidates)
+            details["discrete_total_hazard"] = float(store.get("discrete_total_hazard", 0.0))
+            details["discrete_hazard_threshold"] = float(store.get("discrete_hazard_threshold", np.inf))
+        first_tau = None if not event_times else float(event_times[0] - start_time)
+        return StepResult(
+            advanced_time=float(state.t - start_time),
+            event_occurred=bool(applied_event_ids),
+            channel_id=None if not applied_event_ids else int(applied_event_ids[-1]),
+            propensity_sum=max(float(last_total_discrete_propensity), 0.0),
+            tau=first_tau,
+            details=details,
+        )
+
     def _pdmp_network(self, network: ReactionNetworkData | ElementaryMassActionNetwork) -> ReactionNetworkData | ElementaryMassActionNetwork:
         if not isinstance(network, (ReactionNetworkData, ElementaryMassActionNetwork)):
             raise TypeError(
@@ -1048,6 +1308,9 @@ class PDMPStepper(BaseStepper):
             store["event_heap"] = []
             store["heap_stale_pops"] = 0
             store["heap_rebuilds"] = 0
+            store["rq_mask"] = np.zeros(network.n_channels, dtype=bool)
+            store["discrete_total_hazard"] = 0.0
+            store["discrete_hazard_threshold"] = np.inf
         return store
 
     def _get_propensities(
@@ -1160,6 +1423,13 @@ class PDMPStepper(BaseStepper):
 
         store["partition"] = partition
         store["discrete_mask"] = new_mask
+        rq_mask = np.zeros_like(new_mask, dtype=bool)
+        rq_channels = np.asarray(getattr(partition, "rq_channels", np.empty(0, dtype=np.int64)), dtype=np.int64)
+        if rq_channels.size:
+            rq_mask[rq_channels] = True
+        store["rq_mask"] = rq_mask
+        if self._uses_discrete_event_gillespie():
+            self._reset_scalar_discrete_hazard(store, rng)
         if self._uses_discrete_event_heap():
             self._install_discrete_event_heap_mask(
                 store,
@@ -1366,6 +1636,20 @@ class PDMPStepper(BaseStepper):
         available = self._available_channel_mask(network, state, channels_array)
         props[~available] = 0.0
 
+    def _available_discrete_propensity_total(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        discrete_channels: np.ndarray,
+        propensities: np.ndarray,
+    ) -> float:
+        channels = np.asarray(discrete_channels, dtype=np.int64)
+        if channels.size == 0:
+            return 0.0
+        props = np.maximum(np.asarray(propensities, dtype=float)[channels], 0.0).copy()
+        self._zero_unavailable_gillespie_props(network, state, channels, props)
+        return max(float(np.sum(props)), 0.0)
+
     def _sample_gillespie_channel_at_current_state(
         self,
         network: ReactionNetworkData | ElementaryMassActionNetwork,
@@ -1554,6 +1838,45 @@ class PDMPStepper(BaseStepper):
         hazards = np.asarray(store["hazards"], dtype=float)
         thresholds[cid] = float(rng.exponential(1.0))
         hazards[cid] = 0.0
+
+    def _reset_scalar_discrete_hazard(self, store: dict[str, Any], rng: np.random.Generator) -> None:
+        """Reset Algorithm-2 scalar hazard after adaptation."""
+
+        store["discrete_total_hazard"] = 0.0
+        store["discrete_hazard_threshold"] = float(rng.exponential(1.0))
+
+    def _scalar_discrete_hazard(self, store: dict[str, Any]) -> float:
+        value = float(store.get("discrete_total_hazard", 0.0))
+        if not np.isfinite(value) or value < 0.0:
+            value = 0.0
+            store["discrete_total_hazard"] = value
+        return value
+
+    def _scalar_discrete_threshold(self, store: dict[str, Any], rng: np.random.Generator) -> float:
+        value = float(store.get("discrete_hazard_threshold", np.inf))
+        if not np.isfinite(value):
+            value = self._scalar_discrete_hazard(store) + float(rng.exponential(1.0))
+            store["discrete_hazard_threshold"] = value
+        return value
+
+    def _advance_scalar_discrete_hazard(
+        self,
+        store: dict[str, Any],
+        total_discrete_propensity: float,
+        dt: float,
+    ) -> None:
+        if dt <= 0.0:
+            return
+        increment = max(float(total_discrete_propensity), 0.0) * float(dt)
+        store["discrete_total_hazard"] = self._scalar_discrete_hazard(store) + increment
+
+    def _advance_scalar_discrete_threshold(self, store: dict[str, Any], rng: np.random.Generator) -> None:
+        store["discrete_hazard_threshold"] = self._scalar_discrete_threshold(store, rng) + float(rng.exponential(1.0))
+
+    def _channel_is_rq(self, store: dict[str, Any], channel_id: int) -> bool:
+        mask = store.get("rq_mask")
+        cid = int(channel_id)
+        return bool(isinstance(mask, np.ndarray) and 0 <= cid < mask.size and bool(mask[cid]))
 
     def _refresh_propensities_after_state_change(
         self,
@@ -1810,6 +2133,7 @@ class PDMPStepper(BaseStepper):
             ("discrete_channels", partition.discrete_channels, network.n_channels),
             ("continuous_species", partition.continuous_species, network.n_species),
             ("discrete_species", partition.discrete_species, network.n_species),
+            ("rq_channels", partition.rq_channels, network.n_channels),
         ):
             arr = np.asarray(values, dtype=np.int64)
             if np.any(arr < 0) or np.any(arr >= int(size)):
@@ -1868,6 +2192,7 @@ class PDMPStepper(BaseStepper):
             "n_discrete_channels": int(partition.discrete_channels.size),
             "n_continuous_species": int(partition.continuous_species.size),
             "n_discrete_species": int(partition.discrete_species.size),
+            "n_rq_channels": int(partition.rq_channels.size),
             "fast_subnetwork_count": int(len(partition.fast_subnetworks)),
             "n_repartitions": int(repartitions),
             "total_jump_propensity": max(float(total_discrete_propensity), 0.0),

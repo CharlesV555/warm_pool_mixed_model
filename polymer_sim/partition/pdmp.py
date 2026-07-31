@@ -34,6 +34,7 @@ class PDMPPartitionResult:
     zeta: np.ndarray
     lower_bounds: np.ndarray
     upper_bounds: np.ndarray
+    rq_channels: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
     fast_subnetworks: list["FastSubnetwork"] = field(default_factory=list)
     metadata: dict[str, object] = field(default_factory=dict)
 
@@ -97,6 +98,7 @@ class FixedPDMPPartitionStrategy(PDMPPartitionStrategy):
         zeta = beta + network.nu_minus @ alpha
         lower = np.full(network.n_species, -np.inf, dtype=float)
         upper = np.full(network.n_species, np.inf, dtype=float)
+        rq_channels = _rq_channels(network, discrete_channels, continuous_species)
         return PDMPPartitionResult(
             continuous_channels=continuous_channels,
             discrete_channels=discrete_channels,
@@ -107,6 +109,7 @@ class FixedPDMPPartitionStrategy(PDMPPartitionStrategy):
             zeta=zeta,
             lower_bounds=lower,
             upper_bounds=upper,
+            rq_channels=rq_channels,
             metadata={"method": "fixed"},
         )
 
@@ -203,7 +206,7 @@ class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
         #   SC -> continuous_species
         #   SD -> discrete_species
         #   bounds -> lower_bounds / upper_bounds
-        #   RQ -> not explicitly represented yet
+        #   RQ -> rq_channels
         x = np.maximum(np.asarray(state.x, dtype=float), 0.0)
 
         # Algorithm 3 scale estimation.
@@ -243,6 +246,7 @@ class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
         discrete_channels = np.flatnonzero(~continuous_channel_mask).astype(np.int64, copy=False)
         continuous_species = np.flatnonzero(continuous_species_mask).astype(np.int64, copy=False)
         discrete_species = np.flatnonzero(~continuous_species_mask).astype(np.int64, copy=False)
+        rq_channels = _rq_channels(network, discrete_channels, continuous_species)
 
         # Algorithm 2 scale-validity bounds checked by
         # PDMPStepper.step(...).  When violated, the stepper calls this
@@ -258,6 +262,7 @@ class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
             zeta=zeta,
             lower_bounds=lower,
             upper_bounds=upper,
+            rq_channels=rq_channels,
             fast_subnetworks=fast_subnetworks,
             metadata={
                 "method": "scaling_lp",
@@ -269,6 +274,7 @@ class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
                 "reaction_exponent_threshold": float(self.config.reaction_exponent_threshold),
                 "bound_factor": float(self.config.bound_factor),
                 "fast_subnetwork_count": int(len(fast_subnetworks)),
+                "rq_channel_count": int(rq_channels.size),
                 **lp_metadata,
             },
         )
@@ -378,6 +384,7 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
         discrete_channels = np.flatnonzero(~continuous_channel_mask).astype(np.int64, copy=False)
         continuous_species = np.flatnonzero(continuous_species_mask).astype(np.int64, copy=False)
         discrete_species = np.flatnonzero(~continuous_species_mask).astype(np.int64, copy=False)
+        rq_channels = _rq_channels(network, discrete_channels, continuous_species)
 
         lower, upper = _bounds_from_algorithm3(alpha, continuous_species_mask, self.config.N0, mu, eta)
         catalytic_terms = [
@@ -408,6 +415,7 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
             zeta=zeta,
             lower_bounds=lower,
             upper_bounds=upper,
+            rq_channels=rq_channels,
             fast_subnetworks=fast_subnetworks,
             metadata={
                 "method": "linear_catalysis_scaling_lp",
@@ -419,6 +427,7 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
                 "reaction_exponent_threshold": float(self.config.reaction_exponent_threshold),
                 "bound_factor": float(self.config.bound_factor),
                 "fast_subnetwork_count": int(len(fast_subnetworks)),
+                "rq_channel_count": int(rq_channels.size),
                 "catalysis_mode": str(catalysis_mode),
                 "saturation_alpha": None if saturation_alpha is None else float(saturation_alpha),
                 "saturation_alpha_exponent": saturation_alpha_exponent,
@@ -1260,6 +1269,27 @@ def _bounds_from_algorithm3(
         lower[continuous] = np.power(float(N0), alpha_values[continuous] - float(eta))
         upper[continuous] = np.power(float(N0), alpha_values[continuous] + float(eta))
     return lower, upper
+
+
+def _rq_channels(
+    network: PDMPNetwork,
+    discrete_channels: np.ndarray,
+    continuous_species: np.ndarray,
+) -> np.ndarray:
+    """Return Algorithm-2 RQ channels.
+
+    RQ is the subset of currently discrete reactions whose stoichiometric jump
+    changes at least one currently continuous species.  Firing such a reaction
+    invalidates the current ODE segment, so the stepper accepts the jump at the
+    event time and immediately reruns adaptation.
+    """
+
+    channels = np.asarray(discrete_channels, dtype=np.int64)
+    species = np.asarray(continuous_species, dtype=np.int64)
+    if channels.size == 0 or species.size == 0:
+        return np.empty(0, dtype=np.int64)
+    changed = np.asarray(network.nu[channels], dtype=float)[:, species] != 0.0
+    return channels[np.any(changed, axis=1)].astype(np.int64, copy=False)
 
 
 def _channel_structural_species(

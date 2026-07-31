@@ -100,7 +100,7 @@ class RunSettings:
     pdmp_delta: float = 0.9
     pdmp_repartition_on_event: bool = False
     pdmp_repartition_on_bounds: bool = True
-    pdmp_enable_fast_subnetworks: bool = False
+    pdmp_enable_fast_subnetworks: bool = True
     pdmp_fast_subnetwork_threshold: float = 1.0
     pdmp_fast_subnetwork_max_size: int = 3
     pdmp_use_local_propensity_updates: bool = True
