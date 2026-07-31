@@ -10,6 +10,12 @@ import numpy as np
 
 from polymer_sim.core.elementary import ElementaryMassActionNetwork
 from polymer_sim.core.enums import ChannelBlock
+from polymer_sim.core.kernels import (
+    NUMBA_AVAILABLE,
+    collect_affected_channels_numba,
+    rebuild_elementary_gillespie_cache_numba,
+    refresh_elementary_gillespie_cache_numba,
+)
 from polymer_sim.core.network import ReactionNetworkData
 from polymer_sim.core.state import SystemState
 from polymer_sim.partition.pdmp import (
@@ -122,6 +128,7 @@ class PDMPConfig:
     use_local_propensity_updates: bool = True
     local_propensity_full_recompute_fraction: float = 0.5
     heap_rebuild_factor: float = 4.0
+    kernel_backend: str = "auto"
 
     def __post_init__(self) -> None:
         self.ode_step = float(self.ode_step)
@@ -141,6 +148,7 @@ class PDMPConfig:
         self.use_local_propensity_updates = bool(self.use_local_propensity_updates)
         self.local_propensity_full_recompute_fraction = float(self.local_propensity_full_recompute_fraction)
         self.heap_rebuild_factor = float(self.heap_rebuild_factor)
+        self.kernel_backend = str(self.kernel_backend).lower()
         if self.ode_step <= 0.0:
             raise ValueError("ode_step must be > 0")
         if self.hazard_tol < 0.0:
@@ -149,6 +157,10 @@ class PDMPConfig:
             raise ValueError("local_propensity_full_recompute_fraction must be in [0, 1]")
         if self.heap_rebuild_factor < 1.0:
             raise ValueError("heap_rebuild_factor must be >= 1")
+        if self.kernel_backend not in {"auto", "python", "numba"}:
+            raise ValueError("kernel_backend must be 'auto', 'python', or 'numba'")
+        if self.kernel_backend == "numba" and not NUMBA_AVAILABLE:
+            raise ValueError("kernel_backend='numba' requires the numba package")
 
 
 @dataclass(slots=True)
@@ -1372,6 +1384,10 @@ class PDMPStepper(BaseStepper):
             store["affected_channel_scratch"] = np.empty(network.n_channels, dtype=np.int64)
             store["propensity_subset_scratch"] = np.empty(network.n_channels, dtype=float)
             store["available_subset_scratch"] = np.empty(network.n_channels, dtype=bool)
+            store["numba_kernel_used"] = False
+            store["numba_local_refreshes"] = 0
+            store["numba_cache_rebuilds"] = 0
+            store["numba_affected_collects"] = 0
         return store
 
     def _get_propensities(
@@ -1452,6 +1468,36 @@ class PDMPStepper(BaseStepper):
                 values = np.full(int(size), fill_value, dtype=dtype)
             store[name] = values
         return values
+
+    def _numba_backend_enabled(self) -> bool:
+        backend = str(getattr(self.config, "kernel_backend", "auto")).lower()
+        if backend == "python":
+            return False
+        if backend == "numba":
+            return True
+        return bool(NUMBA_AVAILABLE)
+
+    def _has_dependency_csr(self, network: ReactionNetworkData | ElementaryMassActionNetwork) -> bool:
+        indptr = getattr(network, "species_to_channels_indptr", None)
+        indices = getattr(network, "species_to_channels_indices", None)
+        return (
+            isinstance(indptr, np.ndarray)
+            and isinstance(indices, np.ndarray)
+            and indptr.shape == (network.n_species + 1,)
+            and indices.ndim == 1
+        )
+
+    def _elementary_numba_kernel_supported(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+    ) -> bool:
+        return (
+            self._numba_backend_enabled()
+            and isinstance(network, ElementaryMassActionNetwork)
+            and self._has_dependency_csr(network)
+            and self._has_precomputed_reactant_terms(network)
+            and isinstance(getattr(network, "rate_constants", None), np.ndarray)
+        )
 
     def _compute_partition(
         self,
@@ -1822,6 +1868,16 @@ class PDMPStepper(BaseStepper):
             store["gillespie_discrete_total"] = 0.0
             store["gillespie_cache_valid"] = True
             return
+        if self._try_numba_elementary_gillespie_cache_rebuild(
+            network,
+            state,
+            store,
+            propensities,
+            discrete_mask,
+            available_props,
+            available_mask,
+        ):
+            return
         channels = np.flatnonzero(discrete_mask).astype(np.int64, copy=False)
         if channels.size == 0:
             store["gillespie_discrete_total"] = 0.0
@@ -1865,6 +1921,39 @@ class PDMPStepper(BaseStepper):
             return
         self._invalidate_gillespie_discrete_cache(store)
         self._ensure_gillespie_discrete_cache(network, state, store, propensities)
+
+    def _try_numba_elementary_gillespie_cache_rebuild(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        store: dict[str, Any],
+        propensities: np.ndarray,
+        discrete_mask: np.ndarray,
+        available_props: np.ndarray,
+        available_mask: np.ndarray,
+    ) -> bool:
+        if not self._elementary_numba_kernel_supported(network):
+            return False
+        total, bad_count = rebuild_elementary_gillespie_cache_numba(
+            np.asarray(state.x, dtype=float),
+            np.asarray(network.rate_constants, dtype=float),
+            np.asarray(network.reaction_order, dtype=np.int8),
+            np.asarray(network.reactant1, dtype=np.int64),
+            np.asarray(network.reactant2, dtype=np.int64),
+            np.asarray(network.homo_second_order, dtype=bool),
+            np.asarray(discrete_mask, dtype=bool),
+            np.asarray(propensities, dtype=float),
+            available_props,
+            available_mask,
+            float(self.config.hazard_tol),
+        )
+        if int(bad_count) > 0:
+            raise ValueError("PDMP numba Gillespie cache rebuild produced NaN or inf propensities")
+        store["gillespie_discrete_total"] = max(float(total), 0.0)
+        store["gillespie_cache_valid"] = True
+        store["numba_kernel_used"] = True
+        store["numba_cache_rebuilds"] = int(store.get("numba_cache_rebuilds", 0)) + 1
+        return True
 
     def _update_gillespie_discrete_cache_for_channels(
         self,
@@ -1937,6 +2026,66 @@ class PDMPStepper(BaseStepper):
         available_mask[cids] = scratch_props > self.config.hazard_tol
         total += float(np.sum(scratch_props))
         store["gillespie_discrete_total"] = max(float(total), 0.0)
+
+    def _try_numba_elementary_gillespie_local_refresh(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        store: dict[str, Any],
+        affected_channels: np.ndarray,
+        cached_propensities: np.ndarray,
+    ) -> bool:
+        """Run the compiled elementary local refresh when it is safe to do so."""
+
+        if (
+            not self._uses_discrete_event_gillespie()
+            or not bool(store.get("gillespie_cache_valid", False))
+            or not self._elementary_numba_kernel_supported(network)
+        ):
+            return False
+        affected = np.asarray(affected_channels, dtype=np.int64)
+        if affected.size == 0:
+            return True
+        discrete_mask = np.asarray(store.get("discrete_mask"), dtype=bool)
+        if discrete_mask.shape != (network.n_channels,):
+            self._invalidate_gillespie_discrete_cache(store)
+            return False
+        available_props = self._ensure_runtime_array(
+            store,
+            "gillespie_available_propensities",
+            size=network.n_channels,
+            dtype=float,
+            fill_value=0.0,
+        )
+        available_mask = self._ensure_runtime_array(
+            store,
+            "gillespie_available_mask",
+            size=network.n_channels,
+            dtype=bool,
+            fill_value=False,
+        )
+        total, bad_count = refresh_elementary_gillespie_cache_numba(
+            affected,
+            np.asarray(state.x, dtype=float),
+            np.asarray(network.rate_constants, dtype=float),
+            np.asarray(network.reaction_order, dtype=np.int8),
+            np.asarray(network.reactant1, dtype=np.int64),
+            np.asarray(network.reactant2, dtype=np.int64),
+            np.asarray(network.homo_second_order, dtype=bool),
+            discrete_mask,
+            cached_propensities,
+            available_props,
+            available_mask,
+            float(store.get("gillespie_discrete_total", 0.0)),
+            float(self.config.hazard_tol),
+        )
+        if int(bad_count) > 0:
+            raise ValueError("PDMP numba local propensity refresh produced NaN or inf propensities")
+        store["gillespie_discrete_total"] = max(float(total), 0.0)
+        store["gillespie_cache_valid"] = True
+        store["numba_kernel_used"] = True
+        store["numba_local_refreshes"] = int(store.get("numba_local_refreshes", 0)) + 1
+        return True
 
     def _channel_has_available_reactants(
         self,
@@ -2207,6 +2356,23 @@ class PDMPStepper(BaseStepper):
             size=network.n_channels,
             dtype=np.int64,
         )
+        if self._numba_backend_enabled() and self._has_dependency_csr(network):
+            count = int(
+                collect_affected_channels_numba(
+                    species,
+                    -1 if fired_channel is None else int(fired_channel),
+                    np.asarray(network.species_to_channels_indptr, dtype=np.int64),
+                    np.asarray(network.species_to_channels_indices, dtype=np.int64),
+                    marker,
+                    scratch,
+                    int(network.n_species),
+                    int(network.n_channels),
+                )
+            )
+            store["numba_kernel_used"] = True
+            store["numba_affected_collects"] = int(store.get("numba_affected_collects", 0)) + 1
+            return scratch[:count]
+
         count = 0
         for sid_value in species:
             channels = np.asarray(species_to_channels[int(sid_value)], dtype=np.int64)
@@ -2311,6 +2477,9 @@ class PDMPStepper(BaseStepper):
             new_propensities = cached[affected]
             update_mode = "full"
             self._rebuild_gillespie_discrete_cache_after_full_compute(network, state, store, cached)
+        elif self._try_numba_elementary_gillespie_local_refresh(network, state, store, affected, cached):
+            new_propensities = cached[affected]
+            update_mode = "local_numba"
         else:
             subset_scratch = self._ensure_runtime_array(
                 store,
@@ -2579,6 +2748,12 @@ class PDMPStepper(BaseStepper):
             "heap_batch_heapifies": int(store.get("heap_batch_heapifies", 0)) if self._uses_discrete_event_heap() else 0,
             "gillespie_cache_valid": bool(store.get("gillespie_cache_valid", False)) if self._uses_discrete_event_gillespie() else False,
             "gillespie_cached_total": float(store.get("gillespie_discrete_total", 0.0)) if self._uses_discrete_event_gillespie() else 0.0,
+            "kernel_backend": str(getattr(self.config, "kernel_backend", "auto")),
+            "numba_available": bool(NUMBA_AVAILABLE),
+            "numba_kernel_used": bool(store.get("numba_kernel_used", False)),
+            "numba_local_refreshes": int(store.get("numba_local_refreshes", 0)),
+            "numba_cache_rebuilds": int(store.get("numba_cache_rebuilds", 0)),
+            "numba_affected_collects": int(store.get("numba_affected_collects", 0)),
             "partition_metadata": metadata,
         }
 

@@ -874,6 +874,7 @@ def make_strict_2018_pdmp_stepper(
             use_local_propensity_updates=bool(settings.pdmp_use_local_propensity_updates),
             local_propensity_full_recompute_fraction=float(settings.pdmp_local_propensity_full_recompute_fraction),
             heap_rebuild_factor=float(settings.pdmp_heap_rebuild_factor),
+            kernel_backend="numba",
         ),
     )
 

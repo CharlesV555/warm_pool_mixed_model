@@ -82,6 +82,8 @@ class ReactionNetworkData:
     channel_to_catalysts: list[np.ndarray]
     channel_has_catalysts: np.ndarray
     dependency_indices_dirty: bool
+    species_to_channels_indptr: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
+    species_to_channels_indices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
     channel_to_catalyst_strengths: list[np.ndarray] = field(default_factory=list, init=False, repr=False)
     _nu_minus_cache: np.ndarray | None = field(default=None, init=False, repr=False)
     _nu_plus_cache: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -837,8 +839,30 @@ class ReactionNetworkData:
         self.species_to_channels = [np.asarray(sorted(channels), dtype=np.int64) for channels in reverse]
         for channels in self.species_to_channels:
             channels.setflags(write=False)
+        self._rebuild_species_to_channels_csr()
         self._rebuild_catalysis_runtime_caches(channel_has_catalysts)
         self.dependency_indices_dirty = False
+
+    def _rebuild_species_to_channels_csr(self) -> None:
+        """Build a CSR dependency view for compiled local-update kernels."""
+
+        indptr = np.zeros(self.n_species + 1, dtype=np.int64)
+        total = 0
+        for sid, channels in enumerate(self.species_to_channels):
+            total += int(np.asarray(channels, dtype=np.int64).size)
+            indptr[sid + 1] = total
+        indices = np.empty(total, dtype=np.int64)
+        offset = 0
+        for channels in self.species_to_channels:
+            arr = np.asarray(channels, dtype=np.int64)
+            end = offset + int(arr.size)
+            if arr.size:
+                indices[offset:end] = arr
+            offset = end
+        indptr.setflags(write=False)
+        indices.setflags(write=False)
+        self.species_to_channels_indptr = indptr
+        self.species_to_channels_indices = indices
 
     def _rebuild_catalysis_runtime_caches(self, channel_has_catalysts: np.ndarray) -> None:
         """Build per-block sparse catalyst indices from the dense assignment blocks.

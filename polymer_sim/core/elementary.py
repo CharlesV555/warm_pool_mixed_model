@@ -86,6 +86,8 @@ class ElementaryMassActionNetwork:
     dependency_indices_dirty: bool = False
     channel_to_species: list[np.ndarray] = field(default_factory=list)
     species_to_channels: list[np.ndarray] = field(default_factory=list)
+    species_to_channels_indptr: np.ndarray = field(init=False, repr=False)
+    species_to_channels_indices: np.ndarray = field(init=False, repr=False)
     reaction_order: np.ndarray = field(init=False, repr=False)
     reactant1: np.ndarray = field(init=False, repr=False)
     reactant2: np.ndarray = field(init=False, repr=False)
@@ -264,7 +266,29 @@ class ElementaryMassActionNetwork:
                 reverse[int(sid)].add(int(channel_id))
         self.channel_to_species = channel_to_species
         self.species_to_channels = [np.asarray(sorted(values), dtype=np.int64) for values in reverse]
+        self._rebuild_species_to_channels_csr()
         self.dependency_indices_dirty = False
+
+    def _rebuild_species_to_channels_csr(self) -> None:
+        """Build a CSR view of ``species_to_channels`` for compiled kernels."""
+
+        indptr = np.zeros(self.n_species + 1, dtype=np.int64)
+        total = 0
+        for sid, channels in enumerate(self.species_to_channels):
+            total += int(np.asarray(channels, dtype=np.int64).size)
+            indptr[sid + 1] = total
+        indices = np.empty(total, dtype=np.int64)
+        offset = 0
+        for channels in self.species_to_channels:
+            arr = np.asarray(channels, dtype=np.int64)
+            end = offset + int(arr.size)
+            if arr.size:
+                indices[offset:end] = arr
+            offset = end
+        indptr.setflags(write=False)
+        indices.setflags(write=False)
+        self.species_to_channels_indptr = indptr
+        self.species_to_channels_indices = indices
 
     def _check_channel(self, channel_id: int) -> None:
         cid = int(channel_id)

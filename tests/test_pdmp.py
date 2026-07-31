@@ -29,6 +29,7 @@ from polymer_sim import (
     build_reaction_rule_tables,
     generate_fixed_species_space,
 )
+from polymer_sim.core.kernels import NUMBA_AVAILABLE
 
 
 def make_polymer_network(**kwargs):
@@ -779,6 +780,133 @@ def test_pdmp_gillespie_discrete_propensity_cache_updates_locally():
         propensities,
     )
     assert store["gillespie_cache_valid"]
+    assert cached_total == pytest.approx(direct_total)
+
+
+def test_elementary_dependency_csr_matches_species_to_channels():
+    network = ElementaryMassActionNetwork(
+        species_names=["A", "B", "AB"],
+        name_to_idx={"A": 0, "B": 1, "AB": 2},
+        x0=np.asarray([2.0, 1.0, 0.0], dtype=float),
+        nu_minus=np.asarray(
+            [
+                [1.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        nu_plus=np.asarray(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        rate_constants=np.asarray([2.0, 0.5, 0.1], dtype=float),
+    )
+
+    for sid, expected in enumerate(network.species_to_channels):
+        start = int(network.species_to_channels_indptr[sid])
+        end = int(network.species_to_channels_indptr[sid + 1])
+        assert network.species_to_channels_indices[start:end].tolist() == expected.tolist()
+
+
+@pytest.mark.skipif(not NUMBA_AVAILABLE, reason="numba is not installed")
+def test_pdmp_gillespie_numba_backend_refreshes_elementary_cache_locally():
+    network = ElementaryMassActionNetwork(
+        species_names=["A", "B", "AB"],
+        name_to_idx={"A": 0, "B": 1, "AB": 2},
+        x0=np.asarray([1.0, 1.0, 0.0], dtype=float),
+        nu_minus=np.asarray(
+            [
+                [1.0, 1.0, 0.0],  # A + B -> AB
+                [1.0, 0.0, 0.0],  # A -> B
+                [0.0, 0.0, 0.0],  # inflow-like zero-order test channel
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        nu_plus=np.asarray(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        rate_constants=np.asarray([2.0, 0.5, 0.1, 0.2], dtype=float),
+    )
+    state = SystemState.from_x0(network.x0)
+    stepper = PDMPStepper(
+        partition_strategy=FixedPDMPPartitionStrategy(),
+        config=PDMPConfig(
+            discrete_event_method="gillespie",
+            adaptive=False,
+            local_propensity_full_recompute_fraction=1.0,
+            kernel_backend="numba",
+        ),
+    )
+    rng = np.random.default_rng(123)
+    context = StepperContext(network=network, rng=rng)
+    store = stepper._ensure_runtime_store(state, network)
+    propensities = stepper._get_propensities(network, state, store, reason="test")
+    partition = stepper._compute_partition(network, state, propensities, context)
+    stepper._install_partition(
+        store,
+        partition,
+        rng,
+        current_time=float(state.t),
+        propensities=propensities,
+        reset_all=True,
+    )
+
+    cached_total = stepper._available_discrete_propensity_total(
+        network,
+        state,
+        partition.discrete_channels,
+        propensities,
+        store=store,
+    )
+    direct_total = stepper._available_discrete_propensity_total(
+        network,
+        state,
+        partition.discrete_channels,
+        propensities,
+    )
+    assert cached_total == pytest.approx(direct_total)
+    assert store["numba_cache_rebuilds"] >= 1
+
+    changed_species = network.get_channel_changed_species(0)
+    network.apply_channel_update(state, 0)
+    stepper._refresh_propensities_after_state_change(
+        network,
+        state,
+        store,
+        changed_species,
+        rng,
+        reason="test numba local jump",
+        fired_channel=0,
+    )
+
+    propensities = store["propensities"]
+    cached_total = stepper._available_discrete_propensity_total(
+        network,
+        state,
+        partition.discrete_channels,
+        propensities,
+        store=store,
+    )
+    direct_total = stepper._available_discrete_propensity_total(
+        network,
+        state,
+        partition.discrete_channels,
+        propensities,
+    )
+    assert store["propensity_update_mode"] == "local_numba"
+    assert store["numba_local_refreshes"] >= 1
     assert cached_total == pytest.approx(direct_total)
 
 
