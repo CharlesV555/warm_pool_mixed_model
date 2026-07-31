@@ -29,8 +29,11 @@ from polymer_sim import (  # noqa: E402
     BlendedHybridConfig,
     BlendedHybridStepper,
     ChannelBlock,
+    ElementaryExpansionConfig,
     ElementaryMassActionNetwork,
     ExperimentRunner,
+    FiniteMarkovConfig,
+    FiniteMarkovScalingPDMPPartitionStrategy,
     LinearCatalysisScalingPDMPPartitionStrategy,
     NRMBlendedHybridStepper,
     OptimizedNRMStepper,
@@ -39,12 +42,15 @@ from polymer_sim import (  # noqa: E402
     ReactionNetworkData,
     ScalingPDMPConfig,
     SSAStepper,
+    build_elementary_mass_action_network,
     build_reaction_rule_tables,
     clear_all_catalysis,
     generate_fixed_species_space,
     set_catalytic_strengths_for_channels,
 )
 
+
+STRICT_2018_PDMP_METHOD = "strict_2018_pdmp"
 
 METHOD_ORDER = (
     "gillespie_ssa",
@@ -53,6 +59,7 @@ METHOD_ORDER = (
     "nrm_cle_hybrid",
     "gillespie_pdmp_lp",
     "nrm_pdmp_lp",
+    STRICT_2018_PDMP_METHOD,
 )
 
 
@@ -106,6 +113,8 @@ class RunSettings:
     pdmp_use_local_propensity_updates: bool = True
     pdmp_local_propensity_full_recompute_fraction: float = 0.5
     pdmp_heap_rebuild_factor: float = 4.0
+    pdmp_finite_markov_max_states: int = 4096
+    pdmp_finite_markov_max_total_internal_count: int = 10_000
 
 
 NETWORK_SPECS: dict[str, NetworkSpec] = {
@@ -178,6 +187,14 @@ DEFAULT_NETWORKS = (
 )
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "outputs"
 DEFAULT_SETTINGS = RunSettings()
+STRICT_2018_PDMP_SKIP_NETWORKS = (
+    # In DEFAULT_NETWORKS these are the 4th and 5th entries.  The strict 2018
+    # path expands polymer catalysis to an elementary SRN and then performs
+    # finite-CTMC fast-subnetwork checks, so these benchmarks are intentionally
+    # skipped unless this constant is edited.
+    DEFAULT_NETWORKS[3],
+    DEFAULT_NETWORKS[4],
+)
 
 
 def build_network(network_name: str) -> tuple[ReactionNetworkData | ElementaryMassActionNetwork, dict[str, Any], NetworkSpec]:
@@ -201,6 +218,58 @@ def build_network(network_name: str) -> tuple[ReactionNetworkData | ElementaryMa
     if spec.kind != "polymer_cross":
         raise ValueError(f"unknown network kind {spec.kind!r}")
     return (*build_polymer_cross_catalysis_network(spec), spec)
+
+
+def prepare_network_for_method(
+    method: str,
+    network: ReactionNetworkData | ElementaryMassActionNetwork,
+    catalysis_result: dict[str, Any],
+) -> tuple[ReactionNetworkData | ElementaryMassActionNetwork, dict[str, Any]]:
+    method_key = normalize_method(method)
+    if method_key != STRICT_2018_PDMP_METHOD:
+        return network, catalysis_result
+    if isinstance(network, ElementaryMassActionNetwork):
+        metadata = dict(catalysis_result)
+        metadata["strict_2018_srn"] = {
+            "source": "already_elementary_mass_action",
+            "standard_zero_order_inflow": True,
+            "expanded_catalysis": False,
+        }
+        return network, metadata
+
+    elementary_config = ElementaryExpansionConfig(
+        standard_zero_order_inflow=True,
+        include_uncatalyzed_channels=True,
+        expand_catalysis=True,
+        # Keep the strict SRN elementary: catalysis is represented by
+        # catalyst+substrate <-> complex and complex turnover channels.
+        # Existing catalytic strength gamma enters the turnover rate as
+        # base_rate * gamma unless the config is changed here.
+        catalyst_binding_rate=1.0,
+        catalyst_unbinding_rate=1.0,
+        catalytic_turnover_rate=None,
+        catalytic_turnover_scale=1.0,
+    )
+    elementary = build_elementary_mass_action_network(network, elementary_config)
+    metadata = {
+        "source_catalysis_assignment": json_ready(catalysis_result),
+        "strict_2018_srn": {
+            "source": "ReactionNetworkData",
+            "target": "ElementaryMassActionNetwork",
+            "standard_zero_order_inflow": True,
+            "expanded_catalysis": True,
+            "source_n_species": int(network.n_species),
+            "source_n_channels": int(network.n_channels),
+            "elementary_n_species": int(elementary.n_species),
+            "elementary_n_channels": int(elementary.n_channels),
+            "polymer_species_count": int(elementary.polymer_species_count),
+            "complex_species_count": int(max(elementary.n_species - elementary.polymer_species_count, 0)),
+            "catalyst_binding_rate": float(elementary_config.catalyst_binding_rate),
+            "catalyst_unbinding_rate": float(elementary_config.catalyst_unbinding_rate),
+            "catalytic_turnover_scale": float(elementary_config.catalytic_turnover_scale),
+        },
+    }
+    return elementary, metadata
 
 
 def build_polymer_cross_catalysis_network(spec: NetworkSpec) -> tuple[ReactionNetworkData, dict[str, Any]]:
@@ -708,6 +777,8 @@ def make_stepper(
         return make_pdmp_stepper(settings, discrete_event_method="gillespie", network=network), None
     if name == "nrm_pdmp_lp":
         return make_pdmp_stepper(settings, discrete_event_method="nrm_heap", network=network), None
+    if name == STRICT_2018_PDMP_METHOD:
+        return make_strict_2018_pdmp_stepper(settings, network), None
     raise ValueError(f"unknown method {method!r}")
 
 
@@ -763,6 +834,50 @@ def make_pdmp_stepper(
     return stepper
 
 
+def make_strict_2018_pdmp_stepper(
+    settings: RunSettings,
+    network: ReactionNetworkData | ElementaryMassActionNetwork,
+) -> PDMPStepper:
+    if not isinstance(network, ElementaryMassActionNetwork):
+        raise TypeError("strict_2018_pdmp requires an ElementaryMassActionNetwork standard SRN view")
+    partition_config = ScalingPDMPConfig(
+        N0=float(settings.pdmp_n0),
+        continuous_copy_number_scale_threshold_mu=float(settings.pdmp_mu),
+        adaptation_scale_threshold_eta=float(settings.pdmp_eta),
+        reaction_relaxation_delta=float(settings.pdmp_delta),
+        use_lp=True,
+        enable_fast_subnetworks=True,
+        fast_subnetwork_threshold=float(settings.pdmp_fast_subnetwork_threshold),
+        fast_subnetwork_max_size=int(settings.pdmp_fast_subnetwork_max_size),
+    )
+    finite_config = FiniteMarkovConfig(
+        max_states=int(settings.pdmp_finite_markov_max_states),
+        max_total_internal_count=int(settings.pdmp_finite_markov_max_total_internal_count),
+    )
+    return PDMPStepper(
+        partition_strategy=FiniteMarkovScalingPDMPPartitionStrategy(
+            partition_config,
+            finite_config,
+        ),
+        partition_method="scaling",
+        partition_config=partition_config,
+        config=PDMPConfig(
+            ode_step=float(settings.pdmp_ode_step),
+            adaptive=True,
+            # Algorithm 2 reruns adaptation on RQ events or scale-bound
+            # violations; it does not force repartition after every discrete
+            # event.
+            repartition_on_event=False,
+            repartition_on_bounds=True,
+            discrete_event_method="gillespie",
+            use_discrete_event_heap=False,
+            use_local_propensity_updates=bool(settings.pdmp_use_local_propensity_updates),
+            local_propensity_full_recompute_fraction=float(settings.pdmp_local_propensity_full_recompute_fraction),
+            heap_rebuild_factor=float(settings.pdmp_heap_rebuild_factor),
+        ),
+    )
+
+
 def normalize_method(method: str) -> str:
     aliases = {
         "ssa": "gillespie_ssa",
@@ -778,11 +893,29 @@ def normalize_method(method: str) -> str:
         "pdmp_gillespie": "gillespie_pdmp_lp",
         "nrm_pdmp_lp": "nrm_pdmp_lp",
         "pdmp_nrm": "nrm_pdmp_lp",
+        "strict_2018_pdmp": STRICT_2018_PDMP_METHOD,
+        "pdmp_2018_strict": STRICT_2018_PDMP_METHOD,
+        "strict_pdmp_2018": STRICT_2018_PDMP_METHOD,
+        "paper_2018_pdmp": STRICT_2018_PDMP_METHOD,
     }
     key = str(method).lower()
     if key not in aliases:
         raise ValueError(f"unknown method {method!r}; available methods: {list(METHOD_ORDER)}")
     return aliases[key]
+
+
+def should_skip_method_network(method: str, network_name: str) -> bool:
+    method_key = normalize_method(method)
+    return method_key == STRICT_2018_PDMP_METHOD and str(network_name) in STRICT_2018_PDMP_SKIP_NETWORKS
+
+
+def strict_2018_skip_reason(network_name: str) -> str:
+    skipped = ", ".join(STRICT_2018_PDMP_SKIP_NETWORKS)
+    return (
+        f"{STRICT_2018_PDMP_METHOD} skips compare default polymer benchmarks "
+        f"{skipped}; requested network={network_name!r}. "
+        "Edit STRICT_2018_PDMP_SKIP_NETWORKS in examples/compare/common.py to include this run."
+    )
 
 
 def run_method(
@@ -794,8 +927,18 @@ def run_method(
     write_json: bool = True,
 ) -> dict[str, Any]:
     method_key = normalize_method(method)
+    if should_skip_method_network(method_key, network_name):
+        return skipped_run_record(
+            method_key,
+            network_name,
+            settings,
+            reason=strict_2018_skip_reason(network_name),
+            output_dir=output_dir,
+            write_json=write_json,
+        )
     build_started = perf_counter()
     network, catalysis_result, spec = build_network(network_name)
+    network, catalysis_result = prepare_network_for_method(method_key, network, catalysis_result)
     build_wall_seconds = perf_counter() - build_started
     stepper, dt = make_stepper(method_key, settings, network)
 
@@ -839,6 +982,47 @@ def run_method(
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"{spec.name}_{method_key}.json"
+        path.write_text(json.dumps(record, ensure_ascii=True, indent=2), encoding="utf-8")
+        record["result_json_path"] = str(path)
+    return record
+
+
+def skipped_run_record(
+    method_key: str,
+    network_name: str,
+    settings: RunSettings,
+    *,
+    reason: str,
+    output_dir: Path | str,
+    write_json: bool,
+) -> dict[str, Any]:
+    record = {
+        "network": str(network_name),
+        "method": normalize_method(method_key),
+        "script": f"{normalize_method(method_key)}.py",
+        "seed": int(settings.seed),
+        "requested_t_end": settings.t_end,
+        "max_runtime_seconds": float(settings.max_runtime_seconds),
+        "simulation_final_time": 0.0,
+        "wall_runtime_seconds": 0.0,
+        "network_build_wall_seconds": 0.0,
+        "n_steps": 0,
+        "n_events": 0,
+        "stop_reason": "skipped",
+        "skip_reason": str(reason),
+        "stepper_name": None,
+        "n_species": 0,
+        "n_channels": 0,
+        "final_total_abundance": 0.0,
+        "max_species_count": 0.0,
+        "network_spec": asdict(network_spec(network_name)),
+        "run_settings": asdict(settings),
+        "catalysis_assignment": {},
+    }
+    if write_json:
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{network_name}_{normalize_method(method_key)}.json"
         path.write_text(json.dumps(record, ensure_ascii=True, indent=2), encoding="utf-8")
         record["result_json_path"] = str(path)
     return record
@@ -1450,6 +1634,8 @@ def _print_single_run_summary(record: dict[str, Any]) -> None:
     print(f"  stepper: {record.get('stepper_name')}")
     print(f"  seed: {record.get('seed')}")
     print(f"  stop_reason: {record.get('stop_reason')}")
+    if record.get("skip_reason"):
+        print(f"  skip_reason: {record.get('skip_reason')}")
     print(f"  simulation_final_time: {_format_float(record.get('simulation_final_time'))}")
     print(f"  wall_runtime_seconds: {_format_float(record.get('wall_runtime_seconds'))}")
     print(f"  network_build_wall_seconds: {_format_float(record.get('network_build_wall_seconds'))}")

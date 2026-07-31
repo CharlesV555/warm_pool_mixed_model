@@ -1,0 +1,91 @@
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from polymer_sim import (
+    ElementaryMassActionNetwork,
+    FiniteMarkovScalingPDMPPartitionStrategy,
+    ScalingPDMPConfig,
+    SystemState,
+)
+
+
+COMPARE_DIR = Path(__file__).resolve().parents[1] / "examples" / "compare"
+if str(COMPARE_DIR) not in sys.path:
+    sys.path.insert(0, str(COMPARE_DIR))
+
+import common  # noqa: E402
+
+
+def test_strict_2018_method_is_registered_and_skips_requested_default_polymer_networks():
+    assert common.normalize_method("pdmp_2018_strict") == "strict_2018_pdmp"
+    assert common.should_skip_method_network("strict_2018_pdmp", common.DEFAULT_NETWORKS[3])
+    assert common.should_skip_method_network("strict_2018_pdmp", common.DEFAULT_NETWORKS[4])
+
+    record = common.run_method(
+        "strict_2018_pdmp",
+        common.DEFAULT_NETWORKS[3],
+        common.RunSettings(max_runtime_seconds=0.001, max_steps=10),
+        write_json=False,
+    )
+
+    assert record["stop_reason"] == "skipped"
+    assert "skip" in record["skip_reason"].lower()
+    assert record["n_steps"] == 0
+    assert record["n_events"] == 0
+
+
+def test_strict_2018_prepares_polymer_network_as_standard_elementary_srn():
+    network, catalysis_result, _spec = common.build_network("linear_cross_len3")
+
+    elementary, metadata = common.prepare_network_for_method(
+        "strict_2018_pdmp",
+        network,
+        catalysis_result,
+    )
+
+    assert isinstance(elementary, ElementaryMassActionNetwork)
+    assert metadata["strict_2018_srn"]["target"] == "ElementaryMassActionNetwork"
+    assert metadata["strict_2018_srn"]["standard_zero_order_inflow"] is True
+    assert metadata["strict_2018_srn"]["expanded_catalysis"] is True
+    assert elementary.n_channels >= network.n_channels
+    assert np.all(elementary.reaction_order <= 2)
+
+
+def test_finite_markov_scaling_partition_accepts_averageable_fast_subnetwork():
+    network = ElementaryMassActionNetwork(
+        species_names=["A", "B", "AB"],
+        name_to_idx={"A": 0, "B": 1, "AB": 2},
+        x0=np.array([2.0, 1.0, 0.0]),
+        nu_minus=np.array(
+            [
+                [1.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        ),
+        nu_plus=np.array(
+            [
+                [0.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        rate_constants=np.array([100.0, 100.0]),
+    )
+    strategy = FiniteMarkovScalingPDMPPartitionStrategy(
+        ScalingPDMPConfig(
+            N0=10.0,
+            use_lp=False,
+            enable_fast_subnetworks=True,
+            fast_subnetwork_threshold=0.0,
+            fast_subnetwork_max_size=2,
+        )
+    )
+
+    partition = strategy.partition(network, SystemState.from_x0(network.x0))
+
+    assert partition.metadata["method"] == "strict_2018_scaling_lp_finite_markov"
+    assert partition.metadata["finite_markov_averageable_subnetwork_count"] >= 1
+    assert partition.fast_subnetworks

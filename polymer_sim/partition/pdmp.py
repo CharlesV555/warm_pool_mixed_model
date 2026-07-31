@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import combinations
 from typing import Sequence
 
@@ -986,6 +986,157 @@ class FiniteMarkovSubnetworkAnalyzer:
             closed_class_count=0,
             irreducible=False,
         )
+
+
+class FiniteMarkovScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
+    """Algorithm-3 partition plus finite-Markov Algorithm-4 fast-subnetwork checks.
+
+    ``ScalingPDMPPartitionStrategy`` can mark fast subnetworks by structural
+    timescale scoring alone.  This stricter variant keeps the Algorithm-3 LP
+    scaling step, then accepts a scored fast-subnetwork candidate only if the
+    finite internal CTMC can be enumerated and passes the configured
+    averageability checks.
+
+    The accepted subnetworks are added to the continuous reaction/species sets
+    in the returned ``PDMPPartitionResult``.  The actual PDMP stepper still owns
+    time integration and discrete hazard handling.
+    """
+
+    def __init__(
+        self,
+        config: ScalingPDMPConfig | None = None,
+        finite_config: FiniteMarkovConfig | None = None,
+    ):
+        requested_config = config or ScalingPDMPConfig(enable_fast_subnetworks=True)
+        # The base partition must not already add raw scored subnetworks.
+        # This strategy filters candidates through finite CTMC checks first.
+        super().__init__(replace(requested_config, enable_fast_subnetworks=False))
+        self.finite_fast_subnetworks_enabled = bool(requested_config.enable_fast_subnetworks)
+        self.finite_config = finite_config or FiniteMarkovConfig()
+        self.finite_analyzer = FiniteMarkovSubnetworkAnalyzer(self.finite_config)
+        self.finite_selector = FastSubnetworkSelector(
+            threshold=float(requested_config.fast_subnetwork_threshold),
+            max_size=int(requested_config.fast_subnetwork_max_size),
+        )
+
+    def partition(
+        self,
+        network: PDMPNetwork,
+        state: SystemState,
+        propensities: np.ndarray | None = None,
+    ) -> PDMPPartitionResult:
+        base = super().partition(network, state, propensities)
+        if not self.finite_fast_subnetworks_enabled:
+            metadata = dict(base.metadata)
+            metadata.update(
+                {
+                    "method": "strict_2018_scaling_lp_finite_markov",
+                    "finite_markov_fast_subnetworks_enabled": False,
+                }
+            )
+            base.metadata = metadata
+            return base
+
+        selected, finite_results, candidate_count, scored_count = self._finite_markov_selected_subnetworks(
+            network,
+            state,
+            base.zeta,
+        )
+
+        continuous_channel_mask = np.zeros(network.n_channels, dtype=bool)
+        continuous_species_mask = np.zeros(network.n_species, dtype=bool)
+        continuous_channel_mask[base.continuous_channels] = True
+        continuous_species_mask[base.continuous_species] = True
+        for subnetwork in selected:
+            continuous_channel_mask[np.asarray(subnetwork.channels, dtype=np.int64)] = True
+            continuous_species_mask[np.asarray(subnetwork.changed_species, dtype=np.int64)] = True
+
+        continuous_channels = np.flatnonzero(continuous_channel_mask).astype(np.int64, copy=False)
+        discrete_channels = np.flatnonzero(~continuous_channel_mask).astype(np.int64, copy=False)
+        continuous_species = np.flatnonzero(continuous_species_mask).astype(np.int64, copy=False)
+        discrete_species = np.flatnonzero(~continuous_species_mask).astype(np.int64, copy=False)
+        rq_channels = _rq_channels(network, discrete_channels, continuous_species)
+
+        mu = float(self.config.continuous_copy_number_scale_threshold_mu)
+        eta = float(self.config.adaptation_scale_threshold_eta)
+        lower, upper = _bounds_from_algorithm3(base.alpha, continuous_species_mask, self.config.N0, mu, eta)
+        finite_count = sum(1 for result in finite_results if result.finite)
+        averageable_results = [result for result in finite_results if result.averageable]
+        reason_counts: dict[str, int] = {}
+        for result in finite_results:
+            reason = str(result.reason)
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+
+        metadata = dict(base.metadata)
+        metadata.update(
+            {
+                "method": "strict_2018_scaling_lp_finite_markov",
+                "finite_markov_fast_subnetworks_enabled": True,
+                "finite_markov_candidate_count": int(candidate_count),
+                "finite_markov_scored_candidate_count": int(scored_count),
+                "finite_markov_checked_subnetwork_count": int(len(finite_results)),
+                "finite_markov_finite_subnetwork_count": int(finite_count),
+                "finite_markov_averageable_subnetwork_count": int(len(averageable_results)),
+                "finite_markov_averageable_reaction_count": int(
+                    _unique_reaction_count(result.channels for result in averageable_results)
+                ),
+                "finite_markov_reason_counts": reason_counts,
+                "fast_subnetwork_count": int(len(selected)),
+                "rq_channel_count": int(rq_channels.size),
+            }
+        )
+        return PDMPPartitionResult(
+            continuous_channels=continuous_channels,
+            discrete_channels=discrete_channels,
+            continuous_species=continuous_species,
+            discrete_species=discrete_species,
+            alpha=base.alpha,
+            beta=base.beta,
+            zeta=base.zeta,
+            lower_bounds=lower,
+            upper_bounds=upper,
+            rq_channels=rq_channels,
+            fast_subnetworks=selected,
+            metadata=metadata,
+        )
+
+    def _finite_markov_selected_subnetworks(
+        self,
+        network: PDMPNetwork,
+        state: SystemState,
+        zeta: np.ndarray,
+    ) -> tuple[list[FastSubnetwork], list[FiniteMarkovSubnetworkResult], int, int]:
+        cache = self.finite_selector._candidate_cache_for(network)
+        scored = [
+            self.finite_selector._score_candidate_feature(feature, zeta)
+            for feature in cache.features
+        ]
+        scored = [item for item in scored if item.delta_zeta >= self.finite_selector.threshold]
+        scored.sort(key=lambda item: (item.delta_zeta, item.channels.size), reverse=True)
+
+        selected: list[FastSubnetwork] = []
+        checked_results: list[FiniteMarkovSubnetworkResult] = []
+        used_species: set[int] = set()
+        for item in scored:
+            species = set(int(sid) for sid in np.asarray(item.changed_species, dtype=np.int64))
+            if species & used_species:
+                continue
+            result = self.finite_analyzer.analyze(network, state, item)
+            checked_results.append(result)
+            item.metadata.update(
+                {
+                    "finite_markov_finite": bool(result.finite),
+                    "finite_markov_averageable": bool(result.averageable),
+                    "finite_markov_reason": str(result.reason),
+                    "finite_markov_state_count": int(result.state_count),
+                    "finite_markov_transition_count": int(result.transition_count),
+                }
+            )
+            if not result.averageable:
+                continue
+            selected.append(item)
+            used_species.update(species)
+        return selected, checked_results, len(cache.candidates), len(scored)
 
 
 def analyze_fast_network(
