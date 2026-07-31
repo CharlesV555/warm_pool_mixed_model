@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import heapq
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,7 @@ class StepperContext:
     partition_strategy: PartitionStrategy | PDMPPartitionStrategy | None = None
     blending_strategy: BlendingStrategy | None = None
     fast_channels: np.ndarray | None = None
+    wall_deadline: float | None = None
 
 
 @dataclass(slots=True)
@@ -717,6 +719,11 @@ class PDMPStepper(BaseStepper):
     def step(self, state: SystemState, dt: float, context: StepperContext) -> StepResult:
         network = self._pdmp_network(context.network)
         duration = float(dt)
+        if not np.isfinite(duration):
+            # A wall-clock-limited run often passes t_end=inf and dt=None.
+            # PDMP must still return control to the runner frequently so the
+            # runner can enforce max_runtime_seconds and record progress.
+            duration = float(self.config.ode_step)
         if duration <= 0.0:
             return StepResult(advanced_time=0.0, event_occurred=False, details={"mode": "pdmp_no_dt"})
 
@@ -761,6 +768,7 @@ class PDMPStepper(BaseStepper):
         continuous_abs_total = np.zeros(network.n_channels, dtype=float)
         last_total_discrete_propensity = 0.0
         last_total_continuous_propensity = 0.0
+        wall_deadline_reached = False
 
         # Algorithm 2 outer loop.
         # Pseudocode:
@@ -768,6 +776,9 @@ class PDMPStepper(BaseStepper):
         # Here one PDMPStepper.step(...) call advances at most dt simulation time.
         # ExperimentRunner repeatedly calls this method until global t_end.
         while float(state.t) < end_time - self.config.hazard_tol:
+            if self._wall_deadline_reached(context):
+                wall_deadline_reached = True
+                break
             remaining = max(end_time - float(state.t), 0.0)
             if remaining <= 0.0:
                 break
@@ -934,19 +945,22 @@ class PDMPStepper(BaseStepper):
 
                 state.step_count += 1
                 state.event_count += 1
+                details = self._details(
+                    store,
+                    total_discrete_propensity=last_total_discrete_propensity,
+                    total_continuous_propensity=last_total_continuous_propensity,
+                    continuous_abs_total=continuous_abs_total,
+                    repartitions=repartitions,
+                )
+                if details is not None:
+                    details["wall_deadline_reached"] = bool(self._wall_deadline_reached(context))
                 return StepResult(
                     advanced_time=float(state.t - start_time),
                     event_occurred=True,
                     channel_id=int(fired_channel),
                     propensity_sum=last_total_discrete_propensity,
                     tau=float(state.t - start_time),
-                    details=self._details(
-                        store,
-                        total_discrete_propensity=last_total_discrete_propensity,
-                        total_continuous_propensity=last_total_continuous_propensity,
-                        continuous_abs_total=continuous_abs_total,
-                        repartitions=repartitions,
-                    ),
+                    details=details,
                 )
 
             # Algorithm 2 step 3: accept the current ODE/hazard step.
@@ -1005,17 +1019,20 @@ class PDMPStepper(BaseStepper):
                 repartitions += 1
 
         state.step_count += 1
+        details = self._details(
+            store,
+            total_discrete_propensity=last_total_discrete_propensity,
+            total_continuous_propensity=last_total_continuous_propensity,
+            continuous_abs_total=continuous_abs_total,
+            repartitions=repartitions,
+        )
+        if details is not None:
+            details["wall_deadline_reached"] = bool(wall_deadline_reached or self._wall_deadline_reached(context))
         return StepResult(
             advanced_time=float(state.t - start_time),
             event_occurred=False,
             propensity_sum=last_total_discrete_propensity,
-            details=self._details(
-                store,
-                total_discrete_propensity=last_total_discrete_propensity,
-                total_continuous_propensity=last_total_continuous_propensity,
-                continuous_abs_total=continuous_abs_total,
-                repartitions=repartitions,
-            ),
+            details=details,
         )
 
     def _step_gillespie_integrated_hazard(
@@ -1054,12 +1071,19 @@ class PDMPStepper(BaseStepper):
         disabled_event_candidates = 0
         applied_event_ids: list[int] = []
         event_times: list[float] = []
+        wall_deadline_reached = False
 
         while float(state.t) < end_time - self.config.hazard_tol:
+            if self._wall_deadline_reached(context):
+                wall_deadline_reached = True
+                break
             micro_end = min(float(state.t) + float(self.config.ode_step), end_time)
             stop_after_event_or_adaptation = False
 
             while float(state.t) < micro_end - self.config.hazard_tol:
+                if self._wall_deadline_reached(context):
+                    wall_deadline_reached = True
+                    break
                 segment_dt = max(float(micro_end) - float(state.t), 0.0)
                 if segment_dt <= 0.0:
                     break
@@ -1191,6 +1215,11 @@ class PDMPStepper(BaseStepper):
                     fired_channel=fired_channel,
                 )
 
+                if self._wall_deadline_reached(context):
+                    wall_deadline_reached = True
+                    stop_after_event_or_adaptation = True
+                    break
+
                 force_adaptation = self._channel_is_rq(store, fired_channel)
                 if force_adaptation:
                     rq_event_count += 1
@@ -1256,6 +1285,7 @@ class PDMPStepper(BaseStepper):
             details["disabled_discrete_event_candidates"] = int(disabled_event_candidates)
             details["discrete_total_hazard"] = float(store.get("discrete_total_hazard", 0.0))
             details["discrete_hazard_threshold"] = float(store.get("discrete_hazard_threshold", np.inf))
+            details["wall_deadline_reached"] = bool(wall_deadline_reached or self._wall_deadline_reached(context))
         first_tau = None if not event_times else float(event_times[0] - start_time)
         return StepResult(
             advanced_time=float(state.t - start_time),
@@ -1274,6 +1304,17 @@ class PDMPStepper(BaseStepper):
                 "or build an ElementaryMassActionNetwork first for the default paper-style scaling partition."
             )
         return network
+
+    def _wall_deadline_reached(self, context: StepperContext) -> bool:
+        """Return True when the runner's wall-clock budget has expired.
+
+        The runner normally checks max_runtime_seconds between stepper calls.
+        PDMP can process many discrete hazard crossings inside one macro step,
+        so it also observes the same absolute deadline at safe loop points.
+        """
+
+        deadline = context.wall_deadline
+        return deadline is not None and perf_counter() >= float(deadline)
 
     def _ensure_runtime_store(self, state: SystemState, network: ReactionNetworkData | ElementaryMassActionNetwork) -> dict[str, Any]:
         if not isinstance(state.partition_state, dict):

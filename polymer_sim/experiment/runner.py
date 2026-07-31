@@ -69,12 +69,14 @@ class ExperimentRunner:
         state = SystemState.from_x0(network.x0 if x0 is None else x0)
         active_recorder = recorder or SummaryRecorder()
         started_at = perf_counter()
+        wall_deadline = None if max_runtime_seconds is None else started_at + float(max_runtime_seconds)
         stop_reason = "reached_t_end"
         context = StepperContext(
             network=network,
             rng=rng,
             partition_strategy=partition_strategy,
             blending_strategy=blending_strategy,
+            wall_deadline=wall_deadline,
         )
         restriction_context = RestrictionContext(network=network, rng=rng) if restriction is not None else None
         stepper_metadata = _stepper_metadata(stepper)
@@ -95,9 +97,10 @@ class ExperimentRunner:
         timing_setup_elapsed = timing_loop_started_at - run_started_at
 
         while state.t < t_end and state.step_count < max_steps:
-            if max_runtime_seconds is not None and (perf_counter() - started_at) >= float(max_runtime_seconds):
+            if wall_deadline is not None and perf_counter() >= float(wall_deadline):
                 stop_reason = "max_runtime_seconds"
                 break
+            context.wall_deadline = wall_deadline
             remaining = float(t_end - state.t)
             step_dt = remaining if dt is None else min(float(dt), remaining)
             timing_step_start_sim_time = float(state.t)
@@ -157,6 +160,12 @@ class ExperimentRunner:
                         )
                         timing_last_sample_wall = sample_wall
                         timing_next_event_sample += int(timing_report_interval_events)
+            if (
+                (wall_deadline is not None and perf_counter() >= float(wall_deadline))
+                or (result.details is not None and bool(result.details.get("wall_deadline_reached", False)))
+            ):
+                stop_reason = "max_runtime_seconds"
+                break
             if result.advanced_time <= 0.0 and not result.event_occurred:
                 stop_reason = "no_progress"
                 break
@@ -179,7 +188,7 @@ class ExperimentRunner:
         if stop_reason == "reached_t_end":
             if state.step_count >= max_steps and state.t < t_end:
                 stop_reason = "max_steps"
-            elif state.t < t_end and max_runtime_seconds is not None and (perf_counter() - started_at) >= float(max_runtime_seconds):
+            elif state.t < t_end and wall_deadline is not None and perf_counter() >= float(wall_deadline):
                 stop_reason = "max_runtime_seconds"
 
         timing_finalize_started_at = perf_counter()

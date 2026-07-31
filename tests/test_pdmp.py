@@ -1,4 +1,5 @@
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import pytest
@@ -351,6 +352,17 @@ def make_reversible_binding_elementary_network():
     )
 
 
+def make_zero_order_inflow_elementary_network():
+    return ElementaryMassActionNetwork(
+        species_names=["S0"],
+        name_to_idx={"S0": 0},
+        x0=np.array([0.0]),
+        nu_minus=np.array([[0.0]], dtype=float),
+        nu_plus=np.array([[1.0]], dtype=float),
+        rate_constants=np.array([1.0], dtype=float),
+    )
+
+
 def test_finite_markov_analyzer_accepts_reversible_binding_subnetwork():
     network = make_reversible_binding_elementary_network()
     state = SystemState.from_x0(network.x0)
@@ -456,6 +468,68 @@ def test_pdmp_stepper_runs_through_experiment_runner():
     assert result.summary.n_steps >= 1
     assert result.summary.metadata["stepper_name"] == "PDMPStepper"
     assert result.state.x[elementary.species_idx("A")] > elementary.x0[elementary.species_idx("A")]
+
+
+def test_pdmp_infinite_dt_returns_after_one_ode_step():
+    network = make_zero_order_inflow_elementary_network()
+    state = SystemState.from_x0(network.x0)
+    stepper = PDMPStepper(
+        partition_strategy=FixedPDMPPartitionStrategy(continuous_channels=[0]),
+        config=PDMPConfig(ode_step=0.01, discrete_event_method="gillespie"),
+    )
+
+    result = stepper.step(
+        state,
+        float("inf"),
+        StepperContext(network=network, rng=np.random.default_rng(123)),
+    )
+
+    assert result.advanced_time == pytest.approx(0.01)
+    assert state.t == pytest.approx(0.01)
+    assert state.x[0] == pytest.approx(0.01)
+
+
+def test_pdmp_runner_wall_clock_only_run_stops_by_runtime():
+    network = make_zero_order_inflow_elementary_network()
+    stepper = PDMPStepper(
+        partition_strategy=FixedPDMPPartitionStrategy(continuous_channels=[0]),
+        config=PDMPConfig(ode_step=0.01, discrete_event_method="gillespie"),
+    )
+
+    result = ExperimentRunner().run_one(
+        network,
+        stepper,
+        t_end=float("inf"),
+        seed=123,
+        dt=None,
+        max_steps=1_000_000,
+        max_runtime_seconds=0.001,
+    )
+
+    assert result.summary.metadata["stop_reason"] == "max_runtime_seconds"
+    assert np.isfinite(result.summary.final_time)
+
+
+def test_pdmp_stepper_observes_expired_wall_deadline_inside_step():
+    network = make_zero_order_inflow_elementary_network()
+    state = SystemState.from_x0(network.x0)
+    stepper = PDMPStepper(
+        partition_strategy=FixedPDMPPartitionStrategy(continuous_channels=[0]),
+        config=PDMPConfig(ode_step=0.01, discrete_event_method="gillespie"),
+    )
+
+    result = stepper.step(
+        state,
+        10.0,
+        StepperContext(
+            network=network,
+            rng=np.random.default_rng(123),
+            wall_deadline=perf_counter() - 1.0,
+        ),
+    )
+
+    assert result.details["wall_deadline_reached"] is True
+    assert result.advanced_time == 0.0
 
 
 def test_pdmp_stepper_can_use_heap_discrete_event_locator():
