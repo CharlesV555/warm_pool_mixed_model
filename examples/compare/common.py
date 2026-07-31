@@ -392,7 +392,7 @@ def build_toggle_switch_network(spec: NetworkSpec) -> tuple[ElementaryMassAction
 
 def build_repressilator_network(spec: NetworkSpec) -> tuple[ElementaryMassActionNetwork, dict[str, Any]]:
     species = ("m_A", "m_B", "m_C", "p_A", "p_B", "p_C")
-    initial = {name: 0.0 for name in species}
+    initial = {"m_A":10.0, "p_A":500,"m_B":0.0, "p_B":0.0, "m_C":0.0, "p_C":0.0}
     reactions = [
         _reaction("R1", (), ("m_A",), 0.1, partition="slow"),
         _reaction("R2", (), ("m_B",), 0.1, partition="slow"),

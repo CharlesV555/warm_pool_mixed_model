@@ -344,6 +344,13 @@ class ElementaryMassActionNetwork:
         if channels.size == 0:
             return values
 
+        # 局部 propensity 更新通常只涉及少量受影响通道。此时布尔 mask、
+        # 临时数组和多次 np.any 的分配成本会超过公式本身，因此用预计算好的
+        # order/reactant 数组走一条无额外数组分配的小循环。全量计算仍保留
+        # NumPy 向量化路径。
+        if channels.size <= 128:
+            return self._compute_propensity_array_loop(channels, x, values)
+
         rates = np.maximum(self.rate_constants[channels], 0.0)
         orders = self.reaction_order[channels]
 
@@ -372,6 +379,40 @@ class ElementaryMassActionNetwork:
             values[second] = second_values
 
         np.maximum(values, 0.0, out=values)
+        return values
+
+    def _compute_propensity_array_loop(self, channels: np.ndarray, x: np.ndarray, out: np.ndarray) -> np.ndarray:
+        """Small-subset elementary propensity kernel.
+
+        该函数依赖 ``_precompute_propensity_terms`` 在建网阶段得到的
+        ``reaction_order/reactant1/reactant2/homo_second_order``，避免在 PDMP
+        局部刷新热路径里反复扫描 ``nu_minus`` 或创建多个布尔 mask。
+        """
+
+        rates = self.rate_constants
+        order = self.reaction_order
+        reactant1 = self.reactant1
+        reactant2 = self.reactant2
+        homo = self.homo_second_order
+        values = out
+        for pos, channel_id in enumerate(channels):
+            cid = int(channel_id)
+            rate = float(rates[cid])
+            if rate <= 0.0:
+                values[pos] = 0.0
+                continue
+            reaction_order = int(order[cid])
+            if reaction_order == 0:
+                values[pos] = rate
+                continue
+            count1 = max(float(x[int(reactant1[cid])]), 0.0)
+            if reaction_order == 1:
+                values[pos] = rate * count1
+                continue
+            if bool(homo[cid]):
+                values[pos] = rate * 0.5 * count1 * max(count1 - 1.0, 0.0)
+            else:
+                values[pos] = rate * count1 * max(float(x[int(reactant2[cid])]), 0.0)
         return values
 
 

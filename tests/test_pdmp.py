@@ -711,6 +711,77 @@ def test_pdmp_available_channel_mask_uses_precomputed_reactant_terms():
     assert mask.tolist() == [False, True, False]
 
 
+def test_pdmp_gillespie_discrete_propensity_cache_updates_locally():
+    network = make_polymer_network(k_poly_left=1.0, k_poly_right=0.0, k_frag_left=0.0, k_frag_right=0.0)
+    a = network.species_idx("A")
+    fired_channel = network.channel_id(ChannelBlock.LEFT_ADD, int(network.left_add_local_id[a, a]))
+    x = np.zeros(network.n_species, dtype=float)
+    x[a] = 2.0
+    state = SystemState.from_x0(x)
+    stepper = PDMPStepper(
+        partition_strategy=FixedPDMPPartitionStrategy(),
+        config=PDMPConfig(discrete_event_method="gillespie", adaptive=False),
+    )
+    rng = np.random.default_rng(123)
+    context = StepperContext(network=network, rng=rng)
+    store = stepper._ensure_runtime_store(state, network)
+    propensities = stepper._get_propensities(network, state, store, reason="test")
+    partition = stepper._compute_partition(network, state, propensities, context)
+    stepper._install_partition(
+        store,
+        partition,
+        rng,
+        current_time=float(state.t),
+        propensities=propensities,
+        reset_all=True,
+    )
+
+    cached_total = stepper._available_discrete_propensity_total(
+        network,
+        state,
+        partition.discrete_channels,
+        propensities,
+        store=store,
+    )
+    direct_total = stepper._available_discrete_propensity_total(
+        network,
+        state,
+        partition.discrete_channels,
+        propensities,
+    )
+    assert store["gillespie_cache_valid"]
+    assert cached_total == pytest.approx(direct_total)
+
+    changed_species = network.get_channel_changed_species(fired_channel)
+    network.apply_channel_update(state, fired_channel)
+    stepper._refresh_propensities_after_state_change(
+        network,
+        state,
+        store,
+        changed_species,
+        rng,
+        reason="test local jump",
+        fired_channel=fired_channel,
+    )
+
+    propensities = store["propensities"]
+    cached_total = stepper._available_discrete_propensity_total(
+        network,
+        state,
+        partition.discrete_channels,
+        propensities,
+        store=store,
+    )
+    direct_total = stepper._available_discrete_propensity_total(
+        network,
+        state,
+        partition.discrete_channels,
+        propensities,
+    )
+    assert store["gillespie_cache_valid"]
+    assert cached_total == pytest.approx(direct_total)
+
+
 def test_pdmp_stepper_can_select_linear_catalysis_partition_method_on_polymer_network():
     network = make_polymer_network(
         k_poly_left=0.0,

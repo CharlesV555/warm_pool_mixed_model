@@ -857,6 +857,8 @@ class PDMPStepper(BaseStepper):
                         state,
                         discrete_channels,
                         rng,
+                        store=store,
+                        propensities=propensities,
                     )
                     if sampled_channel is None:
                         store["gillespie_disabled_event_candidates"] = int(
@@ -1100,6 +1102,7 @@ class PDMPStepper(BaseStepper):
                     state,
                     discrete_channels,
                     propensities,
+                    store=store,
                 )
 
                 if last_total_discrete_propensity <= self.config.hazard_tol:
@@ -1181,6 +1184,7 @@ class PDMPStepper(BaseStepper):
                     state,
                     partition.discrete_channels,
                     rng,
+                    store=store,
                 )
                 last_total_discrete_propensity = float(event_total)
                 self._advance_scalar_discrete_threshold(store, rng)
@@ -1352,6 +1356,22 @@ class PDMPStepper(BaseStepper):
             store["rq_mask"] = np.zeros(network.n_channels, dtype=bool)
             store["discrete_total_hazard"] = 0.0
             store["discrete_hazard_threshold"] = np.inf
+            # Gillespie-in-PDMP 热路径缓存：
+            # - gillespie_available_propensities[c] 保存当前 RD 中、且反应物
+            #   可用的通道 propensity；其它通道为 0。
+            # - gillespie_discrete_total 是上面数组在 RD 上的和。
+            # 状态或 partition 改变后只刷新受影响通道，避免每个 hazard
+            # segment 扫描全部离散通道。
+            store["gillespie_available_mask"] = np.zeros(network.n_channels, dtype=bool)
+            store["gillespie_available_propensities"] = np.zeros(network.n_channels, dtype=float)
+            store["gillespie_discrete_total"] = 0.0
+            store["gillespie_cache_valid"] = False
+            # scratch buffers：用于局部 propensity 更新和可用性过滤。
+            # 这些数组属于当前 state/network 的运行缓存，不参与模型语义。
+            store["affected_channel_marker"] = np.zeros(network.n_channels, dtype=bool)
+            store["affected_channel_scratch"] = np.empty(network.n_channels, dtype=np.int64)
+            store["propensity_subset_scratch"] = np.empty(network.n_channels, dtype=float)
+            store["available_subset_scratch"] = np.empty(network.n_channels, dtype=bool)
         return store
 
     def _get_propensities(
@@ -1404,9 +1424,34 @@ class PDMPStepper(BaseStepper):
 
         store["propensities_valid"] = False
         store["propensities_dirty_reason"] = str(reason)
+        self._invalidate_gillespie_discrete_cache(store)
         if changed_species is not None:
             previous = np.asarray(store.get("propensities_dirty_species", np.empty(0, dtype=np.int64)), dtype=np.int64)
             store["propensities_dirty_species"] = self._merge_species_ids(previous, changed_species)
+
+    def _invalidate_gillespie_discrete_cache(self, store: dict[str, Any]) -> None:
+        """Invalidate cached RD propensity totals for the Gillespie discrete path."""
+
+        store["gillespie_cache_valid"] = False
+        store["gillespie_discrete_total"] = 0.0
+
+    def _ensure_runtime_array(
+        self,
+        store: dict[str, Any],
+        name: str,
+        *,
+        size: int,
+        dtype: type,
+        fill_value: float | int | bool | None = None,
+    ) -> np.ndarray:
+        values = store.get(name)
+        if not isinstance(values, np.ndarray) or values.shape != (int(size),) or values.dtype != np.dtype(dtype):
+            if fill_value is None:
+                values = np.empty(int(size), dtype=dtype)
+            else:
+                values = np.full(int(size), fill_value, dtype=dtype)
+            store[name] = values
+        return values
 
     def _compute_partition(
         self,
@@ -1470,6 +1515,7 @@ class PDMPStepper(BaseStepper):
             rq_mask[rq_channels] = True
         store["rq_mask"] = rq_mask
         if self._uses_discrete_event_gillespie():
+            self._invalidate_gillespie_discrete_cache(store)
             self._reset_scalar_discrete_hazard(store, rng)
         if self._uses_discrete_event_heap():
             self._install_discrete_event_heap_mask(
@@ -1683,7 +1729,13 @@ class PDMPStepper(BaseStepper):
         state: SystemState,
         discrete_channels: np.ndarray,
         propensities: np.ndarray,
+        *,
+        store: dict[str, Any] | None = None,
     ) -> float:
+        if store is not None and self._uses_discrete_event_gillespie():
+            self._ensure_gillespie_discrete_cache(network, state, store, propensities)
+            return max(float(store.get("gillespie_discrete_total", 0.0)), 0.0)
+
         channels = np.asarray(discrete_channels, dtype=np.int64)
         if channels.size == 0:
             return 0.0
@@ -1697,15 +1749,31 @@ class PDMPStepper(BaseStepper):
         state: SystemState,
         discrete_channels: np.ndarray,
         rng: np.random.Generator,
+        *,
+        store: dict[str, Any] | None = None,
+        propensities: np.ndarray | None = None,
     ) -> tuple[int | None, float]:
         channels = np.asarray(discrete_channels, dtype=np.int64)
         if channels.size == 0:
             return None, 0.0
 
-        props = network.compute_propensities_for_channels(channels, state)
-        self._clean_propensities(props)
-        self._zero_unavailable_gillespie_props(network, state, channels, props)
-        total = float(np.sum(props))
+        if store is not None:
+            cached_props = propensities
+            if cached_props is None:
+                cached_props = self._get_propensities(
+                    network,
+                    state,
+                    store,
+                    reason="gillespie channel sample",
+                )
+            self._ensure_gillespie_discrete_cache(network, state, store, cached_props)
+            props = np.asarray(store["gillespie_available_propensities"], dtype=float)[channels]
+            total = float(store.get("gillespie_discrete_total", 0.0))
+        else:
+            props = network.compute_propensities_for_channels(channels, state)
+            self._clean_propensities(props)
+            self._zero_unavailable_gillespie_props(network, state, channels, props)
+            total = float(np.sum(props))
         if total <= self.config.hazard_tol:
             return None, 0.0
         threshold = float(rng.random() * total)
@@ -1714,6 +1782,161 @@ class PDMPStepper(BaseStepper):
         if local >= channels.size:
             local = int(channels.size - 1)
         return int(channels[local]), total
+
+    def _ensure_gillespie_discrete_cache(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        store: dict[str, Any],
+        propensities: np.ndarray,
+    ) -> None:
+        """Build the cached available RD propensity vector when invalid.
+
+        P0 优化点：Algorithm-2 的离散危险度每个 segment 都需要
+        ``sum_{r in RD} lambda_r``。旧实现每次都复制 RD propensity 并检查
+        反应物是否可用；这里在缓存有效时直接返回标量总和。缓存失效发生在
+        状态改变、partition 改变或 propensity 全量失效时。
+        """
+
+        available_props = self._ensure_runtime_array(
+            store,
+            "gillespie_available_propensities",
+            size=network.n_channels,
+            dtype=float,
+            fill_value=0.0,
+        )
+        available_mask = self._ensure_runtime_array(
+            store,
+            "gillespie_available_mask",
+            size=network.n_channels,
+            dtype=bool,
+            fill_value=False,
+        )
+        if bool(store.get("gillespie_cache_valid", False)):
+            return
+
+        available_props[:] = 0.0
+        available_mask[:] = False
+        discrete_mask = np.asarray(store.get("discrete_mask"), dtype=bool)
+        if discrete_mask.shape != (network.n_channels,):
+            store["gillespie_discrete_total"] = 0.0
+            store["gillespie_cache_valid"] = True
+            return
+        channels = np.flatnonzero(discrete_mask).astype(np.int64, copy=False)
+        if channels.size == 0:
+            store["gillespie_discrete_total"] = 0.0
+            store["gillespie_cache_valid"] = True
+            return
+
+        scratch_props = self._ensure_runtime_array(
+            store,
+            "propensity_subset_scratch",
+            size=network.n_channels,
+            dtype=float,
+        )[: channels.size]
+        scratch_available = self._ensure_runtime_array(
+            store,
+            "available_subset_scratch",
+            size=network.n_channels,
+            dtype=bool,
+        )[: channels.size]
+        scratch_props[:] = np.asarray(propensities, dtype=float)[channels]
+        np.maximum(scratch_props, 0.0, out=scratch_props)
+        self._fill_available_channel_mask(network, state, channels, scratch_available)
+        scratch_props[~scratch_available] = 0.0
+
+        available_props[channels] = scratch_props
+        active = scratch_props > self.config.hazard_tol
+        if np.any(active):
+            available_mask[channels[active]] = True
+        store["gillespie_discrete_total"] = max(float(np.sum(scratch_props)), 0.0)
+        store["gillespie_cache_valid"] = True
+
+    def _rebuild_gillespie_discrete_cache_after_full_compute(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        store: dict[str, Any],
+        propensities: np.ndarray,
+    ) -> None:
+        """Rebuild Gillespie RD cache after a known-current full propensity pass."""
+
+        if not self._uses_discrete_event_gillespie():
+            return
+        self._invalidate_gillespie_discrete_cache(store)
+        self._ensure_gillespie_discrete_cache(network, state, store, propensities)
+
+    def _update_gillespie_discrete_cache_for_channels(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        store: dict[str, Any],
+        channels: np.ndarray,
+        propensities: np.ndarray,
+    ) -> None:
+        """Refresh cached Gillespie weights for changed channels only.
+
+        该函数在 ``_refresh_propensities_after_state_change`` 完成局部
+        propensity 更新后调用。若缓存尚未建立，保持 invalid，由下一次
+        hazard total 查询一次性重建。
+        """
+
+        if not self._uses_discrete_event_gillespie() or not bool(store.get("gillespie_cache_valid", False)):
+            return
+        channel_array = np.asarray(channels, dtype=np.int64)
+        if channel_array.size == 0:
+            return
+        discrete_mask = np.asarray(store.get("discrete_mask"), dtype=bool)
+        if discrete_mask.shape != (network.n_channels,):
+            self._invalidate_gillespie_discrete_cache(store)
+            return
+        valid = (channel_array >= 0) & (channel_array < network.n_channels)
+        if not np.any(valid):
+            return
+        valid_indices = np.flatnonzero(valid)
+        discrete_indices = valid_indices[discrete_mask[channel_array[valid_indices]]]
+        if discrete_indices.size == 0:
+            return
+        cids = channel_array[discrete_indices]
+
+        available_props = self._ensure_runtime_array(
+            store,
+            "gillespie_available_propensities",
+            size=network.n_channels,
+            dtype=float,
+            fill_value=0.0,
+        )
+        available_mask = self._ensure_runtime_array(
+            store,
+            "gillespie_available_mask",
+            size=network.n_channels,
+            dtype=bool,
+            fill_value=False,
+        )
+        total = max(float(store.get("gillespie_discrete_total", 0.0)), 0.0)
+        total -= float(np.sum(available_props[cids]))
+
+        scratch_props = self._ensure_runtime_array(
+            store,
+            "propensity_subset_scratch",
+            size=network.n_channels,
+            dtype=float,
+        )[: cids.size]
+        scratch_available = self._ensure_runtime_array(
+            store,
+            "available_subset_scratch",
+            size=network.n_channels,
+            dtype=bool,
+        )[: cids.size]
+        scratch_props[:] = np.asarray(propensities, dtype=float)[cids]
+        np.maximum(scratch_props, 0.0, out=scratch_props)
+        self._fill_available_channel_mask(network, state, cids, scratch_available)
+        scratch_props[~scratch_available] = 0.0
+
+        available_props[cids] = scratch_props
+        available_mask[cids] = scratch_props > self.config.hazard_tol
+        total += float(np.sum(scratch_props))
+        store["gillespie_discrete_total"] = max(float(total), 0.0)
 
     def _channel_has_available_reactants(
         self,
@@ -1742,6 +1965,20 @@ class PDMPStepper(BaseStepper):
     ) -> np.ndarray:
         ids = np.asarray(channels, dtype=np.int64)
         available = np.ones(ids.shape, dtype=bool)
+        return self._fill_available_channel_mask(network, state, ids, available)
+
+    def _fill_available_channel_mask(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        state: SystemState,
+        channels: np.ndarray,
+        out: np.ndarray,
+    ) -> np.ndarray:
+        ids = np.asarray(channels, dtype=np.int64)
+        available = out
+        if available.shape != ids.shape:
+            raise ValueError(f"out must have shape {ids.shape}")
+        available[...] = True
         if ids.size == 0:
             return available
         if not self._has_precomputed_reactant_terms(network):
@@ -1919,6 +2156,83 @@ class PDMPStepper(BaseStepper):
         cid = int(channel_id)
         return bool(isinstance(mask, np.ndarray) and 0 <= cid < mask.size and bool(mask[cid]))
 
+    def _affected_channels_for_species_fast(
+        self,
+        network: ReactionNetworkData | ElementaryMassActionNetwork,
+        store: dict[str, Any],
+        changed_species: np.ndarray,
+        *,
+        fired_channel: int | None,
+    ) -> np.ndarray:
+        """Map changed species to affected channels with reusable scratch buffers.
+
+        P1 优化点：旧路径委托给 ``affected_channels_for_species``，内部通常是
+        ``concatenate + np.unique``。事件很多时这会成为热路径。这里直接读取
+        network 的 ``species_to_channels`` 列表，用 marker 去重并把结果写入
+        scratch buffer。返回值只在当前刷新调用内有效，调用方不要长期保存。
+        """
+
+        species = np.asarray(changed_species, dtype=np.int64)
+        if species.ndim != 1:
+            raise ValueError("changed_species must be a 1D array")
+        if species.size and np.any((species < 0) | (species >= network.n_species)):
+            raise IndexError("changed_species contains out-of-range species ids")
+
+        if getattr(network, "dependency_indices_dirty", False) or len(getattr(network, "species_to_channels", [])) != network.n_species:
+            rebuild = getattr(network, "rebuild_dependency_indices", None)
+            if callable(rebuild):
+                rebuild()
+
+        species_to_channels = getattr(network, "species_to_channels", None)
+        if not isinstance(species_to_channels, list) or len(species_to_channels) != network.n_species:
+            if species.size:
+                affected = network.affected_channels_for_species(species)
+            else:
+                affected = np.empty(0, dtype=np.int64)
+            if fired_channel is None:
+                return affected
+            fired = np.asarray([int(fired_channel)], dtype=np.int64)
+            return fired if affected.size == 0 else np.unique(np.concatenate((affected, fired))).astype(np.int64, copy=False)
+
+        marker = self._ensure_runtime_array(
+            store,
+            "affected_channel_marker",
+            size=network.n_channels,
+            dtype=bool,
+            fill_value=False,
+        )
+        scratch = self._ensure_runtime_array(
+            store,
+            "affected_channel_scratch",
+            size=network.n_channels,
+            dtype=np.int64,
+        )
+        count = 0
+        for sid_value in species:
+            channels = np.asarray(species_to_channels[int(sid_value)], dtype=np.int64)
+            if channels.size == 0:
+                continue
+            unmarked = channels[~marker[channels]]
+            if unmarked.size == 0:
+                continue
+            marker[unmarked] = True
+            scratch[count : count + unmarked.size] = unmarked
+            count += int(unmarked.size)
+
+        if fired_channel is not None:
+            cid = int(fired_channel)
+            if cid < 0 or cid >= network.n_channels:
+                raise IndexError(f"fired_channel out of range: {cid}")
+            if not bool(marker[cid]):
+                marker[cid] = True
+                scratch[count] = cid
+                count += 1
+
+        affected = scratch[:count]
+        if count:
+            marker[affected] = False
+        return affected
+
     def _refresh_propensities_after_state_change(
         self,
         network: ReactionNetworkData | ElementaryMassActionNetwork,
@@ -1937,6 +2251,7 @@ class PDMPStepper(BaseStepper):
             network.compute_all_propensities(state, out=cached)
             self._clean_propensities(cached)
             self._rebuild_heap_from_propensities(store, state, cached, rng)
+            self._rebuild_gillespie_discrete_cache_after_full_compute(network, state, store, cached)
             store["propensities_valid"] = True
             store["propensities_dirty_reason"] = None
             store["propensities_dirty_species"] = np.empty(0, dtype=np.int64)
@@ -1948,6 +2263,7 @@ class PDMPStepper(BaseStepper):
             network.compute_all_propensities(state, out=cached)
             self._clean_propensities(cached)
             self._rebuild_heap_from_propensities(store, state, cached, rng)
+            self._rebuild_gillespie_discrete_cache_after_full_compute(network, state, store, cached)
             store["propensities_valid"] = True
             store["propensities_dirty_reason"] = None
             store["propensities_dirty_species"] = np.empty(0, dtype=np.int64)
@@ -1958,20 +2274,21 @@ class PDMPStepper(BaseStepper):
         species = np.asarray(changed_species, dtype=np.int64)
         if species.ndim != 1:
             raise ValueError("changed_species must be a 1D array")
-        species = np.unique(species)
         if species.size == 0 and fired_channel is None:
             return
 
-        if self.config.use_local_propensity_updates and species.size:
+        if self.config.use_local_propensity_updates:
             try:
-                affected = network.affected_channels_for_species(species)
+                affected = self._affected_channels_for_species_fast(
+                    network,
+                    store,
+                    species,
+                    fired_channel=fired_channel,
+                )
             except Exception:
                 affected = np.arange(network.n_channels, dtype=np.int64)
         else:
             affected = np.arange(network.n_channels, dtype=np.int64)
-        if fired_channel is not None:
-            fired = np.asarray([int(fired_channel)], dtype=np.int64)
-            affected = fired if affected.size == 0 else np.unique(np.concatenate((affected, fired))).astype(np.int64, copy=False)
         if affected.size == 0:
             return
 
@@ -1982,18 +2299,30 @@ class PDMPStepper(BaseStepper):
         if full_recompute:
             affected = np.arange(network.n_channels, dtype=np.int64)
 
-        old_propensities = np.asarray(cached[affected], dtype=float).copy()
-        old_scheduled = np.asarray(store.get("scheduled_times", np.full(network.n_channels, np.inf, dtype=float)))[affected].copy()
+        if self._uses_discrete_event_heap():
+            old_propensities = np.asarray(cached[affected], dtype=float).copy()
+            old_scheduled = np.asarray(store.get("scheduled_times", np.full(network.n_channels, np.inf, dtype=float)))[affected].copy()
+        else:
+            old_propensities = np.empty(0, dtype=float)
+            old_scheduled = np.empty(0, dtype=float)
         if full_recompute:
             network.compute_all_propensities(state, out=cached)
             self._clean_propensities(cached)
             new_propensities = cached[affected]
             update_mode = "full"
+            self._rebuild_gillespie_discrete_cache_after_full_compute(network, state, store, cached)
         else:
-            new_propensities = network.compute_propensities_for_channels(affected, state)
+            subset_scratch = self._ensure_runtime_array(
+                store,
+                "propensity_subset_scratch",
+                size=network.n_channels,
+                dtype=float,
+            )[: affected.size]
+            new_propensities = network.compute_propensities_for_channels(affected, state, out=subset_scratch)
             self._clean_propensities(new_propensities)
             cached[affected] = new_propensities
             update_mode = "local"
+            self._update_gillespie_discrete_cache_for_channels(network, state, store, affected, cached)
 
         if self._uses_discrete_event_heap():
             self._reschedule_discrete_heap_channels(
@@ -2248,6 +2577,8 @@ class PDMPStepper(BaseStepper):
             "heap_stale_pops": int(store.get("heap_stale_pops", 0)) if self._uses_discrete_event_heap() else 0,
             "heap_rebuilds": int(store.get("heap_rebuilds", 0)) if self._uses_discrete_event_heap() else 0,
             "heap_batch_heapifies": int(store.get("heap_batch_heapifies", 0)) if self._uses_discrete_event_heap() else 0,
+            "gillespie_cache_valid": bool(store.get("gillespie_cache_valid", False)) if self._uses_discrete_event_gillespie() else False,
+            "gillespie_cached_total": float(store.get("gillespie_discrete_total", 0.0)) if self._uses_discrete_event_gillespie() else 0.0,
             "partition_metadata": metadata,
         }
 
