@@ -7,9 +7,12 @@ from polymer_sim import (
     RestrictionController,
     SSAStepper,
     TrajectoryRecorder,
+    ChannelBlock,
+    build_food_supply_restriction,
     TrimerOutflowRestriction,
     build_restriction,
     build_n3_wh_network,
+    normalize_food_supply_mode,
 )
 from polymer_sim.core.state import SystemState
 from polymer_sim.simulation.restriction import RestrictionContext
@@ -94,6 +97,56 @@ def test_runner_applies_restriction_and_keeps_food_present():
     assert result.summary.final_time == 0.5
     assert np.allclose(trajectory.states[:, zero_sid], 10.0)
     assert np.allclose(trajectory.states[:, one_sid], 10.0)
+
+
+def test_food_supply_mode_helper_supports_explicit_and_constant_modes():
+    network = build_n3_wh_network(initial_counts={"0": 10.0, "1": 10.0}, k_food_inflow=1.0)
+
+    assert normalize_food_supply_mode("inflow") == "explicit_inflow"
+    assert normalize_food_supply_mode("chemostat") == "constant"
+    assert build_food_supply_restriction(network, mode="explicit_inflow") is None
+
+    restriction = build_food_supply_restriction(
+        network,
+        mode="constant",
+        food_species=("0", "1"),
+        food_count=10.0,
+    )
+    assert isinstance(restriction, RestrictionController)
+
+
+def test_constant_food_mode_runs_without_explicit_inflow_channels():
+    network = build_n3_wh_network(
+        initial_counts={"0": 10.0, "1": 10.0},
+        k_right_add=1.0,
+        k_nonfood_outflow=0.8,
+        k_food_inflow=0.0,
+    )
+    assert network.channel_sizes[ChannelBlock.INFLOW] == 0
+
+    recorder = TrajectoryRecorder()
+    restriction = build_food_supply_restriction(
+        network,
+        mode="constant",
+        food_species=("0", "1"),
+        food_count=10.0,
+    )
+    result = ExperimentRunner().run_one(
+        network,
+        SSAStepper(),
+        t_end=0.5,
+        seed=33,
+        recorder=recorder,
+        restriction=restriction,
+    )
+    trajectory = recorder.finalize()
+    zero_sid = network.species_idx("0")
+    one_sid = network.species_idx("1")
+
+    assert result.summary.final_time == 0.5
+    assert np.allclose(trajectory.states[:, zero_sid], 10.0)
+    assert np.allclose(trajectory.states[:, one_sid], 10.0)
+    assert trajectory.run_metadata["food_replenishment"]["target_counts"] == [10.0, 10.0]
 
 
 def test_runner_can_stop_by_max_runtime_seconds():

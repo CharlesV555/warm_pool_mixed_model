@@ -3136,9 +3136,9 @@ class BlendedHybridStepper(BaseStepper):
             return StepResult(advanced_time=0.0, event_occurred=False, details={"mode": "blended_no_dt"})
 
         network = context.network
-        self._maybe_update_reaction_interval_dt(network, state)
-        x_float = self._float_nonnegative(state.x)
-        beta = self._channel_betas(network, x_float)
+        self._maybe_update_reaction_interval_dt(network, state) # 自适应dt,默认不开启
+        x_float = self._float_nonnegative(state.x) # 返回一个浮点数数组，确保所有元素非负
+        beta = self._channel_betas(network, x_float) # 计算全局的beta，需要审查具体实现
         beta_min = float(np.min(beta)) if beta.size else 0.0
         beta_max = float(np.max(beta)) if beta.size else 0.0
 
@@ -3528,11 +3528,11 @@ class BlendedHybridStepper(BaseStepper):
 
         species_beta = _species_beta_array(values[: lookup.n_species], self.config.i1, self.config.i2)
         relevant_beta = species_beta[lookup.relevant_species]
-        relevant_beta *= lookup.relevant_mask
+        relevant_beta *= lookup.relevant_mask 
         return np.max(relevant_beta, axis=1)
 
     def _channel_beta_lookup(self, network: ReactionNetworkData) -> _ChannelBetaLookup:
-        mode = self.config.beta_species_mode
+        mode = self.config.beta_species_mode # β计算引入哪些模式
         key = (id(network), mode)
         cached = self._beta_lookup_cache.get(key)
         if (
@@ -3540,10 +3540,10 @@ class BlendedHybridStepper(BaseStepper):
             and cached.n_channels == int(network.n_channels)
             and cached.n_species == int(network.n_species)
             and cached.mode == mode
-        ):
+        ): # 每一步都要核验cached信息
             return cached
 
-        lookup = _build_channel_beta_lookup(network, mode)
+        lookup = _build_channel_beta_lookup(network, mode) # 这里是一个缓存表，如果上面cached不存在就会计算
         self._beta_lookup_cache[key] = lookup
         return lookup
 
@@ -4155,7 +4155,7 @@ def _species_beta_array(x: np.ndarray, i1: float, i2: float) -> np.ndarray:
     return np.clip(beta, 0.0, 1.0)
 
 
-def _build_channel_beta_lookup(network: ReactionNetworkData, mode: str) -> _ChannelBetaLookup:
+def _build_channel_beta_lookup(network: ReactionNetworkData, mode: str) -> _ChannelBetaLookup: # 一个缓存表
     relevant_by_channel: list[list[int]] = []
     max_width = 0
     n_channels = int(network.n_channels)

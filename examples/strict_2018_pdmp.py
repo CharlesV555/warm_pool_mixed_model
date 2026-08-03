@@ -15,6 +15,7 @@ EXAMPLES_DIR = PROJECT_ROOT / "examples"
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from polymer_sim import (  # noqa: E402
+    BaseStepper,
     ChannelBlock,
     ElementaryExpansionConfig,
     ElementaryMassActionNetwork,
@@ -22,6 +23,8 @@ from polymer_sim import (  # noqa: E402
     FiniteMarkovConfig,
     FiniteMarkovScalingPDMPPartitionStrategy,
     PDMPConfig,
+    PDMPPartitionResult,
+    PDMPPartitionStrategy,
     PDMPStepper,
     ReactionNetworkData,
     ScalingPDMPConfig,
@@ -33,6 +36,8 @@ from polymer_sim import (  # noqa: E402
     generate_fixed_species_space,
     save_trajectory_record,
     set_catalytic_strengths_for_channels,
+    StepperContext,
+    StepResult,
 )
 
 METHOD_NAME = "strict_2018_pdmp"
@@ -69,7 +74,7 @@ class Strict2018Settings:
     max_steps: int = 100_000_000
     max_runtime_seconds: float | None = 60.0
     pdmp_ode_step: float = 0.001
-    pdmp_n0: float = 500.0
+    pdmp_n0: float = 1000.0
     pdmp_mu: float = 1.0
     pdmp_eta: float = 0.9
     pdmp_delta: float = 0.9
@@ -83,6 +88,216 @@ class Strict2018Settings:
 
 
 DEFAULT_SETTINGS = Strict2018Settings()
+
+
+class PartitionTimingProbe(PDMPPartitionStrategy):
+    """Count adaptive partition calls and their LP wall time for this example."""
+
+    def __init__(self, wrapped: PDMPPartitionStrategy):
+        self.wrapped = wrapped
+        self.repartition_count = 0
+        self.repartition_wall_seconds = 0.0
+        self.lp_wall_seconds = 0.0
+        self.lp_success_count = 0
+        self.lp_fallback_count = 0
+        self.last_lp_status: str | None = None
+
+    def partition(
+        self,
+        network: Any,
+        state: Any,
+        propensities: np.ndarray | None = None,
+    ) -> PDMPPartitionResult:
+        self.repartition_count += 1
+        started = perf_counter()
+        try:
+            result = self.wrapped.partition(network, state, propensities)
+        finally:
+            self.repartition_wall_seconds += perf_counter() - started
+
+        metadata = getattr(result, "metadata", {})
+        if isinstance(metadata, dict):
+            self.lp_wall_seconds += float(metadata.get("lp_wall_seconds", 0.0))
+            if bool(metadata.get("lp_used", False)):
+                self.lp_success_count += 1
+            else:
+                self.lp_fallback_count += 1
+            status = metadata.get("lp_status")
+            if status is not None:
+                self.last_lp_status = str(status)
+        return result
+
+    def diagnostics(self, *, n_steps: int) -> dict[str, object]:
+        mean_seconds = self.lp_wall_seconds / self.repartition_count if self.repartition_count else 0.0
+        return {
+            "n_steps": int(n_steps),
+            "n_lp_repartitions": int(self.repartition_count),
+            "lp_wall_seconds": float(self.lp_wall_seconds),
+            "repartition_wall_seconds": float(self.repartition_wall_seconds),
+            "lp_mean_wall_seconds": float(mean_seconds),
+            "n_lp_successful": int(self.lp_success_count),
+            "n_lp_fallback": int(self.lp_fallback_count),
+            "last_lp_status": self.last_lp_status,
+            "counter_source": "PDMP partition_strategy.partition() calls",
+        }
+
+
+class InstrumentedPDMPStepper(BaseStepper):
+    """Delegate PDMP execution while recording channel/species mode-time diagnostics."""
+
+    def __init__(self, wrapped: PDMPStepper):
+        self.wrapped = wrapped
+        self.config = wrapped.config
+        self.partition_method = wrapped.partition_method
+        self.partition_config = wrapped.partition_config
+        self.partition_strategy = wrapped.partition_strategy
+        self.step_call_count = 0
+        self.event_count_observed = 0
+        self._ode_channel_intervals: list[dict[str, object]] = []
+        self._channel_continuous_time: np.ndarray | None = None
+        self._channel_gillespie_time: np.ndarray | None = None
+        self._species_continuous_time: np.ndarray | None = None
+        self._species_gillespie_time: np.ndarray | None = None
+
+    def invalidate_cache(self) -> None:
+        self.wrapped.invalidate_cache()
+
+    def step(self, state: Any, dt: float, context: StepperContext) -> StepResult:
+        start_time = float(state.t)
+        result = self.wrapped.step(state, dt, context)
+        self.step_call_count += 1
+        self._record_step_modes(context.network, state, start_time, float(state.t), result)
+        return result
+
+    def diagnostics(self, network: ElementaryMassActionNetwork | ReactionNetworkData) -> dict[str, object]:
+        self._ensure_arrays(network)
+        species_rows = [
+            {
+                "species_id": int(species_id),
+                "species_name": str(species_name),
+                "gillespie_time": float(self._species_gillespie_time[species_id]),
+                "continuous_time": float(self._species_continuous_time[species_id]),
+            }
+            for species_id, species_name in enumerate(network.species_names)
+        ]
+        channel_rows = [
+            {
+                "channel_id": int(channel_id),
+                "gillespie_time": float(self._channel_gillespie_time[channel_id]),
+                "continuous_time": float(self._channel_continuous_time[channel_id]),
+                "label": json_ready(network.describe_channel(channel_id)),
+            }
+            for channel_id in range(network.n_channels)
+        ]
+        return {
+            "n_step_calls_observed": int(self.step_call_count),
+            "n_events_observed": int(self.event_count_observed),
+            "ode_channel_intervals": list(self._ode_channel_intervals),
+            "channel_mode_time": channel_rows,
+            "species_mode_time": species_rows,
+            "mode_time_definition": (
+                "Each advanced_time interval is accumulated for species changed by continuous "
+                "channels as continuous_time and for species changed by discrete channels as "
+                "gillespie_time. A species can accumulate both when different active channels "
+                "affect it under different modes."
+            ),
+        }
+
+    def _record_step_modes(
+        self,
+        network: ElementaryMassActionNetwork | ReactionNetworkData,
+        state: Any,
+        start_time: float,
+        end_time: float,
+        result: StepResult,
+    ) -> None:
+        advanced_time = max(float(result.advanced_time), 0.0)
+        if advanced_time <= 0.0:
+            return
+        self._ensure_arrays(network)
+        continuous_channels, discrete_channels = self._current_channel_partition(state)
+        if continuous_channels.size:
+            self._channel_continuous_time[continuous_channels] += advanced_time
+            continuous_species = self._changed_species_for_channels(network, continuous_channels)
+            if continuous_species.size:
+                self._species_continuous_time[continuous_species] += advanced_time
+            self._append_ode_interval(start_time, end_time, continuous_channels)
+        if discrete_channels.size:
+            self._channel_gillespie_time[discrete_channels] += advanced_time
+            discrete_species = self._changed_species_for_channels(network, discrete_channels)
+            if discrete_species.size:
+                self._species_gillespie_time[discrete_species] += advanced_time
+
+        details = result.details or {}
+        if "discrete_event_ids" in details:
+            self.event_count_observed += int(np.asarray(details["discrete_event_ids"], dtype=np.int64).size)
+        elif result.event_occurred:
+            self.event_count_observed += 1
+
+    def _ensure_arrays(self, network: ElementaryMassActionNetwork | ReactionNetworkData) -> None:
+        if self._channel_continuous_time is None or self._channel_continuous_time.shape[0] != network.n_channels:
+            self._channel_continuous_time = np.zeros(network.n_channels, dtype=float)
+            self._channel_gillespie_time = np.zeros(network.n_channels, dtype=float)
+        if self._species_continuous_time is None or self._species_continuous_time.shape[0] != network.n_species:
+            self._species_continuous_time = np.zeros(network.n_species, dtype=float)
+            self._species_gillespie_time = np.zeros(network.n_species, dtype=float)
+
+    def _current_channel_partition(self, state: Any) -> tuple[np.ndarray, np.ndarray]:
+        partition = self._current_partition(state)
+        if partition is None:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+        return (
+            np.asarray(partition.continuous_channels, dtype=np.int64),
+            np.asarray(partition.discrete_channels, dtype=np.int64),
+        )
+
+    def _current_partition(self, state: Any) -> PDMPPartitionResult | None:
+        partition_state = getattr(state, "partition_state", None)
+        if not isinstance(partition_state, dict):
+            return None
+        store = partition_state.get("pdmp")
+        if not isinstance(store, dict):
+            return None
+        partition = store.get("partition")
+        return partition if isinstance(partition, PDMPPartitionResult) else None
+
+    def _changed_species_for_channels(
+        self,
+        network: ElementaryMassActionNetwork | ReactionNetworkData,
+        channel_ids: np.ndarray,
+    ) -> np.ndarray:
+        if channel_ids.size == 0:
+            return np.empty(0, dtype=np.int64)
+        mask = np.zeros(network.n_species, dtype=bool)
+        for channel_id in np.asarray(channel_ids, dtype=np.int64):
+            changed = network.get_channel_changed_species(int(channel_id))
+            if changed.size:
+                mask[np.asarray(changed, dtype=np.int64)] = True
+        return np.flatnonzero(mask).astype(np.int64, copy=False)
+
+    def _append_ode_interval(self, start_time: float, end_time: float, channel_ids: np.ndarray) -> None:
+        ids = [int(channel_id) for channel_id in np.asarray(channel_ids, dtype=np.int64).tolist()]
+        if not ids:
+            return
+        duration = max(float(end_time) - float(start_time), 0.0)
+        if duration <= 0.0:
+            return
+        if self._ode_channel_intervals:
+            last = self._ode_channel_intervals[-1]
+            if last["continuous_channel_ids"] == ids and abs(float(last["end_time"]) - float(start_time)) <= 1e-12:
+                last["end_time"] = float(end_time)
+                last["duration"] = float(last["duration"]) + duration
+                last["n_step_calls"] = int(last["n_step_calls"]) + 1
+                return
+        self._ode_channel_intervals.append(
+            {
+                "start_time": float(start_time),
+                "end_time": float(end_time),
+                "duration": float(duration),
+                "continuous_channel_ids": ids,
+                "n_step_calls": 1,
+            }
+        )
 
 
 NETWORK_SPECS: dict[str, NetworkSpec] = {
@@ -215,11 +430,14 @@ def make_strict_2018_pdmp_stepper(settings: Strict2018Settings) -> PDMPStepper:
         max_states=int(settings.pdmp_finite_markov_max_states),
         max_total_internal_count=int(settings.pdmp_finite_markov_max_total_internal_count),
     )
-    return PDMPStepper(
-        partition_strategy=FiniteMarkovScalingPDMPPartitionStrategy(
+    partition_strategy = PartitionTimingProbe(
+        FiniteMarkovScalingPDMPPartitionStrategy(
             partition_config,
             finite_config,
-        ),
+        )
+    )
+    return PDMPStepper(
+        partition_strategy=partition_strategy,
         partition_method="scaling",
         partition_config=partition_config,
         config=PDMPConfig(
@@ -699,6 +917,13 @@ def network_spec(network_name: str) -> NetworkSpec:
     return NETWORK_SPECS[key]
 
 
+def _partition_timing_probe(stepper: Any) -> PartitionTimingProbe | None:
+    strategy = getattr(stepper, "partition_strategy", None)
+    if isinstance(strategy, PartitionTimingProbe):
+        return strategy
+    return None
+
+
 def run_strict_2018_pdmp(
     network_name: str,
     settings: Strict2018Settings,
@@ -710,7 +935,7 @@ def run_strict_2018_pdmp(
     network, strict_metadata = prepare_strict_2018_network(source_network, network_metadata)
     build_elapsed = perf_counter() - build_started
 
-    stepper = make_strict_2018_pdmp_stepper(settings)
+    stepper = InstrumentedPDMPStepper(make_strict_2018_pdmp_stepper(settings))
     recorder = TrajectoryRecorder()
     result = ExperimentRunner().run_one(
         network,
@@ -725,6 +950,19 @@ def run_strict_2018_pdmp(
         timing_report_name=f"{spec.name}_{METHOD_NAME}",
         network_build_elapsed_seconds=build_elapsed,
     )
+    partition_probe = _partition_timing_probe(stepper)
+    runtime_checks = (
+        partition_probe.diagnostics(n_steps=int(result.summary.n_steps))
+        if partition_probe is not None
+        else {
+            "n_steps": int(result.summary.n_steps),
+            "n_lp_repartitions": None,
+            "lp_wall_seconds": None,
+            "counter_source": "partition timing probe unavailable",
+        }
+    )
+    runtime_checks.update(stepper.diagnostics(network))
+    result.summary.metadata["pdmp_runtime_checks"] = json_ready(runtime_checks)
     trajectory_record = recorder.finalize()
     trajectory_record.run_metadata["example_parameters"] = {
         "method": METHOD_NAME,
@@ -741,10 +979,16 @@ def run_strict_2018_pdmp(
             for channel_id in range(network.n_channels)
         ],
     }
+    trajectory_record.run_metadata["pdmp_runtime_checks"] = json_ready(runtime_checks)
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     output_path = out_dir / f"{spec.name}_{METHOD_NAME}_trajectory.npz"
+    diagnostics_path = out_dir / f"{spec.name}_{METHOD_NAME}_diagnostics.json"
+    diagnostics_path.write_text(
+        json.dumps(json_ready(runtime_checks), ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
     save_trajectory_record(output_path, trajectory_record)
 
     print(f"\n{METHOD_NAME} summary:")
@@ -759,8 +1003,31 @@ def run_strict_2018_pdmp(
         f"trajectory points={trajectory_record.times.shape[0]}, "
         f"state shape={trajectory_record.states.shape}"
     )
+    print(
+        "pdmp checks: "
+        f"steps={runtime_checks['n_steps']}, "
+        f"lp_repartitions={runtime_checks['n_lp_repartitions']}, "
+        f"lp_wall_seconds={runtime_checks['lp_wall_seconds']}"
+    )
+    print("species mode times:")
+    _print_species_mode_times(runtime_checks.get("species_mode_time", []))
+    print(f"diagnostics saved to: {diagnostics_path}")
     print(f"trajectory saved to: {output_path}")
     return output_path, result
+
+
+def _print_species_mode_times(rows: object) -> None:
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        print(
+            "  "
+            f"{row.get('species_name')}: "
+            f"gillespie={float(row.get('gillespie_time', 0.0)):.6g}, "
+            f"continuous={float(row.get('continuous_time', 0.0)):.6g}"
+        )
 
 
 def json_ready(value):
@@ -831,5 +1098,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# 

@@ -211,6 +211,50 @@ def test_scaling_pdmp_partition_runs_and_partitions_all_channels():
     assert partition.zeta.shape == (elementary.n_channels,)
 
 
+def test_scaling_pdmp_scale_caps_floor_nonpositive_copy_numbers_and_rates():
+    network = ElementaryMassActionNetwork(
+        species_names=["S0", "S1", "S2"],
+        name_to_idx={"S0": 0, "S1": 1, "S2": 2},
+        x0=np.asarray([0.0, -5.0, 100.0], dtype=float),
+        nu_minus=np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        ),
+        nu_plus=np.asarray(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        rate_constants=np.asarray([0.0, -2.0, 10.0], dtype=float),
+    )
+    strategy = ScalingPDMPPartitionStrategy(
+        ScalingPDMPConfig(N0=10.0, use_lp=False, exponent_floor=-400.0)
+    )
+
+    partition = strategy.partition(network, SystemState.from_x0(network.x0))
+    expected_rate_floor_exponent = np.log(np.finfo(float).tiny) / np.log(10.0)
+
+    assert np.all(np.isfinite(partition.alpha))
+    assert np.all(np.isfinite(partition.beta))
+    assert np.all(np.isfinite(partition.zeta))
+    assert partition.alpha[0] == pytest.approx(0.0)
+    assert partition.alpha[1] == pytest.approx(0.0)
+    assert partition.alpha[2] == pytest.approx(2.0)
+    assert partition.beta[0] == pytest.approx(expected_rate_floor_exponent)
+    assert partition.beta[1] == pytest.approx(expected_rate_floor_exponent)
+    assert partition.beta[2] == pytest.approx(1.0)
+    assert partition.metadata["nonpositive_copy_number_scale_count"] == 2
+    assert partition.metadata["nonpositive_rate_scale_count"] == 2
+    assert partition.metadata["rate_scale_floor"] == pytest.approx(np.finfo(float).tiny)
+
+
 def test_scaling_pdmp_algorithm3_mu_eta_delta_controls_partition_bounds():
     network = make_polymer_network(k_poly_left=0.0, k_poly_right=0.0, k_inflow=1.0, inflow_species_ids=[0])
     elementary = build_elementary_mass_action_network(network)
@@ -295,6 +339,34 @@ def test_linear_catalysis_scaling_zeta_includes_saturation_alpha_for_saturating_
     assert partition.metadata["saturation_alpha_exponent"] == pytest.approx(-1.0)
     assert partition.metadata["saturating_catalysis_term_count"] >= 1
     assert partition.zeta[channel] == pytest.approx(base_exponent + saturated_factor_exponent)
+
+
+def test_linear_catalysis_scaling_floors_nonpositive_copy_numbers_and_rates():
+    network = make_polymer_network(
+        k_poly_left=0.0,
+        k_poly_right=0.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+        catalysis_mode="linear",
+    )
+    state = SystemState.from_x0(network.x0)
+    state.x[0] = 0.0
+    state.x[1] = -3.0
+    strategy = LinearCatalysisScalingPDMPPartitionStrategy(
+        ScalingPDMPConfig(N0=10.0, use_lp=False, exponent_floor=-400.0)
+    )
+
+    partition = strategy.partition(network, state)
+    expected_rate_floor_exponent = np.log(np.finfo(float).tiny) / np.log(10.0)
+
+    assert np.all(np.isfinite(partition.alpha))
+    assert np.all(np.isfinite(partition.beta))
+    assert np.all(np.isfinite(partition.zeta))
+    assert partition.alpha[0] == pytest.approx(0.0)
+    assert partition.alpha[1] == pytest.approx(0.0)
+    assert np.min(partition.beta) == pytest.approx(expected_rate_floor_exponent)
+    assert partition.metadata["nonpositive_copy_number_scale_count"] >= 2
+    assert partition.metadata["nonpositive_rate_scale_count"] == int(np.sum(network.rate_constants <= 0.0))
 
 
 def test_fast_subnetwork_selector_finds_timescale_separated_component():

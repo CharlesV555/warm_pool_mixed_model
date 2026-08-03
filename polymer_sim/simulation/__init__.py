@@ -6,7 +6,9 @@ from polymer_sim.simulation.restriction import (
     RestrictionContext,
     RestrictionController,
     TrimerOutflowRestriction,
+    build_food_supply_restriction,
     build_restriction,
+    normalize_food_supply_mode,
 )
 from polymer_sim.simulation.stepper import (
     BaseStepper,
@@ -45,7 +47,9 @@ __all__ = [
     "StepResult",
     "StepperContext",
     "TrimerOutflowRestriction",
+    "build_food_supply_restriction",
     "build_restriction",
     "compute_all_propensities",
     "estimate_mean_reaction_interval",
+    "normalize_food_supply_mode",
 ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field, replace
 from itertools import combinations
+from time import perf_counter
 from typing import Sequence
 
 import numpy as np
@@ -14,6 +15,7 @@ from polymer_sim.core.state import SystemState
 
 PDMPNetwork = ElementaryMassActionNetwork | ReactionNetworkData
 _FAST_NETWORK_CANDIDATE_CACHE: dict[tuple[int, int, int, int], "_FastNetworkCandidateCache"] = {}
+_MIN_POSITIVE_FLOAT = float(np.finfo(float).tiny)
 
 
 @dataclass(slots=True)
@@ -125,7 +127,7 @@ class ScalingPDMPConfig:
     continuous_copy_number_scale_threshold_mu: float | None = None
     adaptation_scale_threshold_eta: float | None = None
     reaction_relaxation_delta: float | None = None
-    min_rate: float = 1e-300
+    min_rate: float = _MIN_POSITIVE_FLOAT
     exponent_floor: float = -12.0
     use_lp: bool = True
     enable_fast_subnetworks: bool = False
@@ -172,8 +174,68 @@ class ScalingPDMPConfig:
             raise ValueError("reaction_relaxation_delta must be >= 0")
         if self.min_rate <= 0.0:
             raise ValueError("min_rate must be > 0")
+        self.min_rate = max(self.min_rate, _MIN_POSITIVE_FLOAT)
         if self.fast_subnetwork_max_size <= 0:
             raise ValueError("fast_subnetwork_max_size must be > 0")
+
+
+def _copy_number_scale_exponents(values: np.ndarray, N0: float) -> tuple[np.ndarray, dict[str, object]]:
+    """Compute Algorithm-3 species scale caps A_i with zero-count protection.
+
+    The paper's A_i uses the current copy number scale.  Numerically, log(0)
+    and log(negative) are invalid, so x_i <= 0 is evaluated as x_i = 1.  Values
+    in (0, 1) are also floored to 1 to preserve the existing nonnegative
+    exponent convention.
+    """
+
+    raw = np.asarray(values, dtype=float)
+    finite = np.isfinite(raw)
+    nonpositive = (~finite) | (raw <= 0.0)
+    safe = np.where(finite & (raw > 1.0), raw, 1.0)
+    exponents = np.log(safe) / np.log(float(N0))
+    return exponents, {
+        "copy_number_scale_floor": 1.0,
+        "nonpositive_copy_number_scale_count": int(np.sum(nonpositive)),
+    }
+
+
+def _rate_scale_exponents(
+    values: np.ndarray,
+    N0: float,
+    min_rate: float,
+    exponent_floor: float,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Compute Algorithm-3 reaction scale caps B_k with nonpositive-rate protection."""
+
+    raw = np.asarray(values, dtype=float)
+    rate_floor = max(float(min_rate), _MIN_POSITIVE_FLOAT)
+    finite = np.isfinite(raw)
+    nonpositive = (~finite) | (raw <= 0.0)
+    safe = np.where(finite & (raw > rate_floor), raw, rate_floor)
+    exponents = np.log(safe) / np.log(float(N0))
+    exponents = np.maximum(exponents, float(exponent_floor))
+    return exponents, {
+        "rate_scale_floor": float(rate_floor),
+        "nonpositive_rate_scale_count": int(np.sum(nonpositive)),
+    }
+
+
+def _positive_scale_exponent(
+    value: float,
+    N0: float,
+    min_rate: float,
+    *,
+    exponent_floor: float | None,
+) -> float:
+    """Return a finite log-scale exponent for scalar positive parameters."""
+
+    rate_floor = max(float(min_rate), _MIN_POSITIVE_FLOAT)
+    raw = float(value)
+    safe = raw if np.isfinite(raw) and raw > rate_floor else rate_floor
+    exponent = float(np.log(safe) / np.log(float(N0)))
+    if exponent_floor is not None:
+        exponent = max(exponent, float(exponent_floor))
+    return exponent
 
 
 class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
@@ -207,14 +269,20 @@ class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
         #   SD -> discrete_species
         #   bounds -> lower_bounds / upper_bounds
         #   RQ -> rq_channels
-        x = np.maximum(np.asarray(state.x, dtype=float), 0.0)
-
         # Algorithm 3 scale estimation.
         # alpha_i estimates the copy-number scale of species i relative to N0.
         # beta_k estimates the reaction-rate scale of channel k relative to N0.
-        alpha_cap = np.log(np.maximum(x, 1.0)) / np.log(self.config.N0)
-        beta_cap = np.log(np.maximum(network.rate_constants, self.config.min_rate)) / np.log(self.config.N0)
-        beta_cap = np.maximum(beta_cap, self.config.exponent_floor)
+        # Numerically protected A_i/B_k construction:
+        # - x_i <= 0 is evaluated as x_i = 1, so A_i = log_N0(1) = 0;
+        # - k'_k <= 0 is evaluated with the smallest positive float before
+        #   exponent_floor is applied.
+        alpha_cap, alpha_metadata = _copy_number_scale_exponents(np.asarray(state.x, dtype=float), self.config.N0)
+        beta_cap, beta_metadata = _rate_scale_exponents(
+            network.rate_constants,
+            self.config.N0,
+            self.config.min_rate,
+            self.config.exponent_floor,
+        )
 
         # Optional LP pass for Algorithm 3 consistency constraints.
         alpha, beta, lp_metadata = self._solve_or_fallback(network, alpha_cap, beta_cap)
@@ -275,6 +343,8 @@ class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
                 "bound_factor": float(self.config.bound_factor),
                 "fast_subnetwork_count": int(len(fast_subnetworks)),
                 "rq_channel_count": int(rq_channels.size),
+                **alpha_metadata,
+                **beta_metadata,
                 **lp_metadata,
             },
         )
@@ -286,11 +356,19 @@ class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
         beta_cap: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
         if not self.config.use_lp:
-            return alpha_cap.copy(), beta_cap.copy(), {"lp_used": False, "lp_status": "disabled"}
+            return alpha_cap.copy(), beta_cap.copy(), {
+                "lp_used": False,
+                "lp_status": "disabled",
+                "lp_wall_seconds": 0.0,
+            }
         try:
             from scipy.optimize import linprog
         except Exception:
-            return alpha_cap.copy(), beta_cap.copy(), {"lp_used": False, "lp_status": "scipy_unavailable"}
+            return alpha_cap.copy(), beta_cap.copy(), {
+                "lp_used": False,
+                "lp_status": "scipy_unavailable",
+                "lp_wall_seconds": 0.0,
+            }
 
         n_species = network.n_species
         n_channels = network.n_channels
@@ -312,6 +390,7 @@ class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
                 rows.append(row)
                 rhs.append(0.0)
 
+        lp_started = perf_counter()
         result = linprog(
             objective,
             A_ub=np.vstack(rows) if rows else None,
@@ -319,16 +398,19 @@ class ScalingPDMPPartitionStrategy(PDMPPartitionStrategy):
             bounds=bounds,
             method="highs",
         )
+        lp_wall_seconds = perf_counter() - lp_started
         if not result.success:
             return alpha_cap.copy(), beta_cap.copy(), {
                 "lp_used": False,
                 "lp_status": str(result.message),
+                "lp_wall_seconds": float(lp_wall_seconds),
             }
         values = np.asarray(result.x, dtype=float)
         return values[:n_species], values[n_species:], {
             "lp_used": True,
             "lp_status": "optimal",
             "lp_objective": float(-result.fun),
+            "lp_wall_seconds": float(lp_wall_seconds),
         }
 
 
@@ -357,11 +439,13 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
         propensities: np.ndarray | None = None,
     ) -> PDMPPartitionResult:
         self._validate_linear_catalysis_network(network)
-        x = np.maximum(np.asarray(state.x, dtype=float), 0.0)
-
-        alpha_cap = np.log(np.maximum(x, 1.0)) / np.log(self.config.N0)
-        beta_cap = np.log(np.maximum(network.rate_constants, self.config.min_rate)) / np.log(self.config.N0)
-        beta_cap = np.maximum(beta_cap, self.config.exponent_floor)
+        alpha_cap, alpha_metadata = _copy_number_scale_exponents(np.asarray(state.x, dtype=float), self.config.N0)
+        beta_cap, beta_metadata = _rate_scale_exponents(
+            network.rate_constants,
+            self.config.N0,
+            self.config.min_rate,
+            self.config.exponent_floor,
+        )
 
         alpha, beta, lp_metadata = self._solve_or_fallback_linear_catalysis(network, alpha_cap, beta_cap)
         zeta = self._effective_linear_catalysis_zeta(network, alpha, beta)
@@ -403,7 +487,12 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
         saturation_alpha_exponent = (
             None
             if saturation_alpha is None
-            else float(np.log(max(float(saturation_alpha), self.config.min_rate)) / np.log(self.config.N0))
+            else _positive_scale_exponent(
+                float(saturation_alpha),
+                self.config.N0,
+                self.config.min_rate,
+                exponent_floor=None,
+            )
         )
         return PDMPPartitionResult(
             continuous_channels=continuous_channels,
@@ -434,6 +523,8 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
                 "linear_catalysis_term_count": int(len(catalytic_terms)),
                 "saturating_catalysis_term_count": int(saturated_term_count),
                 "saturating_selected_upper_branch_count": int(selected_upper_branch_count),
+                **alpha_metadata,
+                **beta_metadata,
                 **lp_metadata,
             },
         )
@@ -454,11 +545,19 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
         beta_cap: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
         if not self.config.use_lp:
-            return alpha_cap.copy(), beta_cap.copy(), {"lp_used": False, "lp_status": "disabled"}
+            return alpha_cap.copy(), beta_cap.copy(), {
+                "lp_used": False,
+                "lp_status": "disabled",
+                "lp_wall_seconds": 0.0,
+            }
         try:
             from scipy.optimize import linprog
         except Exception:
-            return alpha_cap.copy(), beta_cap.copy(), {"lp_used": False, "lp_status": "scipy_unavailable"}
+            return alpha_cap.copy(), beta_cap.copy(), {
+                "lp_used": False,
+                "lp_status": "scipy_unavailable",
+                "lp_wall_seconds": 0.0,
+            }
 
         n_species = network.n_species
         n_channels = network.n_channels
@@ -491,6 +590,7 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
                         rows.append(row)
                         rhs.append(-float(branch.constant_exponent))
 
+        lp_started = perf_counter()
         result = linprog(
             objective,
             A_ub=np.vstack(rows) if rows else None,
@@ -498,16 +598,19 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
             bounds=bounds,
             method="highs",
         )
+        lp_wall_seconds = perf_counter() - lp_started
         if not result.success:
             return alpha_cap.copy(), beta_cap.copy(), {
                 "lp_used": False,
                 "lp_status": str(result.message),
+                "lp_wall_seconds": float(lp_wall_seconds),
             }
         values = np.asarray(result.x, dtype=float)
         return values[:n_species], values[n_species:], {
             "lp_used": True,
             "lp_status": "optimal",
             "lp_objective": float(-result.fun),
+            "lp_wall_seconds": float(lp_wall_seconds),
         }
 
     def _effective_linear_catalysis_zeta(
@@ -547,8 +650,12 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
             strength = network.get_catalytic_strength(channel_id, int(catalyst_sid))
             if strength <= 0.0:
                 continue
-            strength_exponent = np.log(max(float(strength), self.config.min_rate)) / np.log(self.config.N0)
-            strength_exponent = max(float(strength_exponent), float(self.config.exponent_floor))
+            strength_exponent = _positive_scale_exponent(
+                float(strength),
+                self.config.N0,
+                self.config.min_rate,
+                exponent_floor=self.config.exponent_floor,
+            )
             if self._uses_saturating_catalysis_scaling(network, channel_id):
                 branches = self._saturating_catalysis_branches(
                     network,
@@ -590,9 +697,12 @@ class LinearCatalysisScalingPDMPPartitionStrategy(ScalingPDMPPartitionStrategy):
         catalyst_sid: int,
         strength_exponent: float,
     ) -> list["_CatalyticScalingBranch"]:
-        saturation_alpha_exponent = np.log(
-            max(float(network.saturation_alpha), self.config.min_rate)
-        ) / np.log(self.config.N0)
+        saturation_alpha_exponent = _positive_scale_exponent(
+            float(network.saturation_alpha),
+            self.config.N0,
+            self.config.min_rate,
+            exponent_floor=None,
+        )
         branches = [
             _CatalyticScalingBranch(
                 constant_exponent=float(strength_exponent - saturation_alpha_exponent),

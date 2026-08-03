@@ -107,7 +107,9 @@ from polymer_sim.simulation.restriction import (
     RestrictionContext,
     RestrictionController,
     TrimerOutflowRestriction,
+    build_food_supply_restriction,
     build_restriction,
+    normalize_food_supply_mode,
 )
 
 __all__ = [
@@ -185,6 +187,7 @@ __all__ = [
     "enumerate_irr_rafs",
     "generate_fixed_species_space",
     "FixedPDMPPartitionStrategy",
+    "build_food_supply_restriction",
     "build_restriction",
     "is_raf_subset",
     "load_summary",
@@ -203,6 +206,7 @@ __all__ = [
     "plot_summary_pipeline",
     "plot_species_with_outflow",
     "plot_time_series",
+    "normalize_food_supply_mode",
     "save_summary",
     "save_run_timing_report",
     "save_timing_summary",

@@ -13,9 +13,11 @@ from polymer_sim import (
     assign_paper_minimal_catalysis,
     build_n3_wh_network,
     build_n3_wh_reactions,
+    build_food_supply_restriction,
     compute_max_raf,
     enumerate_irr_rafs,
     format_stepper_info,
+    normalize_food_supply_mode,
     save_trajectory_record,
 )
 
@@ -29,6 +31,7 @@ INITIAL_FOOD_COUNT = 10.0
 FOOD_INFLOW_RATE = 1000.0
 FOOD_INFLOW_HILL_COEFFICIENT = 2.0
 FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
+FOOD_SUPPLY_MODE = "explicit_inflow"  # "explicit_inflow", "constant", "upper_limit", or "none"
 INITIAL_COUNTS = {
     "0": min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT),
     "1": min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT),
@@ -57,9 +60,15 @@ def print_static_raf_result(max_raf, irr_rafs) -> None:
         print(f"  irrRAF {idx}: {labels}")
 
 
-# Legacy restriction entry point.
-# Food limiting now lives inside formal INFLOW channel propensities through
-# food_inflow_capacity / food_inflow_hill_coefficient.
+# Food supply entry point.
+# - "explicit_inflow": food input is represented by formal INFLOW channels with
+#   the Hill-like capacity factor controlled by FOOD_MAX_COUNT and
+#   FOOD_INFLOW_HILL_COEFFICIENT.
+# - "constant": food is a chemostat boundary condition. The network is built
+#   without food INFLOW channels, and runner applies a restriction that resets
+#   food counts to INITIAL_FOOD_COUNT after each SSA event.
+# - "upper_limit": runner caps food from above but does not replenish it.
+# - "none": no food input or restriction is applied.
 
 
 def print_run_summary(run_result, trajectory_record) -> None:
@@ -99,6 +108,9 @@ def print_run_summary(run_result, trajectory_record) -> None:
 
 
 def main() -> None:
+    food_supply_mode = normalize_food_supply_mode(FOOD_SUPPLY_MODE)
+    use_explicit_food_inflow = food_supply_mode == "explicit_inflow"
+
     # Network entry point:
     # If you want a different chemistry or a different fixed species space,
     # change the builder here first.
@@ -106,8 +118,8 @@ def main() -> None:
         initial_counts=INITIAL_COUNTS,
         k_right_add=K_RIGHT_ADD,
         k_nonfood_outflow=K_NONFOOD_OUTFLOW,
-        k_food_inflow=FOOD_INFLOW_RATE,
-        food_inflow_capacity=FOOD_MAX_COUNT,
+        k_food_inflow=FOOD_INFLOW_RATE if use_explicit_food_inflow else 0.0,
+        food_inflow_capacity=FOOD_MAX_COUNT if use_explicit_food_inflow else None,
         food_inflow_hill_coefficient=FOOD_INFLOW_HILL_COEFFICIENT,
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
@@ -142,24 +154,28 @@ def main() -> None:
     # blending strategies. For HybridStepper/CLEStepper work, the first place
     # to change is the ExperimentRunner.run_one(...) call below.
     #
-    # Restriction entry point:
-    # Food input and its soft upper limit are represented by formal INFLOW
-    # channels. The old FoodUpperLimitRestriction call is intentionally not
-    # used so event-driven steppers can keep their local caches.
+    # Food-supply strategy entry point:
+    # Change FOOD_SUPPLY_MODE at the top of the file to compare explicit food
+    # inflow reactions with a constant-food chemostat boundary condition.
     #
     # Runtime cutoff entry point:
     # If MAX_TIMES is not None, runner will stop when wall-clock runtime reaches
     # that limit, even if t_end has not been reached yet.
     runner = ExperimentRunner()
     recorder = TrajectoryRecorder()
-    # restriction = build_food_upper_limit_restriction(network)
+    restriction = build_food_supply_restriction(
+        network,
+        mode=food_supply_mode,
+        food_species=("0", "1"),
+        food_count=INITIAL_FOOD_COUNT,
+    )
     run_result = runner.run_one(
         network,
         stepper,
         t_end=T_END,
         seed=SEED,
         recorder=recorder,
-        # restriction=restriction,
+        restriction=restriction,
         max_steps=MAX_STEPS,
         max_runtime_seconds=MAX_TIMES,
     )
@@ -174,7 +190,7 @@ def main() -> None:
 
     print_run_summary(run_result, trajectory_record)
     print(f"  trajectory saved to: {output_path}")
-    print("  hs2014 model enabled: formal OUTFLOW/INFLOW channels with Hill-like food inflow cap")
+    print(f"  hs2014 food supply mode: {food_supply_mode}")
 
 
 if __name__ == "__main__":

@@ -105,7 +105,7 @@ class ExperimentRunner:
             step_dt = remaining if dt is None else min(float(dt), remaining)
             timing_step_start_sim_time = float(state.t)
             timing_step_started_at = perf_counter()
-            result = stepper.step(state, step_dt, context)
+            result = stepper.step(state, step_dt, context) # step所在地
             if timing_enabled:
                 timing_step_elapsed += perf_counter() - timing_step_started_at
                 timing_next_sim_sample_index = _accumulate_simulation_clock_timing(
