@@ -37,10 +37,12 @@ def main() -> None:
         t_end=None if str(args.t_end).lower() in {"none", "null", "inf", "infinity"} else float(args.t_end),
         max_steps=int(args.max_steps),
         max_runtime_seconds=float(args.wall_seconds),
+        food_supply_mode=args.food_supply_mode,
         blended_i1=float(args.blended_i1),
         blended_i2=float(args.blended_i2),
         blended_dt_cle=float(args.blended_dt_cle),
         blended_dt_macro=float(args.blended_dt_macro),
+        blended_beta_compute_mode=str(args.blended_beta_compute_mode),
         pdmp_ode_step=float(args.pdmp_ode_step),
     )
     records = run_comparison(
@@ -62,11 +64,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=SETTINGS.seed)
     parser.add_argument("--t-end", default="none", help="Use 'none' to stop by wall-clock/max-steps.")
     parser.add_argument("--max-steps", type=int, default=SETTINGS.max_steps)
+    parser.add_argument(
+        "--food-supply-mode",
+        choices=("explicit_inflow", "constant", "upper_limit", "none"),
+        default=SETTINGS.food_supply_mode,
+        help="Override food handling for networks that declare food_species.",
+    )
     parser.add_argument("--output-dir", default=str(OUTPUT_DIR))
     parser.add_argument("--blended-i1", type=float, default=SETTINGS.blended_i1)
     parser.add_argument("--blended-i2", type=float, default=SETTINGS.blended_i2)
     parser.add_argument("--blended-dt-cle", type=float, default=SETTINGS.blended_dt_cle)
     parser.add_argument("--blended-dt-macro", type=float, default=SETTINGS.blended_dt_macro)
+    parser.add_argument(
+        "--blended-beta-compute-mode",
+        choices=("beta_fully_compute", "beta_compute_by_state_difference"),
+        default=SETTINGS.blended_beta_compute_mode,
+    )
     parser.add_argument("--pdmp-ode-step", type=float, default=SETTINGS.pdmp_ode_step)
     parser.add_argument("--profile-dir", default=None)
     parser.add_argument("--profile-limit", type=int, default=40)

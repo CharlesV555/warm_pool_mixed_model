@@ -233,13 +233,18 @@ def test_block_vectorized_substrate_saturating_propensities_match_scalar_channel
 
     same_species_channel = network.channel_id(ChannelBlock.LEFT_ADD, int(network.left_add_local_id[a, a]))
     mixed_channel = network.channel_id(ChannelBlock.LEFT_ADD, int(network.left_add_local_id[a, b]))
+    right_channel = network.channel_id(ChannelBlock.RIGHT_ADD, int(network.right_add_local_id[ba, a]))
     network.set_catalytic_strength(same_species_channel, catalyst_sid=ab, strength=0.5, rebuild=False)
-    network.set_catalytic_strength(mixed_channel, catalyst_sid=ba, strength=0.25, rebuild=True)
+    network.set_catalytic_strength(mixed_channel, catalyst_sid=ba, strength=0.25, rebuild=False)
+    network.set_catalytic_strength(right_channel, catalyst_sid=ab, strength=0.75, rebuild=True)
 
     vectorized = network.compute_all_propensities(state)
     scalar = np.asarray([network.compute_propensity(channel_id, state) for channel_id in range(network.n_channels)])
+    subset_channels = np.asarray([mixed_channel, same_species_channel, right_channel], dtype=np.int64)
+    subset = network.compute_propensities_for_channels(subset_channels, state)
 
     assert np.allclose(vectorized, scalar)
+    assert np.allclose(subset, vectorized[subset_channels])
     assert vectorized[same_species_channel] == 0.0
     assert vectorized[mixed_channel] > 0.0
     assert aa in network.get_channel_products(same_species_channel)

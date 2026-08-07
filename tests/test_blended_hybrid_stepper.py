@@ -1,5 +1,6 @@
 import numpy as np
 
+import polymer_sim.simulation.stepper as stepper_module
 from polymer_sim import (
     BlendedHybridConfig,
     BlendedHybridStepper,
@@ -13,7 +14,7 @@ from polymer_sim import (
     build_reaction_rule_tables,
     generate_fixed_species_space,
 )
-from polymer_sim.simulation.stepper import _species_beta
+from polymer_sim.simulation.stepper import _lookup_beta_affected_channels, _species_beta
 
 
 def make_network(initial_count: float = 20.0) -> ReactionNetworkData:
@@ -455,6 +456,333 @@ def test_blended_hybrid_beta_can_use_reactants_only():
     beta = stepper._channel_betas(network, state.x)
 
     assert beta[channel] == 0.0
+
+
+def test_blended_hybrid_beta_reverse_lookup_updates_small_affected_set():
+    class LocalBetaStepper(BlendedHybridStepper):
+        def _beta_local_update_limit(self, n_channels: int) -> int:
+            return int(n_channels)
+
+    network = make_network(initial_count=100.0)
+    x = np.full(network.n_species, 100.0, dtype=float)
+    stepper = LocalBetaStepper(
+        BlendedHybridConfig(
+            i1=10.0,
+            i2=30.0,
+            dt_cle=0.01,
+            beta_compute_mode="beta_compute_by_state_difference",
+        )
+    )
+
+    beta0 = stepper._channel_betas(network, x).copy()
+    assert stepper._last_beta_full_recompute
+
+    sid = network.species_idx("AAA")
+    x_changed = x.copy()
+    x_changed[sid] = 20.0
+    lookup = stepper._channel_beta_lookup(network)
+    affected = _lookup_beta_affected_channels(lookup, np.asarray([sid], dtype=np.int64))
+
+    beta1 = stepper._channel_betas(network, x_changed)
+    expected = BlendedHybridStepper(stepper.config)._channel_betas(network, x_changed)
+
+    assert 0 < affected.size <= stepper._beta_local_update_limit(network.n_channels)
+    assert not stepper._last_beta_full_recompute
+    assert stepper._last_beta_affected_updates == affected.size
+    assert np.allclose(beta1, expected)
+    assert np.any(beta0[affected] != beta1[affected])
+
+
+def test_blended_hybrid_beta_state_difference_local_update_recomputes_only_affected_species(monkeypatch):
+    class LocalBetaStepper(BlendedHybridStepper):
+        def _beta_local_update_limit(self, n_channels: int) -> int:
+            return int(n_channels)
+
+    network = make_network(initial_count=100.0)
+    x = np.full(network.n_species, 100.0, dtype=float)
+    sid = network.species_idx("AAA")
+    x_changed = x.copy()
+    x_changed[sid] = 20.0
+    expected = BlendedHybridStepper(BlendedHybridConfig(i1=10.0, i2=30.0, dt_cle=0.01))._channel_betas(
+        network,
+        x_changed,
+    )
+    stepper = LocalBetaStepper(
+        BlendedHybridConfig(
+            i1=10.0,
+            i2=30.0,
+            dt_cle=0.01,
+            beta_compute_mode="beta_compute_by_state_difference",
+        )
+    )
+
+    calls: list[int] = []
+    original = stepper_module._species_beta_array
+
+    def record_species_beta_array(values: np.ndarray, i1: float, i2: float) -> np.ndarray:
+        calls.append(np.asarray(values).size)
+        return original(values, i1, i2)
+
+    monkeypatch.setattr(stepper_module, "_species_beta_array", record_species_beta_array)
+
+    stepper._channel_betas(network, x)
+    calls.clear()
+    beta = stepper._channel_betas(network, x_changed)
+    lookup = stepper._channel_beta_lookup(network)
+    affected = _lookup_beta_affected_channels(lookup, np.asarray([sid], dtype=np.int64))
+    affected_species = lookup.relevant_species[affected][lookup.relevant_mask[affected]]
+
+    assert not stepper._last_beta_full_recompute
+    assert np.allclose(beta, expected)
+    assert affected_species.size < network.n_species
+    assert calls == [np.unique(affected_species).size]
+
+
+def test_blended_hybrid_beta_reverse_lookup_updates_large_affected_set_when_limit_disabled():
+    space = generate_fixed_species_space(["A", "B"], max_len=5, initial_counts={"A": 100.0, "B": 100.0})
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(space, tables)
+    x = np.full(network.n_species, 100.0, dtype=float)
+    stepper = BlendedHybridStepper(
+        BlendedHybridConfig(
+            i1=10.0,
+            i2=30.0,
+            dt_cle=0.01,
+            beta_compute_mode="beta_compute_by_state_difference",
+        )
+    )
+
+    stepper._channel_betas(network, x)
+    x_changed = x.copy()
+    x_changed[network.species_idx("A")] = 20.0
+    lookup = stepper._channel_beta_lookup(network)
+    affected = _lookup_beta_affected_channels(lookup, np.asarray([network.species_idx("A")], dtype=np.int64))
+
+    beta = stepper._channel_betas(network, x_changed)
+    expected = BlendedHybridStepper(stepper.config)._channel_betas(network, x_changed)
+
+    assert affected.size > stepper._beta_local_update_limit(network.n_channels)
+    if affected.size >= network.n_channels:
+        assert stepper._last_beta_full_recompute
+        assert stepper._last_beta_affected_updates == 0
+    else:
+        assert not stepper._last_beta_full_recompute
+        assert stepper._last_beta_affected_updates == affected.size
+    assert np.allclose(beta, expected)
+
+
+def test_blended_hybrid_beta_fully_compute_skips_local_update_path():
+    class LocalBetaStepper(BlendedHybridStepper):
+        def _beta_local_update_limit(self, n_channels: int) -> int:
+            return int(n_channels)
+
+    network = make_network(initial_count=100.0)
+    x = np.full(network.n_species, 100.0, dtype=float)
+    stepper = LocalBetaStepper(BlendedHybridConfig(i1=10.0, i2=30.0, dt_cle=0.01))
+
+    stepper._channel_betas(network, x)
+    x_changed = x.copy()
+    x_changed[network.species_idx("AAA")] = 20.0
+    beta = stepper._channel_betas(network, x_changed)
+    expected = BlendedHybridStepper(stepper.config)._channel_betas(network, x_changed)
+
+    assert stepper.config.beta_compute_mode == "beta_fully_compute"
+    assert stepper._last_beta_full_recompute
+    assert stepper._last_beta_affected_updates == 0
+    assert np.allclose(beta, expected)
+
+
+def test_blended_hybrid_strict_int_for_cle_uses_rounded_propensities():
+    space = generate_fixed_species_space(["A"], max_len=1, initial_counts={"A": 0.0})
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_poly_left=0.0,
+        k_poly_right=0.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+        k_outflow=10.0,
+        outflow_species_ids=[space.idx("A")],
+    )
+    state = SystemState(t=0.0, x=np.asarray([0.4], dtype=float))
+    stepper = BlendedHybridStepper(
+        BlendedHybridConfig(
+            i1=-2.0,
+            i2=-1.0,
+            dt_cle=0.01,
+            adaptive_cle_dt=False,
+            round_low_counts_after_cle=False,
+            strict_int_for_CLE=True,
+        )
+    )
+
+    result = stepper.step(
+        state,
+        0.01,
+        StepperContext(network=network, rng=np.random.default_rng(31)),
+    )
+
+    assert result.details["mode"] == "cle"
+    assert result.details["total_cle_propensity"] == 0.0
+    assert np.isclose(state.x[0], 0.4)
+
+
+def test_blended_hybrid_strict_int_for_cle_reuses_mixed_jump_propensities():
+    class CountingBlendedHybridStepper(BlendedHybridStepper):
+        def __init__(self, config: BlendedHybridConfig):
+            super().__init__(config)
+            self.propensity_calls = 0
+
+        def _propensities_for_x(self, network, x, t):
+            self.propensity_calls += 1
+            return super()._propensities_for_x(network, x, t)
+
+    space = generate_fixed_species_space(
+        ["A", "B"],
+        max_len=1,
+        initial_counts={"A": 20.0, "B": 20.0},
+    )
+    tables = build_reaction_rule_tables(space)
+    network = ReactionNetworkData.from_species_space(
+        space,
+        tables,
+        k_poly_left=0.0,
+        k_poly_right=0.0,
+        k_frag_left=0.0,
+        k_frag_right=0.0,
+        k_outflow=0.01,
+        outflow_species_ids=[space.idx("A"), space.idx("B")],
+    )
+    state = SystemState.from_x0(network.x0)
+    stepper = CountingBlendedHybridStepper(
+        BlendedHybridConfig(
+            i1=10.0,
+            i2=30.0,
+            dt_cle=1e-6,
+            adaptive_cle_dt=False,
+            strict_int_for_CLE=True,
+        )
+    )
+
+    context = StepperContext(network=network, rng=np.random.default_rng(32))
+
+    result = stepper.step(state, 1e-6, context)
+    assert result.details["mode"] == "mixed_cle"
+    assert stepper.propensity_calls == 1
+
+    result = stepper.step(state, 1e-6, context)
+    assert result.details["mode"] == "mixed_cle"
+    assert stepper.propensity_calls == 1
+
+    state.x[:] = stepper._observed_propensity_state
+    state.x[space.idx("A")] += 1.0
+    result = stepper.step(state, 1e-6, context)
+    assert result.details["mode"] == "mixed_cle"
+    assert np.isclose(result.details["total_jump_propensity"], 0.1945)
+    assert stepper.propensity_calls == 1
+
+
+def test_blended_hybrid_observed_propensity_reuses_beta_affected_sets(monkeypatch):
+    class LocalObservedPropensityStepper(BlendedHybridStepper):
+        def _observed_propensity_local_update_limit(self, n_channels: int) -> int:
+            return int(n_channels)
+
+    network = make_network(initial_count=100.0)
+    x = np.full(network.n_species, 100.0, dtype=float)
+    sid = network.species_idx("AAA")
+    stepper = LocalObservedPropensityStepper(
+        BlendedHybridConfig(
+            i1=10.0,
+            i2=30.0,
+            dt_cle=0.01,
+            strict_int_for_CLE=True,
+            beta_compute_mode="beta_compute_by_state_difference",
+        )
+    )
+
+    stepper._channel_betas(network, x)
+    stepper._propensities_for_observed_cached(network, x, 0.0, "cached propensities")
+
+    x_changed = x.copy()
+    x_changed[sid] = 20.0
+    stepper._channel_betas(network, x_changed)
+    beta_affected_channels = stepper._last_beta_reuse_beta_channels.copy()
+    beta_affected_species = stepper._last_beta_reuse_affected_species.copy()
+    assert beta_affected_channels.size > 0
+    assert beta_affected_species.size > 0
+
+    def fail_affected_channels_for_species(self, species_ids):
+        raise AssertionError("propensity should reuse beta affected channels")
+
+    monkeypatch.setattr(ReactionNetworkData, "affected_channels_for_species", fail_affected_channels_for_species)
+
+    propensities = stepper._propensities_for_observed_cached(network, x_changed, 0.0, "cached propensities")
+    expected = network.compute_all_propensities(SystemState(t=0.0, x=x_changed))
+
+    assert np.allclose(propensities, expected)
+    assert stepper._last_observed_propensity_reused_beta_affected
+    assert stepper._last_observed_propensity_beta_affected_species == beta_affected_species.size
+    assert stepper._last_observed_propensity_beta_affected_channels == beta_affected_channels.size
+    assert stepper._last_observed_propensity_affected_updates == stepper._last_beta_reuse_affected_channels.size
+    assert stepper._last_observed_propensity_update_path == "local_update"
+
+
+def test_blended_hybrid_observed_propensity_reuse_adds_changed_catalyst_channels(monkeypatch):
+    class LocalObservedPropensityStepper(BlendedHybridStepper):
+        def _observed_propensity_local_update_limit(self, n_channels: int) -> int:
+            return int(n_channels)
+
+    network = make_network(initial_count=100.0)
+    source = network.species_idx("A")
+    monomer = network.species_idx("B")
+    product = network.species_idx("AB")
+    catalyst = network.species_idx("AAA")
+    channel = network.channel_id(ChannelBlock.RIGHT_ADD, int(network.right_add_local_id[source, monomer]))
+    network.set_catalytic_strength(channel, catalyst_sid=catalyst, strength=2.0, mirror_reverse=False)
+    x = np.full(network.n_species, 100.0, dtype=float)
+    stepper = LocalObservedPropensityStepper(
+        BlendedHybridConfig(
+            i1=10.0,
+            i2=30.0,
+            dt_cle=0.01,
+            strict_int_for_CLE=True,
+            beta_compute_mode="beta_compute_by_state_difference",
+        )
+    )
+
+    stepper._channel_betas(network, x)
+    stepper._propensities_for_observed_cached(network, x, 0.0, "cached propensities")
+
+    x_changed = x.copy()
+    x_changed[catalyst] = 20.0
+    stepper._channel_betas(network, x_changed)
+    lookup = stepper._channel_beta_lookup(network)
+    beta_affected = _lookup_beta_affected_channels(lookup, np.asarray([catalyst], dtype=np.int64))
+
+    assert channel not in set(int(cid) for cid in beta_affected)
+    assert stepper._last_beta_reuse_extra_channels.size == 0
+    assert stepper._last_beta_reuse_changed_catalyst_species.size == 0
+    assert stepper._last_beta_reuse_catalyst_channels.size == 0
+
+    def fail_affected_channels_for_species(self, species_ids):
+        raise AssertionError("propensity should reuse beta affected channels plus catalyst channels")
+
+    monkeypatch.setattr(ReactionNetworkData, "affected_channels_for_species", fail_affected_channels_for_species)
+
+    propensities = stepper._propensities_for_observed_cached(network, x_changed, 0.0, "cached propensities")
+    expected = network.compute_all_propensities(SystemState(t=0.0, x=x_changed))
+
+    assert np.allclose(propensities, expected)
+    assert propensities[channel] == expected[channel]
+    assert product not in network.get_channel_reactants(channel)
+    assert channel in set(int(cid) for cid in stepper._last_beta_reuse_catalyst_channels)
+    assert channel in set(int(cid) for cid in stepper._last_beta_reuse_extra_channels)
+    assert catalyst in set(int(sid) for sid in stepper._last_beta_reuse_changed_catalyst_species)
+    assert stepper._last_observed_propensity_reused_beta_affected
+    assert stepper._last_observed_propensity_changed_catalyst_species == 1
+    assert stepper._last_observed_propensity_catalyst_affected_channels >= 1
+    assert stepper._last_observed_propensity_beta_extra_channels >= 1
 
 
 def test_blended_hybrid_runner_compatibility():

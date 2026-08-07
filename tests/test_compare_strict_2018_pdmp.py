@@ -4,8 +4,10 @@ from pathlib import Path
 import numpy as np
 
 from polymer_sim import (
+    ChannelBlock,
     ElementaryMassActionNetwork,
     FiniteMarkovScalingPDMPPartitionStrategy,
+    ReactionNetworkData,
     ScalingPDMPConfig,
     SystemState,
 )
@@ -51,6 +53,40 @@ def test_strict_2018_prepares_polymer_network_as_standard_elementary_srn():
     assert metadata["strict_2018_srn"]["expanded_catalysis"] is True
     assert elementary.n_channels >= network.n_channels
     assert np.all(elementary.reaction_order <= 2)
+
+
+def test_compare_constant_food_disables_reactionnetwork_inflow_and_builds_restriction():
+    network, _catalysis_result, spec = common.build_network("linear_cross_len3", food_supply_mode="constant")
+
+    assert isinstance(network, ReactionNetworkData)
+    assert spec.food_supply_mode == "constant"
+    assert network.channel_sizes[ChannelBlock.INFLOW] == 0
+
+    restriction = common.build_compare_food_restriction(network, spec)
+    assert restriction is not None
+
+
+def test_compare_explicit_food_keeps_reactionnetwork_inflow_channels():
+    network, _catalysis_result, spec = common.build_network("linear_cross_len3", food_supply_mode="explicit_inflow")
+
+    assert isinstance(network, ReactionNetworkData)
+    assert spec.food_supply_mode == "explicit_inflow"
+    assert network.channel_sizes[ChannelBlock.INFLOW] == len(spec.food_species)
+    assert common.build_compare_food_restriction(network, spec) is None
+
+
+def test_compare_constant_food_omits_manual_elementary_food_io():
+    network, metadata, spec = common.build_network(
+        "polymer_food_dimer_inhibition_len3",
+        food_supply_mode="constant",
+    )
+
+    assert isinstance(network, ElementaryMassActionNetwork)
+    assert spec.food_supply_mode == "constant"
+    assert metadata["expected_partition"]["explicit_food_inflow_reactions"] is False
+    notes = [str(label.get("note", "")) for label in network.reaction_labels]
+    assert not any(note.startswith("food inflow") or note.startswith("food outflow") for note in notes)
+    assert common.build_compare_food_restriction(network, spec) is not None
 
 
 def test_finite_markov_scaling_partition_accepts_averageable_fast_subnetwork():

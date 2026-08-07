@@ -1298,13 +1298,14 @@ class ReactionNetworkData:
             return factors
 
         x_values = np.asarray(x, dtype=float)
-        for position, local_id in enumerate(local_ids):
-            start = int(row_ptr[int(local_id)])
-            end = int(row_ptr[int(local_id) + 1])
-            if start == end:
-                continue
-            cats = cat_species_ids[start:end]
-            factors[position] += float(np.dot(strengths[start:end], x_values[cats]))
+        positions, entries = self._csr_entries_for_local_ids(row_ptr, local_ids)
+        if entries.size:
+            contribution = np.bincount(
+                positions,
+                weights=strengths[entries] * x_values[cat_species_ids[entries]],
+                minlength=int(local_ids.size),
+            )
+            factors += contribution
         return factors
 
     def _sparse_substrate_saturating_factors(
@@ -1343,26 +1344,60 @@ class ReactionNetworkData:
             factors += contribution
             return factors
 
-        for position, local_id in enumerate(local_ids):
-            cap = float(capacity[position])
-            if cap <= 0.0:
-                continue
-            start = int(row_ptr[int(local_id)])
-            end = int(row_ptr[int(local_id) + 1])
-            if start == end:
-                continue
-            cats = cat_species_ids[start:end]
-            x_c = x_values[cats]
-            denom = self.saturation_alpha * cap + x_c
-            terms = np.zeros(cats.shape, dtype=float)
+        active_positions = np.flatnonzero(np.asarray(capacity, dtype=float) > 0.0)
+        if active_positions.size == 0:
+            return factors
+        active_local_ids = local_ids[active_positions]
+        positions, entries = self._csr_entries_for_local_ids(row_ptr, active_local_ids, active_positions)
+        if entries.size:
+            cap_by_entry = np.asarray(capacity, dtype=float)[positions]
+            x_c = x_values[cat_species_ids[entries]]
+            denom = self.saturation_alpha * cap_by_entry + x_c
+            weights = np.zeros(entries.shape, dtype=float)
             np.divide(
-                strengths[start:end] * cap * x_c,
+                strengths[entries] * cap_by_entry * x_c,
                 denom,
-                out=terms,
+                out=weights,
                 where=denom > 0.0,
             )
-            factors[position] += float(np.sum(terms))
+            contribution = np.bincount(
+                positions,
+                weights=weights,
+                minlength=int(local_ids.size),
+            )
+            factors += contribution
         return factors
+
+    def _csr_entries_for_local_ids(
+        self,
+        row_ptr: np.ndarray,
+        local_ids: np.ndarray,
+        positions: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        ids = np.asarray(local_ids, dtype=np.int64)
+        if ids.size == 0:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+
+        starts = row_ptr[ids]
+        counts = row_ptr[ids + 1] - starts
+        total = int(np.sum(counts))
+        if total <= 0:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+
+        if positions is None:
+            row_positions = np.arange(ids.size, dtype=np.int64)
+        else:
+            row_positions = np.asarray(positions, dtype=np.int64)
+            if row_positions.shape != ids.shape:
+                raise ValueError("positions must match local_ids shape")
+
+        repeated_positions = np.repeat(row_positions, counts)
+        segment_starts = np.repeat(starts, counts)
+        segment_offsets = np.repeat(np.cumsum(counts) - counts, counts)
+        entries = segment_starts + (np.arange(total, dtype=np.int64) - segment_offsets)
+        return repeated_positions, entries
 
     def _substrate_capacity_values(self, block: ChannelBlock, local_ids: np.ndarray, x: np.ndarray) -> np.ndarray:
         if block == ChannelBlock.LEFT_ADD:

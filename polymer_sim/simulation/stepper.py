@@ -6,7 +6,9 @@ import heapq
 from time import perf_counter
 from typing import Any
 
+from line_profiler import profile
 import numpy as np
+from scipy.sparse import csr_matrix
 
 from polymer_sim.core.elementary import ElementaryMassActionNetwork
 from polymer_sim.core.enums import ChannelBlock
@@ -78,6 +80,13 @@ class _FastCLEAdvanceResult:
 class _ChannelBetaLookup:
     relevant_species: np.ndarray
     relevant_mask: np.ndarray
+    species_to_channels_indptr: np.ndarray
+    species_to_channels_indices: np.ndarray
+    propensity_extra_species_to_channels_indptr: np.ndarray
+    propensity_extra_species_to_channels_indices: np.ndarray
+    catalyst_species_mask: np.ndarray
+    catalyst_species_to_channels_indptr: np.ndarray
+    catalyst_species_to_channels_indices: np.ndarray
     n_channels: int
     n_species: int
     mode: str
@@ -173,7 +182,9 @@ class BlendedHybridConfig:
     round_mode: str = "nearest"
     clip_negative: bool = True
     beta_species_mode: str = "reactants_products"
+    beta_compute_mode: str = "beta_fully_compute"
     round_low_counts_after_cle: bool = True
+    strict_int_for_CLE: bool = False
     use_reaction_interval_dt: bool = False
     reaction_interval_update_steps: int = 100
     reaction_interval_scale: float = 1.0
@@ -193,7 +204,9 @@ class BlendedHybridConfig:
         self.clip_negative = bool(self.clip_negative)
         self.use_reaction_interval_dt = bool(self.use_reaction_interval_dt)
         self.beta_species_mode = str(self.beta_species_mode).lower()
+        self.beta_compute_mode = str(self.beta_compute_mode).lower()
         self.round_low_counts_after_cle = bool(self.round_low_counts_after_cle)
+        self.strict_int_for_CLE = bool(self.strict_int_for_CLE)
         self.reaction_interval_update_steps = int(self.reaction_interval_update_steps)
         self.reaction_interval_scale = float(self.reaction_interval_scale)
         self.adaptive_cle_dt = bool(self.adaptive_cle_dt)
@@ -214,6 +227,10 @@ class BlendedHybridConfig:
             raise ValueError("round_mode must be 'nearest', 'floor', or 'ceil'")
         if self.beta_species_mode not in {"reactants", "products", "reactants_products"}:
             raise ValueError("beta_species_mode must be 'reactants', 'products', or 'reactants_products'")
+        if self.beta_compute_mode not in {"beta_fully_compute", "beta_compute_by_state_difference"}:
+            raise ValueError(
+                "beta_compute_mode must be 'beta_fully_compute' or 'beta_compute_by_state_difference'"
+            )
         if self.reaction_interval_update_steps <= 0:
             raise ValueError("reaction_interval_update_steps must be > 0")
         if self.reaction_interval_scale <= 0.0:
@@ -331,11 +348,15 @@ class SSAStepper(BaseStepper):
         threshold = float(rng.random() * total)
         cumulative = 0.0
         chosen = int(selected_channels[-1])
-        for channel_id, propensity in zip(selected_channels, selected_prop):
-            cumulative += float(propensity)
-            if cumulative >= threshold:
-                chosen = int(channel_id)
-                break
+        # for channel_id, propensity in zip(selected_channels, selected_prop):
+        #     cumulative += float(propensity)
+        #     if cumulative >= threshold:
+        #         chosen = int(channel_id)
+        #         break
+        # 这里尝试加速。有效果哦
+        cum = np.cumsum(selected_prop)
+        chosen_idx = np.searchsorted(cum, threshold)
+        chosen = selected_channels[chosen_idx]
 
         changed_species = network.get_channel_changed_species(chosen)
         network.apply_channel_update(state, chosen)
@@ -3130,6 +3151,37 @@ class BlendedHybridStepper(BaseStepper):
         self._reaction_interval_dt: float | None = None
         self._adaptive_dt_cle = self._clamp_cle_dt(self.config.dt_cle)
         self._adaptive_dt_macro = self._clamp_cle_dt(self.config.effective_dt_macro)
+        self._channel_beta_cache: np.ndarray | None = None
+        self._species_beta_cache: np.ndarray | None = None
+        self._channel_beta_state_cache: np.ndarray | None = None
+        self._channel_beta_cache_key: tuple[int, str, float, float, str] | None = None
+        self._last_beta_full_recompute = False
+        self._last_beta_affected_updates = 0
+        self._last_beta_reuse_network_id: int | None = None
+        self._last_beta_reuse_changed_species = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_affected_channels = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_affected_species = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_beta_channels = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_extra_channels = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_changed_catalyst_species = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_catalyst_channels = np.empty(0, dtype=np.int64)
+        self._observed_propensity_cache: np.ndarray | None = None
+        self._observed_propensity_state: np.ndarray | None = None
+        self._observed_propensity_network_id: int | None = None
+        self._last_observed_propensity_full_recompute = False
+        self._last_observed_propensity_affected_updates = 0
+        self._last_observed_propensity_update_path = "not_used"
+        self._last_observed_propensity_reused_beta_affected = False
+        self._last_observed_propensity_beta_affected_species = 0
+        self._last_observed_propensity_beta_affected_channels = 0
+        self._last_observed_propensity_beta_extra_channels = 0
+        self._last_observed_propensity_changed_catalyst_species = 0
+        self._last_observed_propensity_catalyst_affected_channels = 0
+        self._stoich_sparsity_profile = None
+
+    def invalidate_cache(self) -> None:
+        self._invalidate_beta_cache()
+        self._invalidate_observed_propensity_cache()
 
     def step(self, state: SystemState, dt: float, context: StepperContext) -> StepResult:
         if dt <= 0.0:
@@ -3138,15 +3190,16 @@ class BlendedHybridStepper(BaseStepper):
         network = context.network
         self._maybe_update_reaction_interval_dt(network, state) # 自适应dt,默认不开启
         x_float = self._float_nonnegative(state.x) # 返回一个浮点数数组，确保所有元素非负
-        beta = self._channel_betas(network, x_float) # 计算全局的beta，需要审查具体实现
+        observed = self._rounded_nonnegative(x_float) # beta 和 mixed propensity 都基于同一个 rounded observed state
+        beta = self._channel_betas(network, observed) # 根据x计算当前全局的beta，可能存在小数组问题（一个反应可能只涉及1、2、3个物质但要查表）
         beta_min = float(np.min(beta)) if beta.size else 0.0
         beta_max = float(np.max(beta)) if beta.size else 0.0
 
-        if beta_max <= self.config.beta_tol:
+        if beta_max <= self.config.beta_tol: # 1e-12
             return self._pure_cle_step(state, float(dt), context, beta, beta_min, beta_max)
         if beta_min >= 1.0 - self.config.beta_tol:
-            return self._pure_ssa_step(state, float(dt), context, beta_min, beta_max)
-        return self._mixed_step(state, float(dt), context, beta, beta_min, beta_max)
+            return self._pure_ssa_step(state, float(dt), context, beta_min, beta_max, observed=observed)
+        return self._mixed_step(state, float(dt), context, beta, beta_min, beta_max, observed=observed) # 一般走这个路，检查一下
 
     def _pure_cle_step(
         self,
@@ -3186,6 +3239,7 @@ class BlendedHybridStepper(BaseStepper):
                 "stepper_dt": cle.dt,
                 "reaction_interval_dt": self._reaction_interval_dt,
                 "continuous_channel_abs_increments": cle.continuous_abs.copy(),
+                **self._observed_propensity_details(),
                 **self._adaptive_cle_details(cle),
             },
         )
@@ -3197,12 +3251,18 @@ class BlendedHybridStepper(BaseStepper):
         context: StepperContext,
         beta_min: float,
         beta_max: float,
+        *,
+        observed: np.ndarray | None = None,
     ) -> StepResult:
         network = context.network
         duration = min(self._current_dt_macro(), dt)
-        observed = self._rounded_nonnegative(state.x)
-        propensities = self._propensities_for_x(network, observed, state.t)
-        propensities = self._clean_propensities(propensities, "jump propensities")
+        observed = self._rounded_nonnegative(state.x) if observed is None else np.asarray(observed, dtype=float)
+        if self.config.strict_int_for_CLE:
+            propensities = self._propensities_for_observed_cached(network, observed, state.t, "jump propensities")
+        else:
+            self._last_observed_propensity_update_path = "full_uncached"
+            propensities = self._propensities_for_x(network, observed, state.t)
+            propensities = self._clean_propensities(propensities, "jump propensities")
         total = float(np.sum(propensities))
         state.x[:] = observed
 
@@ -3217,6 +3277,7 @@ class BlendedHybridStepper(BaseStepper):
             "n_low_count_rounded": 0,
             "stepper_dt": duration,
             "reaction_interval_dt": self._reaction_interval_dt,
+            **self._observed_propensity_details(),
         }
         if total <= 0.0:
             state.t += duration
@@ -3260,28 +3321,34 @@ class BlendedHybridStepper(BaseStepper):
         beta: np.ndarray,
         beta_min: float,
         beta_max: float,
+        *,
+        observed: np.ndarray | None = None,
     ) -> StepResult:
         network = context.network
         duration = min(self._current_dt_cle(), dt)
-        observed = self._rounded_nonnegative(state.x)
-        base_jump = self._propensities_for_x(network, observed, state.t)
-        base_jump = self._clean_propensities(base_jump, "jump propensities")
-        lambda_jump = self._clean_propensities(beta * base_jump, "split jump propensities")
+        observed = self._rounded_nonnegative(state.x) if observed is None else np.asarray(observed, dtype=float) # 若没有传入rounded，现场做。
+        if self.config.strict_int_for_CLE: # 采取共享propensity
+            base_jump = self._propensities_for_observed_cached(network, observed, state.t, "jump propensities") # 第一次计算propensity
+        else:
+            self._last_observed_propensity_update_path = "full_uncached"
+            base_jump = self._propensities_for_x(network, observed, state.t) # 耗时大头
+            base_jump = self._clean_propensities(base_jump, "jump propensities") # 把负数换成0
+        lambda_jump = self._clean_propensities(beta * base_jump, "split jump propensities (beta or propensity may be negative)") # 这里是全量beta*propensity,能否结合“改变的mask”来减少？
         total_jump = float(np.sum(lambda_jump))
 
         tau = float("inf")
         sampled_channel: int | None = None
         if total_jump > 0.0:
             tau = float(context.rng.exponential(1.0 / total_jump))
-            sampled_channel = _sample_channel(
+            sampled_channel = _sample_channel( # 确定离散通道发生的反应 耗时项
                 np.arange(network.n_channels, dtype=np.int64),
-                lambda_jump,
+                lambda_jump, # 乘上beta的propensity就得到了离散通道
                 total_jump,
                 context.rng,
             )
 
-        if tau < duration and sampled_channel is not None:
-            cle = self._adaptive_cle_increment(
+        if tau < duration and sampled_channel is not None: # 如果采样的tau小于duration,说明有离散事件发生
+            cle = self._adaptive_cle_increment( # 这里的x会内部进行round,检查后续是否需要，如果不需要就删掉
                 network,
                 state.x,
                 beta,
@@ -3289,9 +3356,10 @@ class BlendedHybridStepper(BaseStepper):
                 context.rng,
                 kind="cle",
                 grow_on_success=False,
+                base_propensities=base_jump if self.config.strict_int_for_CLE else None,
             )
             state.x[:] = cle.x
-            if cle.dt < tau - self.config.beta_tol or cle.rejected_attempts > 0:
+            if cle.dt < tau - self.config.beta_tol or cle.rejected_attempts > 0: # 在离散通道预计发生反应之前，CLE通道出事
                 state.t += cle.dt
                 state.step_count += 1
                 return StepResult(
@@ -3314,10 +3382,11 @@ class BlendedHybridStepper(BaseStepper):
                         "scheduled_tau": float(tau),
                         "scheduled_discrete_event_deferred": True,
                         "continuous_channel_abs_increments": cle.continuous_abs.copy(),
+                        **self._observed_propensity_details(),
                         **self._adaptive_cle_details(cle),
                     },
                 )
-
+            #正常得到CLE结果后
             applied = self._apply_jump_safely(network, state.x, sampled_channel)
             state.t += tau
             state.step_count += 1
@@ -3342,10 +3411,11 @@ class BlendedHybridStepper(BaseStepper):
                     "reaction_interval_dt": self._reaction_interval_dt,
                     "invalid_jump_skipped": not applied,
                     "continuous_channel_abs_increments": cle.continuous_abs.copy(),
+                    **self._observed_propensity_details(),
                     **self._adaptive_cle_details(cle),
                 },
             )
-
+        # 如果没有离散事件发生
         cle = self._adaptive_cle_increment(
             network,
             state.x,
@@ -3354,6 +3424,7 @@ class BlendedHybridStepper(BaseStepper):
             context.rng,
             kind="cle",
             grow_on_success=True,
+            base_propensities=base_jump if self.config.strict_int_for_CLE else None,
         )
         state.x[:] = cle.x
         state.t += cle.dt
@@ -3375,10 +3446,12 @@ class BlendedHybridStepper(BaseStepper):
                 "stepper_dt": cle.dt,
                 "reaction_interval_dt": self._reaction_interval_dt,
                 "continuous_channel_abs_increments": cle.continuous_abs.copy(),
+                **self._observed_propensity_details(),
                 **self._adaptive_cle_details(cle),
             },
         )
-
+        
+    @profile
     def _cle_increment(
         self,
         network: ReactionNetworkData,
@@ -3386,6 +3459,8 @@ class BlendedHybridStepper(BaseStepper):
         beta: np.ndarray,
         dt: float,
         rng: np.random.Generator,
+        *,
+        base_propensities: np.ndarray | None = None,
     ) -> np.ndarray:
         if dt <= 0.0:
             self._last_n_clipped = 0
@@ -3395,16 +3470,62 @@ class BlendedHybridStepper(BaseStepper):
             return self._float_nonnegative(x_float)
 
         self._last_n_low_count_rounded = 0
-        x0 = self._float_nonnegative(x_float)
-        prop = self._propensities_for_x(network, x0, 0.0)
-        prop = self._clean_propensities(prop, "CLE propensities")
-        prop_cle = self._clean_propensities((1.0 - beta) * prop, "split CLE propensities")
+        x0 = self._float_nonnegative(x_float) # 又来一次
+        if base_propensities is None: # 如果没有传入缓存的propensity
+            propensity_state = self._rounded_nonnegative(x0) if self.config.strict_int_for_CLE else x0
+            if self.config.strict_int_for_CLE:
+                prop = self._propensities_for_observed_cached(network, propensity_state, 0.0, "CLE propensities")
+            else:
+                self._last_observed_propensity_update_path = "full_uncached"
+                prop = self._propensities_for_x(network, propensity_state, 0.0) # 耗时项
+                prop = self._clean_propensities(prop, "CLE propensities")
+        else: # 有propensity缓存就直接用，还是已经检查过non_negative的
+            prop = np.asarray(base_propensities, dtype=float)
+            if prop.shape != (network.n_channels,):
+                raise ValueError(f"base_propensities must have shape ({network.n_channels},)")
+
+        prop_cle = self._clean_propensities((1.0 - beta) * prop, "split CLE propensities") # 连续通道propensity
         self._last_total_cle_propensity = float(np.sum(prop_cle))
 
+        # 具体计算CLE
         means = prop_cle * float(dt)
         amounts = means + np.sqrt(np.maximum(means, 0.0)) * rng.normal(size=network.n_channels)
         self._last_continuous_channel_abs_increments = np.abs(amounts).astype(float, copy=False)
-        increment = amounts @ self._stoichiometry_matrix(network)
+        
+        S = self._stoichiometry_matrix(network)
+        ### 测试函数
+        
+
+        # # ---- sparsity profiling ----
+        # if not hasattr(self, "_stoich_sparsity_profile"):
+        #     nnz = np.count_nonzero(S)
+        #     total = S.size
+            
+        #     self._stoich_sparsity_profile = {
+        #         "n_reactions": S.shape[0],
+        #         "n_species": S.shape[1],
+        #         "matrix_size": total,
+        #         "nnz": nnz,
+        #         "density": nnz / total,
+        #         "sparsity": 1 - nnz / total,
+        #     }
+
+        increment = amounts @ S
+        ### 测试函数结束
+        
+        # increment = amounts @ self._stoichiometry_matrix(network) # 如何优化？
+        #尝试1：自动转化为稀疏矩阵，并采取切片更新
+        # S = csr_matrix(S)
+        # # increment = amounts @ S
+        # cle_mask = beta < 1
+
+        # amounts_cle = amounts[cle_mask]
+
+        # S_cle = S[cle_mask,:]
+
+        # increment = amounts_cle @ S_cle
+        
+        
         x_new = x0 + increment
         if not np.all(np.isfinite(x_new)):
             raise ValueError("CLE increment produced NaN or inf state values")
@@ -3419,7 +3540,7 @@ class BlendedHybridStepper(BaseStepper):
             x_new = self._round_low_count_changed_species(x_new, increment)
         return x_new
 
-    def _adaptive_cle_increment(
+    def _adaptive_cle_increment( # 推进CLE到指定时间的核心函数，返回一个 _AdaptiveCLEResult 对象
         self,
         network: ReactionNetworkData,
         x_float: np.ndarray,
@@ -3429,10 +3550,18 @@ class BlendedHybridStepper(BaseStepper):
         *,
         kind: str,
         grow_on_success: bool,
+        base_propensities: np.ndarray | None = None,
     ) -> _AdaptiveCLEResult:
         requested = max(float(requested_dt), 0.0)
         if requested <= 0.0:
-            x_new = self._cle_increment(network, x_float, beta, 0.0, rng)
+            x_new = self._cle_increment(
+                network,
+                x_float,
+                beta,
+                0.0,
+                rng,
+                base_propensities=base_propensities,
+            )
             return _AdaptiveCLEResult(
                 x=x_new,
                 continuous_abs=self._last_continuous_channel_abs_increments.copy(),
@@ -3446,8 +3575,15 @@ class BlendedHybridStepper(BaseStepper):
                 min_dt_reached=False,
             )
 
-        if not self.config.adaptive_cle_dt:
-            x_new = self._cle_increment(network, x_float, beta, requested, rng)
+        if not self.config.adaptive_cle_dt: # True时会重试
+            x_new = self._cle_increment(
+                network,
+                x_float,
+                beta,
+                requested,
+                rng,
+                base_propensities=base_propensities,
+            )
             return _AdaptiveCLEResult(
                 x=x_new,
                 continuous_abs=self._last_continuous_channel_abs_increments.copy(),
@@ -3466,7 +3602,14 @@ class BlendedHybridStepper(BaseStepper):
         rejected = 0
 
         while True:
-            x_new = self._cle_increment(network, x_float, beta, attempt_dt, rng)
+            x_new = self._cle_increment(
+                network,
+                x_float,
+                beta,
+                attempt_dt,
+                rng,
+                base_propensities=base_propensities,
+            )
             n_clipped = int(self._last_n_clipped)
             n_low_count_rounded = int(self._last_n_low_count_rounded)
             total_cle_propensity = float(self._last_total_cle_propensity)
@@ -3518,7 +3661,9 @@ class BlendedHybridStepper(BaseStepper):
         }
 
     def _channel_betas(self, network: ReactionNetworkData, x: np.ndarray) -> np.ndarray:
-        lookup = self._channel_beta_lookup(network)
+        # lookup 是拓扑缓存：记录 channel -> relevant species，以及反向的 species -> affected beta channels。
+        # 它只依赖 network 和 beta_species_mode，不依赖当前 state.x。
+        lookup = self._channel_beta_lookup(network) # 获得映射关系：每个 reaction/channel 应该看哪些 species 来算 beta
         if lookup.n_channels == 0 or lookup.relevant_species.shape[1] == 0:
             return np.zeros(lookup.n_channels, dtype=float)
 
@@ -3526,10 +3671,121 @@ class BlendedHybridStepper(BaseStepper):
         if values.shape[0] < lookup.n_species:
             raise ValueError("state has fewer species than the reaction network")
 
-        species_beta = _species_beta_array(values[: lookup.n_species], self.config.i1, self.config.i2)
-        relevant_beta = species_beta[lookup.relevant_species]
-        relevant_beta *= lookup.relevant_mask 
-        return np.max(relevant_beta, axis=1)
+        # 数值缓存的 key 必须包含 network、beta 选择模式和阈值；阈值变了，旧 beta 缓存就无效。
+        cache_key = self._beta_cache_key(network, lookup)
+        beta_state = values[: lookup.n_species] # 只取前 n_species 个元素，避免 state.x 里有多余的元素，这里的beta_state其实是rounded_x_state
+
+        if self.config.beta_compute_mode == "beta_fully_compute":
+            # 全量模式：直接由当前 state 计算全量 species beta 和 channel beta。
+            # 既然已经全量计算，就不再在全量结果上叠加局部更新判断。
+            species_beta = _species_beta_array(beta_state, self.config.i1, self.config.i2) # 根据提供的state计算每个 species 的 beta
+            return self._recompute_channel_beta_cache(lookup, species_beta, cache_key, beta_state=beta_state)
+        # beta_compute_by_state_difference 模式：先看 rounded observed state 哪些 species 变了，
+        # 再把 changed species 交给局部 beta 更新路径处理。
+        if not self._channel_beta_cache_matches(lookup, cache_key):
+            return self._recompute_channel_beta_cache_for_state(lookup, beta_state, cache_key)
+        return self._channel_betas_by_state_difference(lookup, beta_state, cache_key)
+
+    def _channel_betas_by_state_difference( # state cache 差异检测
+        self,
+        lookup: _ChannelBetaLookup,
+        beta_state: np.ndarray,
+        cache_key: tuple[int, str, float, float, str],
+    ) -> np.ndarray:
+        # state-difference 模式这里只负责比较当前 state 与上一次 state cache。
+        cached_state = self._channel_beta_state_cache # 这里的beta_state也是缓存的rounded state
+        cached_channel_beta = self._channel_beta_cache
+        if cached_state is None or cached_channel_beta is None:
+            # 防御性分支：理论上 _channel_beta_cache_matches 已经排除了 None。
+            raise RuntimeError("channel beta state cache is not initialized")
+
+        # 这里比较的是提前 round 后的 state，因此不会被 CLE 的微小浮点扰动放大。
+        # species_changed_mask 只表达 state/species 是否改变，不再先算 beta_changed_mask。
+        species_changed_mask = beta_state != cached_state # 这里的beta_state其实是rounded state
+        changed_state_species = np.flatnonzero(species_changed_mask)
+        if changed_state_species.size == 0:
+            self._last_beta_full_recompute = False
+            self._last_beta_affected_updates = 0
+            self._clear_beta_reuse_hint()
+            return cached_channel_beta
+
+        return self._update_channel_beta_cache_for_changed_species(
+            lookup,
+            beta_state,
+            cache_key,
+            changed_state_species,
+        )
+
+    def _recompute_channel_beta_cache_for_state(
+        self,
+        lookup: _ChannelBetaLookup,
+        beta_state: np.ndarray,
+        cache_key: tuple[int, str, float, float, str],
+    ) -> np.ndarray:
+        species_beta = _species_beta_array(beta_state, self.config.i1, self.config.i2)
+        return self._recompute_channel_beta_cache(lookup, species_beta, cache_key, beta_state=beta_state)
+
+    def _update_channel_beta_cache_for_changed_species(
+        self,
+        lookup: _ChannelBetaLookup,
+        beta_state: np.ndarray,
+        cache_key: tuple[int, str, float, float, str],
+        changed_state_species: np.ndarray,
+    ) -> np.ndarray:
+        cached_state = self._channel_beta_state_cache
+        cached_species_beta = self._species_beta_cache # 只是引用
+        cached_channel_beta = self._channel_beta_cache
+        if cached_state is None or cached_species_beta is None or cached_channel_beta is None:
+            # 防御性分支：理论上 _channel_beta_cache_matches 已经排除了 None。
+            return self._recompute_channel_beta_cache_for_state(lookup, beta_state, cache_key)
+
+        # 先从 state 变化出发，通过 reverse mapping 找出这些 species 会影响哪些 channel 的 beta。
+        # 这里查到的是 changed_species_channels，不是 beta 本身。
+        changed_species_channels = _lookup_beta_affected_channels(lookup, changed_state_species)
+
+        if changed_species_channels.size == 0:
+            # 这些 species 不参与任何 channel beta；species beta 缓存无需更新。
+            cached_state[changed_state_species] = beta_state[changed_state_species]
+            self._last_beta_full_recompute = False
+            self._last_beta_affected_updates = 0
+            self._set_beta_reuse_hint(
+                cache_key,
+                changed_state_species,
+                changed_species_channels,
+                np.empty(0, dtype=np.int64),
+            )
+            return cached_channel_beta
+        if (
+            changed_species_channels.size >= lookup.n_channels
+            # or changed_species_channels.size > self._beta_local_update_limit(lookup.n_channels) # 暂时不开启限制，直接看局部更新会有多耗时
+        ):
+            # beta 全量计算很便宜；affected 过大或当前规模禁用局部更新时，full recompute 更稳。
+            return self._recompute_channel_beta_cache_for_state(lookup, beta_state, cache_key)
+
+        # 只有 very small affected set 才局部更新 channel beta。
+        # 通过 changed_species_channels 的 relevant species 得到 affected_species，再只重算这些 species beta。
+        affected_species = _lookup_beta_relevant_species_for_channels(lookup, changed_species_channels)
+        if affected_species.size != 0:
+            cached_species_beta[affected_species] = _species_beta_array(
+                beta_state[affected_species],
+                self.config.i1,
+                self.config.i2,
+            )
+        cached_channel_beta[changed_species_channels] = self._compute_channel_betas_for_channels(
+            lookup,
+            cached_species_beta,
+            changed_species_channels,
+        )
+        cached_state[changed_state_species] = beta_state[changed_state_species]
+        self._last_beta_full_recompute = False
+        self._last_beta_affected_updates = int(changed_species_channels.size)
+        self._set_beta_reuse_hint(
+            cache_key,
+            changed_state_species,
+            changed_species_channels,
+            affected_species,
+        )
+        return cached_channel_beta
 
     def _channel_beta_lookup(self, network: ReactionNetworkData) -> _ChannelBetaLookup:
         mode = self.config.beta_species_mode # β计算引入哪些模式
@@ -3546,6 +3802,128 @@ class BlendedHybridStepper(BaseStepper):
         lookup = _build_channel_beta_lookup(network, mode) # 这里是一个缓存表，如果上面cached不存在就会计算
         self._beta_lookup_cache[key] = lookup
         return lookup
+
+    def _invalidate_beta_cache(self) -> None:
+        # 清数值缓存；不清 _beta_lookup_cache，因为 lookup 是 network 拓扑缓存。
+        self._channel_beta_cache = None
+        self._species_beta_cache = None
+        self._channel_beta_state_cache = None
+        self._channel_beta_cache_key = None
+        self._last_beta_full_recompute = False
+        self._last_beta_affected_updates = 0
+        self._clear_beta_reuse_hint()
+
+    def _clear_beta_reuse_hint(self) -> None:
+        self._last_beta_reuse_network_id = None
+        self._last_beta_reuse_changed_species = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_affected_channels = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_affected_species = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_beta_channels = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_extra_channels = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_changed_catalyst_species = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_catalyst_channels = np.empty(0, dtype=np.int64)
+
+    def _set_beta_reuse_hint(
+        self,
+        cache_key: tuple[int, str, float, float, str],
+        changed_species: np.ndarray,
+        beta_channels: np.ndarray,
+        affected_species: np.ndarray,
+    ) -> None:
+        # 这个 hint 只给同一次 step 里随后的 observed propensity 局部更新复用。
+        # beta 路径只记录它已经算出的 changed species、beta affected channels 和相关 species。
+        # propensity-only extra/catalyst channels 延后到 observed propensity 局部更新真正命中时再查。
+        self._last_beta_reuse_network_id = int(cache_key[0])
+        self._last_beta_reuse_changed_species = np.array(changed_species, dtype=np.int64, copy=True)
+        self._last_beta_reuse_affected_channels = np.array(beta_channels, dtype=np.int64, copy=True)
+        self._last_beta_reuse_affected_species = np.array(affected_species, dtype=np.int64, copy=True)
+        self._last_beta_reuse_beta_channels = np.array(beta_channels, dtype=np.int64, copy=True)
+        self._last_beta_reuse_extra_channels = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_changed_catalyst_species = np.empty(0, dtype=np.int64)
+        self._last_beta_reuse_catalyst_channels = np.empty(0, dtype=np.int64)
+
+    def _beta_cache_key(
+        self,
+        network: ReactionNetworkData,
+        lookup: _ChannelBetaLookup,
+    ) -> tuple[int, str, float, float, str]:
+        return (
+            id(network),
+            lookup.mode,
+            float(self.config.i1),
+            float(self.config.i2),
+            str(self.config.beta_compute_mode),
+        )
+
+    def _channel_beta_cache_matches(
+        self,
+        lookup: _ChannelBetaLookup,
+        cache_key: tuple[int, str, float, float, str],
+    ) -> bool:
+        # 数值缓存必须同时匹配 key 和数组形状；shape 检查防止同 id 对象被重建/替换后误用旧缓存。
+        return (
+            self._channel_beta_cache is not None
+            and self._species_beta_cache is not None
+            and self._channel_beta_state_cache is not None
+            and self._channel_beta_cache_key == cache_key
+            and self._channel_beta_cache.shape == (lookup.n_channels,)
+            and self._species_beta_cache.shape == (lookup.n_species,)
+            and self._channel_beta_state_cache.shape == (lookup.n_species,)
+        )
+
+    def _recompute_channel_beta_cache(
+        self,
+        lookup: _ChannelBetaLookup,
+        species_beta: np.ndarray,
+        cache_key: tuple[int, str, float, float, str],
+        *,
+        beta_state: np.ndarray | None = None,
+    ) -> np.ndarray:
+        # 全量路径：先由 species_beta 查表得到每个 channel 的 beta，再安装为当前数值缓存。
+        beta = self._compute_channel_betas_from_species_beta(lookup, species_beta)
+        self._channel_beta_cache = beta
+        self._species_beta_cache = np.array(species_beta, dtype=float, copy=True)
+        if beta_state is None:
+            self._channel_beta_state_cache = None
+        else:
+            self._channel_beta_state_cache = np.array(beta_state[: lookup.n_species], dtype=float, copy=True)
+        self._channel_beta_cache_key = cache_key
+        self._last_beta_full_recompute = True
+        self._last_beta_affected_updates = 0
+        self._clear_beta_reuse_hint()
+        return beta
+
+    def _compute_channel_betas_from_species_beta( # 在propensity大头解决之前都不需要考虑这里的小数组问题
+        self,
+        lookup: _ChannelBetaLookup,
+        species_beta: np.ndarray,
+    ) -> np.ndarray:
+        if lookup.relevant_species.shape[1] == 0:
+            return np.zeros(lookup.n_channels, dtype=float)
+        relevant_beta = species_beta[lookup.relevant_species] # 查表
+        relevant_beta *= lookup.relevant_mask
+        return np.max(relevant_beta, axis=1) # 只看最可能需要SSA的物种的beta
+
+    def _compute_channel_betas_for_channels(
+        self,
+        lookup: _ChannelBetaLookup,
+        species_beta: np.ndarray,
+        channels: np.ndarray,
+    ) -> np.ndarray:
+        affected = np.asarray(channels, dtype=np.int64)
+        if affected.size == 0:
+            return np.empty(0, dtype=float)
+        relevant_beta = species_beta[lookup.relevant_species[affected]]
+        relevant_beta *= lookup.relevant_mask[affected]
+        return np.max(relevant_beta, axis=1)
+
+    def _beta_local_update_limit(self, n_channels: int) -> int:
+        # beta 的全量计算通常只是小矩阵 gather/max，比局部维护还便宜。
+        # 小网络默认禁用 beta 局部更新；大网络只允许极小 affected set 走局部路径。
+        count = int(n_channels)
+        if count < 1024:
+            return 0
+        return max(8, min(128, int(0.05 * count)))
 
     def _stoichiometry_matrix(self, network: ReactionNetworkData) -> np.ndarray:
         key = id(network)
@@ -3592,6 +3970,186 @@ class BlendedHybridStepper(BaseStepper):
 
     def _propensities_for_x(self, network: ReactionNetworkData, x: np.ndarray, t: float) -> np.ndarray:
         return network.compute_all_propensities(SystemState(t=float(t), x=np.asarray(x, dtype=float)))
+
+    def _invalidate_observed_propensity_cache(self) -> None:
+        self._observed_propensity_cache = None
+        self._observed_propensity_state = None
+        self._observed_propensity_network_id = None
+        self._last_observed_propensity_full_recompute = False
+        self._last_observed_propensity_affected_updates = 0
+        self._last_observed_propensity_update_path = "not_used"
+        self._last_observed_propensity_reused_beta_affected = False
+        self._last_observed_propensity_beta_affected_species = 0
+        self._last_observed_propensity_beta_affected_channels = 0
+        self._last_observed_propensity_beta_extra_channels = 0
+        self._last_observed_propensity_changed_catalyst_species = 0
+        self._last_observed_propensity_catalyst_affected_channels = 0
+
+    def _propensities_for_observed_cached(
+        self,
+        network: ReactionNetworkData,
+        observed: np.ndarray,
+        t: float,
+        name: str,
+    ) -> np.ndarray:
+        values = np.asarray(observed, dtype=float)
+        if values.ndim != 1:
+            raise ValueError("observed state must be a 1D array")
+
+        n_species = int(network.n_species)
+        n_channels = int(network.n_channels)
+        if values.shape[0] < n_species:
+            raise ValueError("observed state has fewer species than the reaction network")
+
+        self._last_observed_propensity_reused_beta_affected = False
+        self._last_observed_propensity_beta_affected_species = 0
+        self._last_observed_propensity_beta_affected_channels = 0
+        self._last_observed_propensity_beta_extra_channels = 0
+        self._last_observed_propensity_changed_catalyst_species = 0
+        self._last_observed_propensity_catalyst_affected_channels = 0
+        if not self._observed_propensity_cache_matches(network): # 第一次计算会走这个路初始化propensity
+            return self._recompute_observed_propensity_cache(network, values, t, name)
+
+        cached_state = self._observed_propensity_state
+        cached_propensities = self._observed_propensity_cache
+        if cached_state is None or cached_propensities is None:
+            return self._recompute_observed_propensity_cache(network, values, t, name)
+
+        changed_species = np.flatnonzero(values[:n_species] != cached_state) # 对比存下来的缓存和传入的state是否一致
+        if changed_species.size == 0:
+            self._last_observed_propensity_full_recompute = False
+            self._last_observed_propensity_affected_updates = 0
+            self._last_observed_propensity_update_path = "cache_hit"
+            return cached_propensities
+
+        affected = self._observed_propensity_affected_channels_from_beta_hint(network, changed_species)
+        if affected is None:
+            if not (
+                hasattr(network, "affected_channels_for_species")
+                and hasattr(network, "compute_propensities_for_channels")
+            ):
+                return self._recompute_observed_propensity_cache(network, values, t, name)
+
+            try:
+                affected = np.asarray(network.affected_channels_for_species(changed_species), dtype=np.int64)
+            except Exception:
+                return self._recompute_observed_propensity_cache(network, values, t, name)
+        elif not hasattr(network, "compute_propensities_for_channels"):
+            return self._recompute_observed_propensity_cache(network, values, t, name)
+
+        if affected.size == 0:
+            cached_state[:] = values[:n_species]
+            self._last_observed_propensity_full_recompute = False
+            self._last_observed_propensity_affected_updates = 0
+            self._last_observed_propensity_update_path = "no_affected_channels"
+            return cached_propensities
+        if affected.size >= n_channels or affected.size > self._observed_propensity_local_update_limit(n_channels):
+            return self._recompute_observed_propensity_cache(network, values, t, name)
+
+        updated = network.compute_propensities_for_channels(affected, SystemState(t=float(t), x=values))
+        cached_propensities[affected] = self._clean_propensities(updated, name) # 如果不同，更新缓存
+        cached_state[:] = values[:n_species]
+        self._last_observed_propensity_full_recompute = False
+        self._last_observed_propensity_affected_updates = int(affected.size)
+        self._last_observed_propensity_update_path = "local_update"
+        return cached_propensities
+
+    def _observed_propensity_local_update_limit(self, n_channels: int) -> int:
+        return max(8, min(32, int(0.10 * int(n_channels))))
+
+    def _observed_propensity_details(self) -> dict[str, Any]:
+        return {
+            "observed_propensity_update_path": str(self._last_observed_propensity_update_path),
+            "observed_propensity_full_recompute": bool(self._last_observed_propensity_full_recompute),
+            "observed_propensity_affected_updates": int(self._last_observed_propensity_affected_updates),
+            "observed_propensity_reused_beta_affected": bool(
+                self._last_observed_propensity_reused_beta_affected
+            ),
+            "observed_propensity_beta_affected_species": int(
+                self._last_observed_propensity_beta_affected_species
+            ),
+            "observed_propensity_beta_affected_channels": int(
+                self._last_observed_propensity_beta_affected_channels
+            ),
+            "observed_propensity_beta_extra_channels": int(
+                self._last_observed_propensity_beta_extra_channels
+            ),
+            "observed_propensity_changed_catalyst_species": int(
+                self._last_observed_propensity_changed_catalyst_species
+            ),
+            "observed_propensity_catalyst_affected_channels": int(
+                self._last_observed_propensity_catalyst_affected_channels
+            ),
+        }
+
+    def _observed_propensity_affected_channels_from_beta_hint(
+        self,
+        network: ReactionNetworkData,
+        changed_species: np.ndarray,
+    ) -> np.ndarray | None:
+        if self.config.beta_compute_mode != "beta_compute_by_state_difference":
+            return None
+        if self._last_beta_reuse_network_id != id(network):
+            return None
+        species = np.asarray(changed_species, dtype=np.int64)
+        if not np.array_equal(species, self._last_beta_reuse_changed_species):
+            return None
+        lookup = self._channel_beta_lookup(network)
+        # 下面这些查找只服务于 propensity 局部更新，因此不能放在 beta 更新热路径里。
+        beta_channels = np.asarray(self._last_beta_reuse_beta_channels, dtype=np.int64)
+        dependency_extra_channels = _lookup_beta_propensity_extra_affected_channels(lookup, species)
+        changed_catalyst_species = _lookup_beta_changed_catalyst_species(lookup, species)
+        catalyst_channels = _lookup_beta_catalyst_affected_channels(lookup, changed_catalyst_species)
+        extra_channels = _union_int_arrays(dependency_extra_channels, catalyst_channels)
+        affected_channels = _union_int_arrays(beta_channels, extra_channels)
+
+        self._last_beta_reuse_affected_channels = np.array(affected_channels, dtype=np.int64, copy=True)
+        self._last_beta_reuse_extra_channels = np.array(extra_channels, dtype=np.int64, copy=True)
+        self._last_beta_reuse_changed_catalyst_species = np.array(
+            changed_catalyst_species,
+            dtype=np.int64,
+            copy=True,
+        )
+        self._last_beta_reuse_catalyst_channels = np.array(catalyst_channels, dtype=np.int64, copy=True)
+        self._last_observed_propensity_reused_beta_affected = True
+        self._last_observed_propensity_beta_affected_species = int(self._last_beta_reuse_affected_species.size)
+        self._last_observed_propensity_beta_affected_channels = int(beta_channels.size)
+        self._last_observed_propensity_beta_extra_channels = int(extra_channels.size)
+        self._last_observed_propensity_changed_catalyst_species = int(changed_catalyst_species.size)
+        self._last_observed_propensity_catalyst_affected_channels = int(catalyst_channels.size)
+        return affected_channels
+
+    def _observed_propensity_cache_matches(self, network: ReactionNetworkData) -> bool:
+        return (
+            self._observed_propensity_cache is not None
+            and self._observed_propensity_state is not None
+            and self._observed_propensity_network_id == id(network)
+            and self._observed_propensity_cache.shape == (int(network.n_channels),)
+            and self._observed_propensity_state.shape == (int(network.n_species),)
+        )
+
+    def _recompute_observed_propensity_cache(
+        self,
+        network: ReactionNetworkData,
+        observed: np.ndarray,
+        t: float,
+        name: str,
+    ) -> np.ndarray:
+        propensities = self._propensities_for_x(network, observed, t)
+        propensities = self._clean_propensities(propensities, name)
+        self._observed_propensity_cache = propensities
+        self._observed_propensity_state = np.array(observed[: int(network.n_species)], dtype=float, copy=True)
+        self._observed_propensity_network_id = id(network)
+        self._last_observed_propensity_full_recompute = True
+        self._last_observed_propensity_affected_updates = 0
+        self._last_observed_propensity_update_path = "full_recompute"
+        self._last_observed_propensity_reused_beta_affected = False
+        self._last_observed_propensity_beta_affected_species = 0
+        self._last_observed_propensity_beta_affected_channels = 0
+        self._last_observed_propensity_beta_extra_channels = 0
+        self._last_observed_propensity_changed_catalyst_species = 0
+        self._last_observed_propensity_catalyst_affected_channels = 0
+        return propensities
 
     def _clean_propensities(self, propensities: np.ndarray, name: str) -> np.ndarray:
         values = np.asarray(propensities, dtype=float)
@@ -3678,6 +4236,9 @@ class BlendedHybridStepper(BaseStepper):
         if self.config.cle_dt_max is not None:
             dt = min(dt, self.config.cle_dt_max)
         return dt
+    
+    def print_matrix_info(self):
+        print(self._stoich_sparsity_profile)
 
 
 class NRMBlendedHybridStepper(BlendedHybridStepper):
@@ -3705,6 +4266,11 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
         self.nrm_config = nrm_config or OptimizedNRMConfig()
         self._nrm = OptimizedNRMStepper(self.nrm_config)
 
+    def invalidate_cache(self) -> None:
+        super().invalidate_cache()
+        if hasattr(self, "_nrm"):
+            self._nrm.invalidate_cache()
+
     def step(self, state: SystemState, dt: float, context: StepperContext) -> StepResult:
         if dt <= 0.0:
             return StepResult(advanced_time=0.0, event_occurred=False, details={"mode": "nrm_blended_no_dt"})
@@ -3712,15 +4278,16 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
         network = context.network
         self._maybe_update_reaction_interval_dt(network, state)
         x_float = self._float_nonnegative(state.x)
-        beta = self._channel_betas(network, x_float)
+        observed = self._rounded_nonnegative(x_float)
+        beta = self._channel_betas(network, observed)
         beta_min = float(np.min(beta)) if beta.size else 0.0
         beta_max = float(np.max(beta)) if beta.size else 0.0
 
         if beta_max <= self.config.beta_tol:
             return self._pure_cle_step(state, float(dt), context, beta, beta_min, beta_max)
         if beta_min >= 1.0 - self.config.beta_tol:
-            return self._pure_nrm_step(state, float(dt), context, beta_min, beta_max)
-        return self._mixed_step(state, float(dt), context, beta, beta_min, beta_max)
+            return self._pure_nrm_step(state, float(dt), context, beta_min, beta_max, observed=observed)
+        return self._mixed_step(state, float(dt), context, beta, beta_min, beta_max, observed=observed)
 
     def _pure_cle_step(
         self,
@@ -3744,9 +4311,11 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
         context: StepperContext,
         beta_min: float,
         beta_max: float,
+        *,
+        observed: np.ndarray | None = None,
     ) -> StepResult:
         duration = min(self._current_dt_macro(), dt)
-        state.x[:] = self._rounded_nonnegative(state.x)
+        state.x[:] = self._rounded_nonnegative(state.x) if observed is None else np.asarray(observed, dtype=float)
         result = self._nrm.step(state, duration, context)
         details = dict(result.details or {})
         details.update(
@@ -3778,6 +4347,8 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
         beta: np.ndarray,
         beta_min: float,
         beta_max: float,
+        *,
+        observed: np.ndarray | None = None,
     ) -> StepResult:
         network = context.network
         rng = context.rng
@@ -3786,8 +4357,18 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
         end_time = start_time + duration
         x_work = self._float_nonnegative(state.x).copy()
 
-        base_initial = self._propensities_for_x(network, self._rounded_nonnegative(x_work), start_time)
-        base_initial = self._clean_propensities(base_initial, "initial mixed propensities")
+        observed_initial = self._rounded_nonnegative(x_work) if observed is None else np.asarray(observed, dtype=float)
+        if self.config.strict_int_for_CLE:
+            base_initial = self._propensities_for_observed_cached(
+                network,
+                observed_initial,
+                start_time,
+                "initial mixed propensities",
+            )
+        else:
+            base_initial = self._propensities_for_x(network, observed_initial, start_time)
+            base_initial = self._clean_propensities(base_initial, "initial mixed propensities")
+        initial_cle_base_propensities = base_initial if self.config.strict_int_for_CLE else None
         total_jump_initial = float(np.sum(self._clean_propensities(beta * base_initial, "initial jump propensities")))
         total_cle_initial = float(
             np.sum(self._clean_propensities((1.0 - beta) * base_initial, "initial CLE propensities"))
@@ -3800,6 +4381,7 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
             duration,
             beta,
             rng,
+            base_propensities=base_initial,
         )
 
         continuous_abs_total = np.zeros(network.n_channels, dtype=float)
@@ -3826,6 +4408,7 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
                     rng,
                     kind="cle",
                     grow_on_success=False,
+                    base_propensities=initial_cle_base_propensities if current_time == start_time else None,
                 )
                 x_work = cle.x
                 continuous_abs_total += cle.continuous_abs
@@ -3857,6 +4440,7 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
                     rng,
                     kind="cle",
                     grow_on_success=not scheduled_events,
+                    base_propensities=initial_cle_base_propensities if not scheduled_events else None,
                 )
                 x_work = cle.x
                 continuous_abs_total += cle.continuous_abs
@@ -3912,6 +4496,7 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
                 "cle_dt_min_reached": bool(cle_min_dt_reached),
                 "cle_adaptive_stop": bool(cle_stop_due_to_retry),
                 "continuous_channel_abs_increments": continuous_abs_total.copy(),
+                **self._observed_propensity_details(),
                 **schedule_details,
             },
         )
@@ -3924,6 +4509,8 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
         duration: float,
         beta: np.ndarray,
         rng: np.random.Generator,
+        *,
+        base_propensities: np.ndarray | None = None,
     ) -> tuple[list[tuple[float, int]], dict[str, Any]]:
         if duration <= 0.0:
             return [], {"nrm_dependency_graph_used": False, "nrm_full_recompute": False, "nrm_affected_updates": 0}
@@ -3932,8 +4519,14 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
         end_time = now + float(duration)
         x_jump = self._rounded_nonnegative(x).copy()
         jump_state = SystemState(t=now, x=x_jump)
+        if base_propensities is None:
+            base = network.compute_all_propensities(jump_state)
+        else:
+            base = np.asarray(base_propensities, dtype=float)
+            if base.shape != (network.n_channels,):
+                raise ValueError(f"base_propensities must have shape ({network.n_channels},)")
         propensities = self._clean_propensities(
-            beta * network.compute_all_propensities(jump_state),
+            beta * base,
             "mixed NRM jump propensities",
         )
         scheduled = np.full(network.n_channels, np.inf, dtype=float)
@@ -4149,10 +4742,36 @@ def _species_beta(x: float, i1: float, i2: float) -> float:
     return float((float(i2) - value) / (float(i2) - float(i1)))
 
 
-def _species_beta_array(x: np.ndarray, i1: float, i2: float) -> np.ndarray:
+def _species_beta_array(x: np.ndarray, i1: float, i2: float) -> np.ndarray: # 先算再clip，但向量化计算很快
     values = np.asarray(x, dtype=float)
     beta = (float(i2) - values) / (float(i2) - float(i1))
     return np.clip(beta, 0.0, 1.0)
+
+
+def _build_species_to_channels_csr(n_species: int, species_by_channel: list[Any]) -> tuple[np.ndarray, np.ndarray]:
+    species_counts = np.zeros(int(n_species), dtype=np.int64)
+    normalized: list[np.ndarray] = []
+    for channel_species in species_by_channel:
+        species = np.unique(np.asarray(channel_species, dtype=np.int64))
+        if species.size and np.any((species < 0) | (species >= int(n_species))):
+            raise ValueError("channel dependency references species outside network bounds")
+        normalized.append(species)
+        for sid in species:
+            species_counts[int(sid)] += 1
+
+    indptr = np.empty(int(n_species) + 1, dtype=np.int64)
+    indptr[0] = 0
+    np.cumsum(species_counts, out=indptr[1:])
+    indices = np.empty(int(indptr[-1]), dtype=np.int64)
+    write_offsets = indptr[:-1].copy()
+    for channel_id, species in enumerate(normalized):
+        for sid in species:
+            pos = int(write_offsets[int(sid)])
+            indices[pos] = int(channel_id)
+            write_offsets[int(sid)] += 1
+    indptr.setflags(write=False)
+    indices.setflags(write=False)
+    return indptr, indices
 
 
 def _build_channel_beta_lookup(network: ReactionNetworkData, mode: str) -> _ChannelBetaLookup: # 一个缓存表
@@ -4161,6 +4780,7 @@ def _build_channel_beta_lookup(network: ReactionNetworkData, mode: str) -> _Chan
     n_channels = int(network.n_channels)
     n_species = int(network.n_species)
 
+    # 先构造正向关系：每个 channel 计算 beta 时需要看哪些 species。
     for channel_id in range(n_channels):
         if network.get_channel_block(channel_id) == ChannelBlock.INFLOW:
             relevant_species: list[int] = []
@@ -4172,6 +4792,8 @@ def _build_channel_beta_lookup(network: ReactionNetworkData, mode: str) -> _Chan
         relevant_by_channel.append(relevant_species)
         max_width = max(max_width, len(relevant_species))
 
+    # padded dense 表方便 _channel_betas 用一次 gather/max 得到全量 channel beta。
+    # mask 区分真实 species id 和 padding 的 0。
     species = np.zeros((n_channels, max_width), dtype=np.int64)
     mask = np.zeros((n_channels, max_width), dtype=bool)
     for channel_id, relevant_species in enumerate(relevant_by_channel):
@@ -4181,15 +4803,179 @@ def _build_channel_beta_lookup(network: ReactionNetworkData, mode: str) -> _Chan
         species[channel_id, :width] = np.asarray(relevant_species, dtype=np.int64)
         mask[channel_id, :width] = True
 
+    # beta reverse mapping：species -> beta 计算依赖该 species 的 channels。
+    species_to_channels_indptr, species_to_channels_indices = _build_species_to_channels_csr(
+        n_species,
+        relevant_by_channel,
+    )
+
+    # propensity-extra reverse mapping：species -> beta relevant species 未覆盖、但 propensity 依赖该 species 的 channels。
+    # 其中最重要的是 catalyst ids；另外也覆盖 finite-capacity inflow target、以及非默认 beta_species_mode 漏掉的 reactants。
+    dependency_by_channel: list[np.ndarray] = []
+    if getattr(network, "dependency_indices_dirty", False):
+        rebuild = getattr(network, "rebuild_dependency_indices", None)
+        if callable(rebuild):
+            rebuild()
+    channel_to_species = getattr(network, "channel_to_species", None)
+    if isinstance(channel_to_species, list) and len(channel_to_species) == n_channels:
+        for channel_id in range(n_channels):
+            dependency_by_channel.append(np.asarray(channel_to_species[channel_id], dtype=np.int64))
+    else:
+        for relevant_species in relevant_by_channel:
+            dependency_by_channel.append(np.asarray(relevant_species, dtype=np.int64))
+
+    extra_by_channel: list[np.ndarray] = []
+    for channel_id, dependency_species in enumerate(dependency_by_channel):
+        relevant_set = set(int(sid) for sid in relevant_by_channel[channel_id])
+        extra = [int(sid) for sid in np.asarray(dependency_species, dtype=np.int64) if int(sid) not in relevant_set]
+        extra_by_channel.append(np.asarray(extra, dtype=np.int64))
+    propensity_extra_species_to_channels_indptr, propensity_extra_species_to_channels_indices = _build_species_to_channels_csr(
+        n_species,
+        extra_by_channel,
+    )
+
+    catalyst_by_channel: list[np.ndarray] = []
+    channel_to_catalysts = getattr(network, "channel_to_catalysts", None)
+    if isinstance(channel_to_catalysts, list) and len(channel_to_catalysts) == n_channels:
+        for channel_id in range(n_channels):
+            catalyst_by_channel.append(np.asarray(channel_to_catalysts[channel_id], dtype=np.int64))
+    else:
+        for channel_id in range(n_channels):
+            getter = getattr(network, "get_channel_catalysts", None)
+            if callable(getter):
+                catalyst_by_channel.append(np.asarray(getter(channel_id), dtype=np.int64))
+            else:
+                catalyst_by_channel.append(np.empty(0, dtype=np.int64))
+    catalyst_species_to_channels_indptr, catalyst_species_to_channels_indices = _build_species_to_channels_csr(
+        n_species,
+        catalyst_by_channel,
+    )
+    catalyst_species_mask = np.zeros(n_species, dtype=bool)
+    if catalyst_species_to_channels_indices.size:
+        for catalyst_species in catalyst_by_channel:
+            catalyst_species_mask[np.asarray(catalyst_species, dtype=np.int64)] = True
+    catalyst_species_mask.setflags(write=False)
+
+    # lookup 是只读拓扑缓存，后续 step 只读它，不应被运行时路径改写。
     species.setflags(write=False)
     mask.setflags(write=False)
     return _ChannelBetaLookup(
-        relevant_species=species,
+        relevant_species=species, # 每个 channel 在计算 beta 时需要参考的 species id 列表, 被用来找一个反应中最大的 beta
         relevant_mask=mask,
+        species_to_channels_indptr=species_to_channels_indptr,
+        species_to_channels_indices=species_to_channels_indices,
+        propensity_extra_species_to_channels_indptr=propensity_extra_species_to_channels_indptr,
+        propensity_extra_species_to_channels_indices=propensity_extra_species_to_channels_indices,
+        catalyst_species_mask=catalyst_species_mask,
+        catalyst_species_to_channels_indptr=catalyst_species_to_channels_indptr,
+        catalyst_species_to_channels_indices=catalyst_species_to_channels_indices,
         n_channels=n_channels,
         n_species=n_species,
         mode=str(mode),
     )
+
+
+def _lookup_beta_affected_channels(lookup: _ChannelBetaLookup, species_ids: np.ndarray) -> np.ndarray:
+    # 根据 reverse mapping 把 changed species 合并成 affected beta channel 集合。
+    species = np.asarray(species_ids, dtype=np.int64)
+    if species.size == 0:
+        return np.empty(0, dtype=np.int64)
+
+    arrays: list[np.ndarray] = []
+    for sid in np.unique(species):
+        index = int(sid)
+        if index < 0 or index >= lookup.n_species:
+            raise IndexError("species_ids contain out-of-range values")
+        start = int(lookup.species_to_channels_indptr[index])
+        end = int(lookup.species_to_channels_indptr[index + 1])
+        if end > start:
+            arrays.append(lookup.species_to_channels_indices[start:end])
+
+    if not arrays:
+        return np.empty(0, dtype=np.int64)
+    if len(arrays) == 1:
+        return np.array(arrays[0], dtype=np.int64, copy=True)
+    return np.unique(np.concatenate(arrays)).astype(np.int64, copy=False)
+
+
+def _lookup_beta_propensity_extra_affected_channels(lookup: _ChannelBetaLookup, species_ids: np.ndarray) -> np.ndarray:
+    # 根据 propensity-extra reverse mapping，把 beta 没覆盖的 propensity affected channels 补出来。
+    species = np.asarray(species_ids, dtype=np.int64)
+    if species.size == 0:
+        return np.empty(0, dtype=np.int64)
+
+    arrays: list[np.ndarray] = []
+    for sid in np.unique(species):
+        index = int(sid)
+        if index < 0 or index >= lookup.n_species:
+            raise IndexError("species_ids contain out-of-range values")
+        start = int(lookup.propensity_extra_species_to_channels_indptr[index])
+        end = int(lookup.propensity_extra_species_to_channels_indptr[index + 1])
+        if end > start:
+            arrays.append(lookup.propensity_extra_species_to_channels_indices[start:end])
+
+    if not arrays:
+        return np.empty(0, dtype=np.int64)
+    if len(arrays) == 1:
+        return np.array(arrays[0], dtype=np.int64, copy=True)
+    return np.unique(np.concatenate(arrays)).astype(np.int64, copy=False)
+
+
+def _lookup_beta_changed_catalyst_species(lookup: _ChannelBetaLookup, species_ids: np.ndarray) -> np.ndarray:
+    species = np.unique(np.asarray(species_ids, dtype=np.int64))
+    if species.size == 0:
+        return np.empty(0, dtype=np.int64)
+    if np.any((species < 0) | (species >= lookup.n_species)):
+        raise IndexError("species_ids contain out-of-range values")
+    return species[lookup.catalyst_species_mask[species]].astype(np.int64, copy=False)
+
+
+def _lookup_beta_catalyst_affected_channels(lookup: _ChannelBetaLookup, species_ids: np.ndarray) -> np.ndarray:
+    # 只用 changed catalyst ids 查 catalytic propensity affected channels，供 diagnostics 和复用验证。
+    species = np.asarray(species_ids, dtype=np.int64)
+    if species.size == 0:
+        return np.empty(0, dtype=np.int64)
+
+    arrays: list[np.ndarray] = []
+    for sid in np.unique(species):
+        index = int(sid)
+        if index < 0 or index >= lookup.n_species:
+            raise IndexError("species_ids contain out-of-range values")
+        start = int(lookup.catalyst_species_to_channels_indptr[index])
+        end = int(lookup.catalyst_species_to_channels_indptr[index + 1])
+        if end > start:
+            arrays.append(lookup.catalyst_species_to_channels_indices[start:end])
+
+    if not arrays:
+        return np.empty(0, dtype=np.int64)
+    if len(arrays) == 1:
+        return np.array(arrays[0], dtype=np.int64, copy=True)
+    return np.unique(np.concatenate(arrays)).astype(np.int64, copy=False)
+
+
+def _union_int_arrays(*arrays: np.ndarray) -> np.ndarray:
+    nonempty = [np.asarray(arr, dtype=np.int64) for arr in arrays if np.asarray(arr, dtype=np.int64).size]
+    if not nonempty:
+        return np.empty(0, dtype=np.int64)
+    if len(nonempty) == 1:
+        return np.array(nonempty[0], dtype=np.int64, copy=True)
+    return np.unique(np.concatenate(nonempty)).astype(np.int64, copy=False)
+
+
+def _lookup_beta_relevant_species_for_channels(lookup: _ChannelBetaLookup, channel_ids: np.ndarray) -> np.ndarray:
+    # 从 affected channels 反查这些 channel 计算 beta 时真正依赖的 species。
+    channels = np.asarray(channel_ids, dtype=np.int64)
+    if channels.size == 0 or lookup.relevant_species.shape[1] == 0:
+        return np.empty(0, dtype=np.int64)
+    if np.any((channels < 0) | (channels >= lookup.n_channels)):
+        raise IndexError("channel_ids contain out-of-range values")
+
+    relevant_species = lookup.relevant_species[channels]
+    relevant_mask = lookup.relevant_mask[channels]
+    species = relevant_species[relevant_mask]
+    if species.size == 0:
+        return np.empty(0, dtype=np.int64)
+    return np.unique(species).astype(np.int64, copy=False)
 
 
 def _channel_relevant_species(network: ReactionNetworkData, channel_id: int, mode: str = "reactants_products") -> list[int]:
@@ -4204,18 +4990,23 @@ def _channel_relevant_species(network: ReactionNetworkData, channel_id: int, mod
     return [int(sid) for sid in sorted(set(int(sid) for sid in species))]
 
 
-def _sample_channel(
+def _sample_channel( # 对离散通道抽发生的反应
     channels: np.ndarray,
     propensities: np.ndarray,
     total: float,
     rng: np.random.Generator,
 ) -> int:
     threshold = float(rng.random() * total)
-    cumulative = 0.0
-    chosen = int(channels[-1])
-    for channel_id, propensity in zip(channels, propensities):
-        cumulative += float(propensity)
-        if cumulative >= threshold:
-            chosen = int(channel_id)
-            break
+    # cumulative = 0.0
+    # chosen = int(channels[-1])
+    # for channel_id, propensity in zip(channels, propensities):
+    #     cumulative += float(propensity)
+    #     if cumulative >= threshold:
+    #         chosen = int(channel_id)
+    #         break
+    selected_channels = np.asarray(channels, dtype=np.int64)
+    selected_prop = propensities[selected_channels]
+    cum = np.cumsum(selected_prop)
+    chosen_idx = np.searchsorted(cum, threshold)
+    chosen = selected_channels[chosen_idx]
     return chosen

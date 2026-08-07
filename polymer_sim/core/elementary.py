@@ -231,6 +231,17 @@ class ElementaryMassActionNetwork:
         x = np.asarray(state.x, dtype=float)
         return self._compute_propensity_array(channels, x, values)
 
+    def update_propensities_for_species(
+        self,
+        propensities: np.ndarray,
+        state: SystemState,
+        species_ids: np.ndarray | Sequence[int],
+    ) -> np.ndarray:
+        affected = self.affected_channels_for_species(species_ids)
+        if affected.size:
+            propensities[affected] = self.compute_propensities_for_channels(affected, state)
+        return affected
+
     def apply_channel_update(self, state: SystemState, channel_id: int) -> None:
         self.apply_channel_delta(state.x, channel_id, 1.0)
 

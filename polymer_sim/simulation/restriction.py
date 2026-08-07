@@ -6,14 +6,13 @@ from typing import Any
 
 import numpy as np
 
-from polymer_sim.core.network import ReactionNetworkData
 from polymer_sim.core.state import SystemState
 from polymer_sim.simulation.stepper import StepResult
 
 
 @dataclass(slots=True)
 class RestrictionContext:
-    network: ReactionNetworkData
+    network: Any
     rng: np.random.Generator
 
 
@@ -196,7 +195,7 @@ class TrimerOutflowRestriction(BaseRestriction):
 
 
 def build_restriction(
-    network: ReactionNetworkData,
+    network: Any,
     *,
     food_species: tuple[str, ...] = ("0", "1"),
     food_count: float = 10.0,
@@ -241,7 +240,7 @@ def normalize_food_supply_mode(mode: str | None) -> str:
 
 
 def build_food_supply_restriction(
-    network: ReactionNetworkData,
+    network: Any,
     *,
     mode: str | None,
     food_species: tuple[str | int, ...] = ("0", "1"),
@@ -275,7 +274,7 @@ def build_food_supply_restriction(
 
 
 def _resolve_species_counts(
-    network: ReactionNetworkData,
+    network: Any,
     *,
     food_species: tuple[str | int, ...],
     default_count: float,

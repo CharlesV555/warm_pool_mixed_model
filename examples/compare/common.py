@@ -14,7 +14,7 @@ import io
 import json
 import pstats
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Sequence
@@ -37,15 +37,18 @@ from polymer_sim import (  # noqa: E402
     LinearCatalysisScalingPDMPPartitionStrategy,
     NRMBlendedHybridStepper,
     OptimizedNRMStepper,
+    OptimizedNRMConfig,
     PDMPConfig,
     PDMPStepper,
     ReactionNetworkData,
     ScalingPDMPConfig,
     SSAStepper,
     build_elementary_mass_action_network,
+    build_food_supply_restriction,
     build_reaction_rule_tables,
     clear_all_catalysis,
     generate_fixed_species_space,
+    normalize_food_supply_mode,
     set_catalytic_strengths_for_channels,
 )
 
@@ -69,6 +72,8 @@ class NetworkSpec:
     kind: str = "polymer_cross"
     max_len: int = 0
     alphabet: tuple[str, ...] = ("0", "1")
+    food_species: tuple[str, ...] = ()
+    food_supply_mode: str = "explicit_inflow"
     initial_food_count: float = 1000.0
     food_max_count: float = 1000.0
     k_left_add: float = 0.01
@@ -92,6 +97,13 @@ class RunSettings:
     t_end: float | None = None
     max_steps: int = 100_000_000
     max_runtime_seconds: float = 10.0
+    food_supply_mode: str | None = None
+    ssa_use_local_propensity_updates: bool = True
+    nrm_use_dependency_graph: bool = True
+    nrm_fallback_full_recompute: bool = True
+    nrm_propensity_tol: float = 0.0
+    nrm_heap_rebuild_factor: float = 4.0
+    nrm_diagnostics: bool = True
     blended_i1: float = 100.0
     blended_i2: float = 150.0
     blended_dt_cle: float = 0.00033981
@@ -100,6 +112,8 @@ class RunSettings:
     # drive explicit CLE/Euler updates to NaN/inf before the wall-clock stop.
     blended_dt_macro: float = 0.00033981
     blended_beta_species_mode: str = "reactants"
+    blended_beta_compute_mode: str = "beta_fully_compute"
+    blended_strict_int_for_CLE: bool = False
     pdmp_ode_step: float = 0.001
     pdmp_n0: float = 500.0
     pdmp_mu: float = 1.0
@@ -133,6 +147,9 @@ NETWORK_SPECS: dict[str, NetworkSpec] = {
     "polymer_food_dimer_inhibition_len3": NetworkSpec(
         name="polymer_food_dimer_inhibition_len3",
         kind="polymer_food_dimer_inhibition_len3",
+        food_species=("0", "1"),
+        initial_food_count=100.0,
+        food_max_count=100.0,
     ),
     "quasi_disjoint_slow_fast": NetworkSpec(
         name="quasi_disjoint_slow_fast",
@@ -149,31 +166,61 @@ NETWORK_SPECS: dict[str, NetworkSpec] = {
     "polymer_len5_00000_catalyzes_0": NetworkSpec(
         name="polymer_len5_00000_catalyzes_0",
         max_len=5,
+        food_species=("0", "1"),
         cross_catalysis_rules=(("00000", "0"),),
+    ),
+    "polymer_a_len5_a5_catalyzes_a_constant_food": NetworkSpec(
+        name="polymer_a_len5_a5_catalyzes_a_constant_food",
+        max_len=5,
+        alphabet=("A",),
+        food_species=("A",),
+        food_supply_mode="constant",
+        cross_catalysis_rules=(("AAAAA", "A"),),
+    ),
+    "polymer_a_len6_a6_catalyzes_a_constant_food": NetworkSpec(
+        name="polymer_a_len6_a6_catalyzes_a_constant_food",
+        max_len=6,
+        alphabet=("A",),
+        food_species=("A",),
+        food_supply_mode="constant",
+        cross_catalysis_rules=(("AAAAAA", "A"),),
+    ),
+    "polymer_a_len8_a8_catalyzes_a_constant_food": NetworkSpec(
+        name="polymer_a_len8_a8_catalyzes_a_constant_food",
+        max_len=8,
+        alphabet=("A",),
+        food_species=("A",),
+        food_supply_mode="constant",
+        cross_catalysis_rules=(("AAAAAAAA", "A"),),
     ),
     "polymer_len10_two_stage_1_catalysis": NetworkSpec(
         name="polymer_len10_two_stage_1_catalysis",
         kind="polymer_len10_two_stage_1_catalysis",
         max_len=10,
+        food_species=("0", "1"),
     ),
     "polymer_len10_0000000000_catalyzes_0": NetworkSpec(
         name="polymer_len10_0000000000_catalyzes_0",
         max_len=10,
+        food_species=("0", "1"),
         cross_catalysis_rules=(("0000000000", "0"),),
     ),
     "linear_cross_len3": NetworkSpec(
         name="linear_cross_len3",
         max_len=3,
+        food_species=("0", "1"),
         cross_catalysis_rules=(("000", "0"),),
     ),
     "linear_cross_len4": NetworkSpec(
         name="linear_cross_len4",
         max_len=4,
+        food_species=("0", "1"),
         cross_catalysis_rules=(("0000", "0"),),
     ),
     "linear_cross_len5": NetworkSpec(
         name="linear_cross_len5",
         max_len=5,
+        food_species=("0", "1"),
         cross_catalysis_rules=(("00000", "0"),),
     ),
 }
@@ -197,8 +244,12 @@ STRICT_2018_PDMP_SKIP_NETWORKS = (
 )
 
 
-def build_network(network_name: str) -> tuple[ReactionNetworkData | ElementaryMassActionNetwork, dict[str, Any], NetworkSpec]:
-    spec = network_spec(network_name)
+def build_network(
+    network_name: str,
+    *,
+    food_supply_mode: str | None = None,
+) -> tuple[ReactionNetworkData | ElementaryMassActionNetwork, dict[str, Any], NetworkSpec]:
+    spec = network_spec_for_run(network_name, food_supply_mode=food_supply_mode)
     if spec.kind == "fast_dimerization":
         return (*build_fast_dimerization_benchmark_network(spec), spec)
     if spec.kind == "toggle_switch":
@@ -279,6 +330,7 @@ def build_polymer_cross_catalysis_network(spec: NetworkSpec) -> tuple[ReactionNe
     }
     space = generate_fixed_species_space(spec.alphabet, max_len=int(spec.max_len), initial_counts=initial_counts)
     tables = build_reaction_rule_tables(space)
+    use_explicit_food_inflow = spec_uses_explicit_food_inflow(spec)
     network = ReactionNetworkData.from_species_space(
         space,
         tables,
@@ -292,13 +344,17 @@ def build_polymer_cross_catalysis_network(spec: NetworkSpec) -> tuple[ReactionNe
             for sid, name in enumerate(space.species_names)
             if name not in spec.alphabet
         ],
-        k_inflow=float(spec.food_inflow_rate),
+        k_inflow=float(spec.food_inflow_rate) if use_explicit_food_inflow else 0.0,
         inflow_species_ids=[
             sid
             for sid, name in enumerate(space.species_names)
-            if name in spec.alphabet
-        ],
-        inflow_capacity=float(spec.food_max_count) if spec.use_hill_capped_food_inflow else None,
+            if name in spec.food_species
+        ] if use_explicit_food_inflow else None,
+        inflow_capacity=(
+            float(spec.food_max_count)
+            if use_explicit_food_inflow and spec.use_hill_capped_food_inflow
+            else None
+        ),
         inflow_hill_coefficient=float(spec.food_inflow_hill_coefficient),
         catalysis_mode=str(spec.catalysis_mode),
         saturation_alpha=float(spec.saturation_alpha),
@@ -314,6 +370,7 @@ def build_polymer_len10_two_stage_one_catalysis_network(spec: NetworkSpec) -> tu
     }
     space = generate_fixed_species_space(spec.alphabet, max_len=10, initial_counts=initial_counts)
     tables = build_reaction_rule_tables(space)
+    use_explicit_food_inflow = spec_uses_explicit_food_inflow(spec)
     network = ReactionNetworkData.from_species_space(
         space,
         tables,
@@ -327,13 +384,17 @@ def build_polymer_len10_two_stage_one_catalysis_network(spec: NetworkSpec) -> tu
             for sid, name in enumerate(space.species_names)
             if name not in spec.alphabet
         ],
-        k_inflow=float(spec.food_inflow_rate),
+        k_inflow=float(spec.food_inflow_rate) if use_explicit_food_inflow else 0.0,
         inflow_species_ids=[
             sid
             for sid, name in enumerate(space.species_names)
-            if name in spec.alphabet
-        ],
-        inflow_capacity=float(spec.food_max_count) if spec.use_hill_capped_food_inflow else None,
+            if name in spec.food_species
+        ] if use_explicit_food_inflow else None,
+        inflow_capacity=(
+            float(spec.food_max_count)
+            if use_explicit_food_inflow and spec.use_hill_capped_food_inflow
+            else None
+        ),
         inflow_hill_coefficient=float(spec.food_inflow_hill_coefficient),
         catalysis_mode=str(spec.catalysis_mode),
         saturation_alpha=float(spec.saturation_alpha),
@@ -424,30 +485,45 @@ def build_polymer_food_dimer_inhibition_len3_network(
     spec: NetworkSpec,
 ) -> tuple[ElementaryMassActionNetwork, dict[str, Any]]:
     species = ("0", "1", "00", "11", "000", "111")
-    initial = {"0": 100.0, "1": 100.0, "00": 0.0, "11": 0.0, "000": 0.0, "111": 0.0}
-    reactions = [
-        _reaction("R1", (), ("0",), 1.0, partition="slow", note="food inflow 0"),
-        _reaction("R2", (), ("1",), 1.0, partition="slow", note="food inflow 1"),
-        _reaction("R3", ("0",), (), 0.1, partition="slow", note="food outflow 0"),
-        _reaction("R4", ("1",), (), 0.1, partition="slow", note="food outflow 1"),
-        _reaction("R5", ("0", "0"), ("00",), 5.0, partition="fast", note="0 dimerization using food monomers"),
-        _reaction("R6", ("1", "1"), ("11",), 5.0, partition="fast", note="1 dimerization using food monomers"),
-        _reaction("R7", ("00", "0"), ("000",), 10.0, partition="fast", note="0 elongation needs food monomer"),
-        _reaction("R8", ("11", "1"), ("111",), 10.0, partition="fast", note="1 elongation needs food monomer"),
-        _reaction("R9", ("00", "1"), ("00",), 20.0, partition="slow", interface="S*", note="00 suppresses 1 dimerization by depleting 1"),
-        _reaction("R10", ("11", "0"), ("11",), 20.0, partition="slow", interface="S*", note="11 suppresses 0 dimerization by depleting 0"),
-        _reaction("R11", ("00",), (), 0.01, partition="fast", note="00 outflow"),
-        _reaction("R12", ("11",), (), 0.01, partition="fast", note="11 outflow"),
-        _reaction("R13", ("000",), (), 0.1, partition="fast", note="000 outflow"),
-        _reaction("R14", ("111",), (), 0.1, partition="fast", note="111 outflow"),
-    ]
+    food_initial = min(float(spec.initial_food_count), float(spec.food_max_count))
+    initial = {"0": food_initial, "1": food_initial, "00": 0.0, "11": 0.0, "000": 0.0, "111": 0.0}
+    use_explicit_food_inflow = spec_uses_explicit_food_inflow(spec)
+    reactions = []
+    slow_reaction_ids: list[str] = []
+    if use_explicit_food_inflow:
+        reactions.extend(
+            [
+                _reaction("R1", (), ("0",), 1.0, partition="slow", note="food inflow 0"),
+                _reaction("R2", (), ("1",), 1.0, partition="slow", note="food inflow 1"),
+                _reaction("R3", ("0",), (), 0.1, partition="slow", note="food outflow 0"),
+                _reaction("R4", ("1",), (), 0.1, partition="slow", note="food outflow 1"),
+            ]
+        )
+        slow_reaction_ids.extend(["R1", "R2", "R3", "R4"])
+    reactions.extend(
+        [
+            _reaction("R5", ("0", "0"), ("00",), 5.0, partition="fast", note="0 dimerization using food monomers"),
+            _reaction("R6", ("1", "1"), ("11",), 5.0, partition="fast", note="1 dimerization using food monomers"),
+            _reaction("R7", ("00", "0"), ("000",), 10.0, partition="fast", note="0 elongation needs food monomer"),
+            _reaction("R8", ("11", "1"), ("111",), 10.0, partition="fast", note="1 elongation needs food monomer"),
+            _reaction("R9", ("00", "1"), ("00",), 20.0, partition="slow", interface="S*", note="00 suppresses 1 dimerization by depleting 1"),
+            _reaction("R10", ("11", "0"), ("11",), 20.0, partition="slow", interface="S*", note="11 suppresses 0 dimerization by depleting 0"),
+            _reaction("R11", ("00",), (), 0.01, partition="fast", note="00 outflow"),
+            _reaction("R12", ("11",), (), 0.01, partition="fast", note="11 outflow"),
+            _reaction("R13", ("000",), (), 0.1, partition="fast", note="000 outflow"),
+            _reaction("R14", ("111",), (), 0.1, partition="fast", note="111 outflow"),
+        ]
+    )
+    slow_reaction_ids.extend(["R9", "R10"])
     expected = {
-        "slow_reactions": ["R1", "R2", "R3", "R4", "R9", "R10"],
+        "slow_reactions": slow_reaction_ids,
         "fast_reactions": ["R5", "R6", "R7", "R8", "R11", "R12", "R13", "R14"],
         "R_star": [],
         "S_star": ["00", "11"],
         "source": "custom food-dependent polymer toggle analogue",
         "inhibition_implementation": "cross-monomer depletion: 00 + 1 -> 00 and 11 + 0 -> 11",
+        "food_supply_mode": normalized_food_supply_mode(spec),
+        "explicit_food_inflow_reactions": bool(use_explicit_food_inflow),
     }
     return _build_elementary_network(spec.name, species, initial, reactions), _benchmark_metadata(spec, expected)
 
@@ -616,6 +692,43 @@ def network_spec(network_name: str) -> NetworkSpec:
     return NETWORK_SPECS[key]
 
 
+def network_spec_for_run(network_name: str, *, food_supply_mode: str | None = None) -> NetworkSpec:
+    spec = network_spec(network_name)
+    if food_supply_mode is None:
+        return spec
+    return replace(spec, food_supply_mode=normalize_food_supply_mode(food_supply_mode))
+
+
+def normalized_food_supply_mode(spec: NetworkSpec) -> str:
+    return normalize_food_supply_mode(spec.food_supply_mode)
+
+
+def spec_uses_explicit_food_inflow(spec: NetworkSpec) -> bool:
+    """Return whether the network should contain formal food INFLOW reactions.
+
+    ``upper_limit`` keeps the explicit inflow channels and adds a cap
+    restriction.  ``constant`` disables the inflow channels because food is
+    provided by a chemostat-style state projection in the runner.
+    """
+
+    mode = normalized_food_supply_mode(spec)
+    return bool(spec.food_species) and mode in {"explicit_inflow", "upper_limit"}
+
+
+def build_compare_food_restriction(
+    network: ReactionNetworkData | ElementaryMassActionNetwork,
+    spec: NetworkSpec,
+):
+    if not spec.food_species:
+        return None
+    return build_food_supply_restriction(
+        network,
+        mode=normalized_food_supply_mode(spec),
+        food_species=tuple(spec.food_species),
+        food_count=float(spec.initial_food_count),
+    )
+
+
 def assign_cross_terminal_catalysis(network: ReactionNetworkData, spec: NetworkSpec) -> dict[str, Any]:
     clear_all_catalysis(network, rebuild=False)
     channels_by_catalyst: dict[str, list[int]] = {}
@@ -766,13 +879,13 @@ def make_stepper(
 ):
     name = normalize_method(method)
     if name == "gillespie_ssa":
-        return SSAStepper(use_local_propensity_updates=isinstance(network, ReactionNetworkData)), None
+        return SSAStepper(use_local_propensity_updates=bool(settings.ssa_use_local_propensity_updates)), None
     if name == "optimized_nrm":
-        return OptimizedNRMStepper(), None
+        return OptimizedNRMStepper(make_nrm_config(settings)), None
     if name == "gillespie_cle_hybrid":
         return BlendedHybridStepper(make_blended_config(settings)), None
     if name == "nrm_cle_hybrid":
-        return NRMBlendedHybridStepper(make_blended_config(settings)), None
+        return NRMBlendedHybridStepper(make_blended_config(settings), make_nrm_config(settings)), None
     if name == "gillespie_pdmp_lp":
         return make_pdmp_stepper(settings, discrete_event_method="gillespie", network=network), None
     if name == "nrm_pdmp_lp":
@@ -791,6 +904,18 @@ def make_blended_config(settings: RunSettings) -> BlendedHybridConfig:
         use_reaction_interval_dt=False,
         reaction_interval_update_steps=1,
         beta_species_mode=str(settings.blended_beta_species_mode),
+        beta_compute_mode=str(settings.blended_beta_compute_mode),
+        strict_int_for_CLE=bool(settings.blended_strict_int_for_CLE),
+    )
+
+
+def make_nrm_config(settings: RunSettings) -> OptimizedNRMConfig:
+    return OptimizedNRMConfig(
+        use_dependency_graph=bool(settings.nrm_use_dependency_graph),
+        fallback_full_recompute=bool(settings.nrm_fallback_full_recompute),
+        propensity_tol=float(settings.nrm_propensity_tol),
+        heap_rebuild_factor=float(settings.nrm_heap_rebuild_factor),
+        diagnostics=bool(settings.nrm_diagnostics),
     )
 
 
@@ -938,10 +1063,14 @@ def run_method(
             write_json=write_json,
         )
     build_started = perf_counter()
-    network, catalysis_result, spec = build_network(network_name)
+    network, catalysis_result, spec = build_network(
+        network_name,
+        food_supply_mode=settings.food_supply_mode,
+    )
     network, catalysis_result = prepare_network_for_method(method_key, network, catalysis_result)
     build_wall_seconds = perf_counter() - build_started
     stepper, dt = make_stepper(method_key, settings, network)
+    restriction = build_compare_food_restriction(network, spec)
 
     run_started = perf_counter()
     result = ExperimentRunner().run_one(
@@ -952,6 +1081,7 @@ def run_method(
         dt=dt,
         max_steps=int(settings.max_steps),
         max_runtime_seconds=float(settings.max_runtime_seconds),
+        restriction=restriction,
         network_build_elapsed_seconds=build_wall_seconds,
     )
     run_wall_seconds = perf_counter() - run_started
@@ -973,6 +1103,9 @@ def run_method(
         "stepper_name": summary.metadata.get("stepper_name"),
         "n_species": int(network.n_species),
         "n_channels": int(network.n_channels),
+        "food_supply_mode": normalized_food_supply_mode(spec),
+        "uses_explicit_food_inflow": bool(spec_uses_explicit_food_inflow(spec)),
+        "uses_food_restriction": restriction is not None,
         "final_total_abundance": float(final_state.sum()),
         "max_species_count": float(final_state.max()) if final_state.size else 0.0,
         "network_spec": asdict(spec),
@@ -1014,9 +1147,14 @@ def skipped_run_record(
         "stepper_name": None,
         "n_species": 0,
         "n_channels": 0,
+        "food_supply_mode": normalize_food_supply_mode(settings.food_supply_mode)
+        if settings.food_supply_mode is not None
+        else normalize_food_supply_mode(network_spec(network_name).food_supply_mode),
+        "uses_explicit_food_inflow": False,
+        "uses_food_restriction": False,
         "final_total_abundance": 0.0,
         "max_species_count": 0.0,
-        "network_spec": asdict(network_spec(network_name)),
+        "network_spec": asdict(network_spec_for_run(network_name, food_supply_mode=settings.food_supply_mode)),
         "run_settings": asdict(settings),
         "catalysis_assignment": {},
     }
@@ -1129,6 +1267,9 @@ def write_tables(records: Sequence[dict[str, Any]], output_dir: Path | str) -> d
             "stepper_name",
             "n_species",
             "n_channels",
+            "food_supply_mode",
+            "uses_explicit_food_inflow",
+            "uses_food_restriction",
         ]
         with records_csv.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1191,6 +1332,9 @@ def write_simulation_summary_tables(records: Sequence[dict[str, Any]], output_di
         "stepper_name",
         "n_species",
         "n_channels",
+        "food_supply_mode",
+        "uses_explicit_food_inflow",
+        "uses_food_restriction",
     ]
     with summary_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1271,14 +1415,21 @@ def main_single(method: str) -> None:
         t_end=_parse_optional_float(args.t_end),
         max_steps=int(args.max_steps),
         max_runtime_seconds=float(args.wall_seconds),
+        food_supply_mode=args.food_supply_mode,
         blended_i1=float(args.blended_i1),
         blended_i2=float(args.blended_i2),
         blended_dt_cle=float(args.blended_dt_cle),
         blended_dt_macro=float(args.blended_dt_macro),
+        blended_beta_compute_mode=str(args.blended_beta_compute_mode),
+        blended_strict_int_for_CLE=bool(args.blended_strict_int_for_CLE),
         pdmp_ode_step=float(args.pdmp_ode_step),
     )
     records: list[dict[str, Any]] = []
-    print(f"[single method run] method={method_key} networks={list(networks)} wall_seconds={settings.max_runtime_seconds}")
+    food_mode = settings.food_supply_mode if settings.food_supply_mode is not None else "network-default"
+    print(
+        f"[single method run] method={method_key} networks={list(networks)} "
+        f"wall_seconds={settings.max_runtime_seconds} food_supply_mode={food_mode}"
+    )
     for network_name in networks:
         print(f"\n[run] network={network_name} method={method_key}")
         if bool(args.profile):
@@ -1328,11 +1479,25 @@ def _single_parser(method: str) -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=DEFAULT_SETTINGS.seed)
     parser.add_argument("--t-end", default="none", help="Use 'none' to stop by wall-clock/max-steps.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_SETTINGS.max_steps)
+    parser.add_argument(
+        "--food-supply-mode",
+        choices=("explicit_inflow", "constant", "upper_limit", "none"),
+        default=DEFAULT_SETTINGS.food_supply_mode,
+        help="Override food handling for networks that declare food_species.",
+    )
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--blended-i1", type=float, default=DEFAULT_SETTINGS.blended_i1)
     parser.add_argument("--blended-i2", type=float, default=DEFAULT_SETTINGS.blended_i2)
     parser.add_argument("--blended-dt-cle", type=float, default=DEFAULT_SETTINGS.blended_dt_cle)
     parser.add_argument("--blended-dt-macro", type=float, default=DEFAULT_SETTINGS.blended_dt_macro)
+    parser.add_argument(
+        "--blended-beta-compute-mode",
+        choices=("beta_fully_compute", "beta_compute_by_state_difference"),
+        default=DEFAULT_SETTINGS.blended_beta_compute_mode,
+    )
+    parser.add_argument("--blended-strict-int-for-cle", dest="blended_strict_int_for_CLE", action="store_true")
+    parser.add_argument("--no-blended-strict-int-for-cle", dest="blended_strict_int_for_CLE", action="store_false")
+    parser.set_defaults(blended_strict_int_for_CLE=DEFAULT_SETTINGS.blended_strict_int_for_CLE)
     parser.add_argument("--pdmp-ode-step", type=float, default=DEFAULT_SETTINGS.pdmp_ode_step)
     parser.add_argument("--profile", dest="profile", action="store_true", default=True)
     parser.add_argument("--no-profile", dest="profile", action="store_false")
@@ -1398,6 +1563,9 @@ def _profile_report_record(record: dict[str, Any]) -> dict[str, object]:
             "stepper_name": record.get("stepper_name"),
             "n_species": record.get("n_species"),
             "n_channels": record.get("n_channels"),
+            "food_supply_mode": record.get("food_supply_mode"),
+            "uses_explicit_food_inflow": record.get("uses_explicit_food_inflow"),
+            "uses_food_restriction": record.get("uses_food_restriction"),
         },
         "profile_top": list(record.get("profile_top", [])),
     }
@@ -1472,8 +1640,8 @@ def _markdown_simulation_summary(records: Sequence[dict[str, Any]]) -> str:
     lines.extend([
         "## Flat Summary",
         "",
-        "| max_runtime_seconds | network | method | simulation_final_time | wall_runtime_seconds | n_steps | n_events | stop_reason |",
-        "|---:|---|---|---:|---:|---:|---:|---|",
+        "| max_runtime_seconds | network | method | food_supply_mode | simulation_final_time | wall_runtime_seconds | n_steps | n_events | stop_reason |",
+        "|---:|---|---|---|---:|---:|---:|---:|---|",
     ])
     for record in records:
         lines.append(
@@ -1483,6 +1651,7 @@ def _markdown_simulation_summary(records: Sequence[dict[str, Any]]) -> str:
                     _format_summary_value(record.get("max_runtime_seconds")),
                     str(record.get("network")),
                     str(record.get("method")),
+                    str(record.get("food_supply_mode")),
                     _format_summary_value(record.get("simulation_final_time")),
                     _format_summary_value(record.get("wall_runtime_seconds")),
                     _format_summary_value(record.get("n_steps")),
@@ -1536,6 +1705,9 @@ def _simulation_summary_record(record: dict[str, Any]) -> dict[str, Any]:
         "stepper_name": pick("stepper_name"),
         "n_species": pick("n_species"),
         "n_channels": pick("n_channels"),
+        "food_supply_mode": pick("food_supply_mode"),
+        "uses_explicit_food_inflow": pick("uses_explicit_food_inflow"),
+        "uses_food_restriction": pick("uses_food_restriction"),
     }
 
 

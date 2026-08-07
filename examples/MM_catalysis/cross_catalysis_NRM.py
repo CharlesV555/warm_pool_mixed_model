@@ -20,6 +20,7 @@ from polymer_sim import (
     clear_all_catalysis,
     format_stepper_info,
     generate_fixed_species_space,
+    normalize_food_supply_mode,
     save_trajectory_record,
 )
 
@@ -44,10 +45,11 @@ K_NONFOOD_OUTFLOW = 10
 CATALYSIS_MODE = "linear"
 SATURATION_ALPHA = 0.01
 
-INITIAL_FOOD_COUNT = 1000.0
+INITIAL_FOOD_COUNT = 10.0
 FOOD_INFLOW_RATE = 10000.0
 FOOD_INFLOW_HILL_COEFFICIENT = 2.0
 FOOD_MAX_COUNT = INITIAL_FOOD_COUNT
+FOOD_SUPPLY_MODE = "upper_limit"
 INITIAL_COUNTS = {
     name: min(INITIAL_FOOD_COUNT, FOOD_MAX_COUNT)
     for name in ALPHABET
@@ -66,7 +68,9 @@ CROSS_CATALYSIS_RULES = {
 OUTPUT_PATH = EXAMPLES_DIR / "cross_catalysis_NRM_trajectory.npz"
 
 
-def build_cross_catalysis_network() -> tuple[ReactionNetworkData, dict]:
+def build_cross_catalysis_network(*, food_supply_mode: str | None = None) -> tuple[ReactionNetworkData, dict]:
+    mode = normalize_food_supply_mode(FOOD_SUPPLY_MODE if food_supply_mode is None else food_supply_mode)
+    use_explicit_food_inflow = mode in {"explicit_inflow", "upper_limit"}
     space = generate_fixed_species_space(
         ALPHABET,
         max_len=MAX_LEN,
@@ -86,13 +90,13 @@ def build_cross_catalysis_network() -> tuple[ReactionNetworkData, dict]:
             for sid, name in enumerate(space.species_names)
             if name not in ALPHABET
         ],
-        k_inflow=FOOD_INFLOW_RATE,
+        k_inflow=FOOD_INFLOW_RATE if use_explicit_food_inflow else 0.0,
         inflow_species_ids=[
             sid
             for sid, name in enumerate(space.species_names)
             if name in ALPHABET
-        ],
-        inflow_capacity=FOOD_MAX_COUNT,
+        ] if use_explicit_food_inflow else None,
+        inflow_capacity=FOOD_MAX_COUNT if use_explicit_food_inflow else None,
         inflow_hill_coefficient=FOOD_INFLOW_HILL_COEFFICIENT,
         catalysis_mode=CATALYSIS_MODE,
         saturation_alpha=SATURATION_ALPHA,
@@ -217,6 +221,7 @@ def example_parameters() -> dict:
         "k_nonfood_outflow": K_NONFOOD_OUTFLOW,
         "initial_food_count": INITIAL_FOOD_COUNT,
         "effective_initial_counts": dict(INITIAL_COUNTS),
+        "food_supply_mode": FOOD_SUPPLY_MODE,
         "food_inflow_rate": FOOD_INFLOW_RATE,
         "food_inflow_hill_coefficient": FOOD_INFLOW_HILL_COEFFICIENT,
         "food_max_count": FOOD_MAX_COUNT,
