@@ -65,8 +65,9 @@ def print_static_raf_result(max_raf, irr_rafs) -> None:
 #   the Hill-like capacity factor controlled by FOOD_MAX_COUNT and
 #   FOOD_INFLOW_HILL_COEFFICIENT.
 # - "constant": food is a chemostat boundary condition. The network is built
-#   without food INFLOW channels, and runner applies a restriction that resets
-#   food counts to INITIAL_FOOD_COUNT after each SSA event.
+#   without food INFLOW channels; build_food_supply_restriction configures food
+#   as network-level constants and returns None, so runner does not project or
+#   invalidate stepper caches.
 # - "upper_limit": runner caps food from above but does not replenish it.
 # - "none": no food input or restriction is applied.
 

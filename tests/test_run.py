@@ -2,6 +2,8 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
+
 from polymer_sim import (
     ChannelBlock,
     ExperimentRunner,
@@ -12,6 +14,8 @@ from polymer_sim import (
     TrajectoryRecorder,
     build_reaction_rule_tables,
     generate_fixed_species_space,
+    save_trajectory_record,
+    trajectory_dt_statistics,
 )
 
 
@@ -35,6 +39,52 @@ def test_ssa_runs():
     assert result.state.t == 0.5
     assert result.summary.n_steps >= 1
     assert recorder.finalize().states.shape[1] == network.n_species
+
+
+def test_runner_stops_on_catalytic_overflow_guard():
+    network = make_network()
+    a = network.species_idx("A")
+    b = network.species_idx("B")
+    catalyst = network.species_idx("AA")
+    channel = network.channel_id(ChannelBlock.LEFT_ADD, int(network.left_add_local_id[a, b]))
+    network.set_catalytic_strength(channel, catalyst_sid=catalyst, strength=1e200, mirror_reverse=False)
+    x0 = network.x0.copy()
+    x0[a] = 1e10
+    x0[b] = 1e10
+    x0[catalyst] = 1e100
+
+    result = ExperimentRunner().run_one(network, SSAStepper(), t_end=0.5, seed=17, x0=x0)
+
+    assert result.summary.metadata["stop_reason"] == "numerical_guard_catalysis_overflow_risk"
+    guard = result.summary.metadata["numerical_guard"]
+    assert guard["guard"] == "catalytic_propensity_multiply"
+    assert guard["threshold_fraction_of_float_max"] == 0.5
+    assert guard["n_risky_entries"] >= 1
+    assert result.summary.final_time == 0.0
+
+
+def test_trajectory_dt_statistics_reads_intervals_without_states():
+    network = make_network()
+    recorder = TrajectoryRecorder()
+    ExperimentRunner().run_one(network, SSAStepper(), t_end=0.5, seed=13, recorder=recorder)
+    record = recorder.finalize()
+    path = Path("tests") / "_trajectory_dt_statistics_tmp.npz"
+    plot_path = Path("tests") / "_trajectory_dt_statistics_tmp.png"
+    path.unlink(missing_ok=True)
+    plot_path.unlink(missing_ok=True)
+
+    save_trajectory_record(path, record)
+    stats = trajectory_dt_statistics(path, bins=5, plot_path=plot_path, x_log=True)
+
+    assert stats.count == record.times.size - 1
+    assert stats.histogram_counts.sum() == stats.count
+    assert np.all(stats.histogram_edges > 0.0)
+    assert stats.plot_path == str(plot_path)
+    assert plot_path.exists()
+    assert "accepted_step_intervals" in np.load(path, allow_pickle=False).files
+
+    path.unlink(missing_ok=True)
+    plot_path.unlink(missing_ok=True)
 
 
 def test_hybrid_skeleton_runs():

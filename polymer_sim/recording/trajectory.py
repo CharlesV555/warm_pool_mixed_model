@@ -11,10 +11,41 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import json
+from typing import Any
 
 import numpy as np
 
 from polymer_sim.recording.base import BaseRecorder, BaseTrajectoryRecord, PathLike
+
+
+@dataclass(slots=True)
+class DTStatistics:
+    """Lightweight accepted-step interval statistics from a trajectory file."""
+
+    count: int
+    total_time: float
+    min: float
+    max: float
+    mean: float
+    median: float
+    std: float
+    histogram_counts: np.ndarray
+    histogram_edges: np.ndarray
+    plot_path: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "count": int(self.count),
+            "total_time": float(self.total_time),
+            "min": float(self.min),
+            "max": float(self.max),
+            "mean": float(self.mean),
+            "median": float(self.median),
+            "std": float(self.std),
+            "histogram_counts": np.asarray(self.histogram_counts, dtype=np.int64).tolist(),
+            "histogram_edges": np.asarray(self.histogram_edges, dtype=float).tolist(),
+            "plot_path": self.plot_path,
+        }
 
 
 @dataclass(slots=True)
@@ -34,10 +65,15 @@ class TrajectoryRecord(BaseTrajectoryRecord):
     states: np.ndarray
     species_names: list[str]
     run_metadata: dict
+    accepted_step_intervals: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         self.times = np.asarray(self.times, dtype=float)
         self.states = np.asarray(self.states, dtype=float)
+        if self.accepted_step_intervals is not None:
+            self.accepted_step_intervals = np.asarray(self.accepted_step_intervals, dtype=float)
+            if self.accepted_step_intervals.ndim != 1:
+                raise ValueError("accepted_step_intervals must have shape (T - 1,)")
         if self.times.ndim != 1:
             raise ValueError("times must have shape (T,)")
         if self.states.ndim != 2:
@@ -46,6 +82,25 @@ class TrajectoryRecord(BaseTrajectoryRecord):
             raise ValueError("states.shape[0] must match times.shape[0]")
         if self.states.shape[1] != len(self.species_names):
             raise ValueError("states.shape[1] must match len(species_names)")
+
+    @staticmethod
+    def dt_statistics(
+        path: PathLike,
+        *,
+        bins: int | str | np.ndarray = 50,
+        plot_path: PathLike | None = None,
+        x_log: bool = False,
+        y_log: bool = False,
+    ) -> DTStatistics:
+        """Load only accepted-step intervals from a saved trajectory and summarize them.
+
+        This is intentionally file-based and lightweight: it reads the
+        ``accepted_step_intervals`` array from the npz without materializing the
+        potentially large ``states`` matrix.  Older files without that array fall
+        back to reading only ``times`` and computing ``np.diff(times)``.
+        """
+
+        return trajectory_dt_statistics(path, bins=bins, plot_path=plot_path, x_log=x_log, y_log=y_log)
 
 
 class TrajectoryRecorder(BaseRecorder):
@@ -60,6 +115,7 @@ class TrajectoryRecorder(BaseRecorder):
         self._times: list[float] = []
         self._states: list[np.ndarray] = []
         self._metadata: dict = {}
+        self._accepted_step_intervals: list[float] = []
         self._channel_trigger_counts: np.ndarray | None = None
         self._channel_continuous_trigger_counts: np.ndarray | None = None
         self._channel_event_times: list[float] = []
@@ -77,6 +133,7 @@ class TrajectoryRecorder(BaseRecorder):
         self._times = [0.0]
         self._states = [np.asarray(initial_state, dtype=float).copy()]
         self._metadata = dict(metadata or {})
+        self._accepted_step_intervals = []
         n_channels = self._metadata.get("n_channels")
         self._channel_trigger_counts = (
             np.zeros(int(n_channels), dtype=np.int64) if n_channels is not None else None
@@ -115,7 +172,10 @@ class TrajectoryRecorder(BaseRecorder):
         event_time: float | None = None,
         metadata: dict | None = None,
     ) -> None:
-        self._times.append(float(time))
+        current_time = float(time)
+        previous_time = float(self._times[-1]) if self._times else 0.0
+        self._accepted_step_intervals.append(float(max(current_time - previous_time, 0.0)))
+        self._times.append(current_time)
         self._states.append(np.asarray(state, dtype=float).copy())
         step_metadata = dict(metadata or {})
         continuous_increments = step_metadata.pop("continuous_channel_abs_increments", None)
@@ -193,6 +253,7 @@ class TrajectoryRecorder(BaseRecorder):
             states=np.vstack(self._states) if self._states else np.empty((0, 0), dtype=float),
             species_names=list(self._species_names),
             run_metadata=dict(self._metadata),
+            accepted_step_intervals=np.asarray(self._accepted_step_intervals, dtype=float),
         )
 
 
@@ -205,6 +266,11 @@ def save_trajectory_record(path: PathLike, record: TrajectoryRecord) -> None:
         path_obj,
         times=record.times,
         states=record.states,
+        accepted_step_intervals=(
+            np.asarray(record.accepted_step_intervals, dtype=float)
+            if record.accepted_step_intervals is not None
+            else np.diff(np.asarray(record.times, dtype=float))
+        ),
         species_names=np.asarray(record.species_names, dtype=object),
         run_metadata_json=json.dumps(record.run_metadata, ensure_ascii=True),
     )
@@ -220,4 +286,141 @@ def load_trajectory_record(path: PathLike) -> TrajectoryRecord:
             states=np.asarray(data["states"], dtype=float),
             species_names=[str(name) for name in data["species_names"].tolist()],
             run_metadata=metadata,
+            accepted_step_intervals=(
+                np.asarray(data["accepted_step_intervals"], dtype=float)
+                if "accepted_step_intervals" in data.files
+                else np.diff(np.asarray(data["times"], dtype=float))
+            ),
         )
+
+
+def trajectory_dt_statistics(
+    path: PathLike,
+    *,
+    bins: int | str | np.ndarray = 50,
+    plot_path: PathLike | None = None,
+    x_log: bool = False,
+    y_log: bool = False,
+) -> DTStatistics:
+    """Summarize accepted-step intervals from a trajectory npz without loading states."""
+
+    intervals = _load_accepted_step_intervals(path)
+    intervals = intervals[np.isfinite(intervals)]
+    histogram_intervals = intervals[intervals > 0.0] if x_log else intervals
+    if intervals.size == 0:
+        counts = np.zeros(0, dtype=np.int64)
+        edges = np.zeros(0, dtype=float)
+        stats = DTStatistics(
+            count=0,
+            total_time=0.0,
+            min=float("nan"),
+            max=float("nan"),
+            mean=float("nan"),
+            median=float("nan"),
+            std=float("nan"),
+            histogram_counts=counts,
+            histogram_edges=edges,
+        )
+    else:
+        counts, edges = _dt_histogram(histogram_intervals, bins=bins, x_log=bool(x_log))
+        stats = DTStatistics(
+            count=int(intervals.size),
+            total_time=float(np.sum(intervals)),
+            min=float(np.min(intervals)),
+            max=float(np.max(intervals)),
+            mean=float(np.mean(intervals)),
+            median=float(np.median(intervals)),
+            std=float(np.std(intervals)),
+            histogram_counts=np.asarray(counts, dtype=np.int64),
+            histogram_edges=np.asarray(edges, dtype=float),
+        )
+    if plot_path is not None:
+        stats.plot_path = str(_save_dt_statistics_bar_plot(plot_path, stats, x_log=bool(x_log), y_log=bool(y_log)))
+    return stats
+
+
+def _load_accepted_step_intervals(path: PathLike) -> np.ndarray:
+    with np.load(Path(path), allow_pickle=False) as data:
+        if "accepted_step_intervals" in data.files:
+            intervals = np.asarray(data["accepted_step_intervals"], dtype=float)
+        else:
+            times = np.asarray(data["times"], dtype=float)
+            intervals = np.diff(times)
+    if intervals.ndim != 1:
+        raise ValueError("accepted_step_intervals must have shape (T - 1,)")
+    return intervals
+
+
+def _dt_histogram(intervals: np.ndarray, *, bins: int | str | np.ndarray, x_log: bool) -> tuple[np.ndarray, np.ndarray]:
+    values = np.asarray(intervals, dtype=float)
+    if values.size == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=float)
+    if not x_log:
+        return np.histogram(values, bins=bins)
+
+    if isinstance(bins, str):
+        bin_count = 50
+    elif np.isscalar(bins):
+        bin_count = max(int(bins), 1)
+    else:
+        edges = np.asarray(bins, dtype=float)
+        if np.any(edges <= 0.0):
+            raise ValueError("log-x histogram bin edges must be positive")
+        return np.histogram(values, bins=edges)
+
+    min_dt = float(np.min(values))
+    max_dt = float(np.max(values))
+    if min_dt <= 0.0:
+        raise ValueError("log-x dt histogram requires positive intervals")
+    if min_dt == max_dt:
+        lower = min_dt / np.sqrt(10.0)
+        upper = max_dt * np.sqrt(10.0)
+    else:
+        lower = min_dt
+        upper = max_dt
+    edges = np.logspace(np.log10(lower), np.log10(upper), bin_count + 1)
+    return np.histogram(values, bins=edges)
+
+
+def _save_dt_statistics_bar_plot(path: PathLike, stats: DTStatistics, *, x_log: bool, y_log: bool) -> Path:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.0))
+    counts = np.asarray(stats.histogram_counts, dtype=float)
+    edges = np.asarray(stats.histogram_edges, dtype=float)
+    if counts.size and edges.size == counts.size + 1:
+        widths = np.diff(edges)
+        ax.bar(edges[:-1], counts, width=widths, align="edge", edgecolor="black", linewidth=0.4)
+    ax.set_xlabel("accepted step interval dt")
+    ax.set_ylabel("count")
+    if x_log:
+        ax.set_xscale("log")
+    if y_log:
+        ax.set_yscale("log")
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
+def trajectory_final_time(path: PathLike) -> float:
+    """Return the final simulation time from a saved trajectory npz.
+
+    This lightweight inspection helper reads only the ``times`` array, so it
+    avoids loading the potentially large ``states`` matrix.
+    """
+
+    with np.load(Path(path), allow_pickle=False) as data:
+        times = np.asarray(data["times"], dtype=float)
+        if times.ndim != 1:
+            raise ValueError("trajectory times must have shape (T,)")
+        if times.size == 0:
+            raise ValueError("trajectory contains no time points")
+        return float(times[-1])

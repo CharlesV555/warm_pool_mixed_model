@@ -77,7 +77,8 @@ def create_beta_hybrid_update_config(
             {
                 **base_settings,
                 "blended_beta_compute_mode": "beta_fully_compute",
-                "blended_strict_int_for_CLE": False,
+                "blended_strict_int_for_CLE": True,
+                "local_propensity_calculation": False,
             },
         ),
         (
@@ -86,6 +87,7 @@ def create_beta_hybrid_update_config(
                 **base_settings,
                 "blended_beta_compute_mode": "beta_fully_compute",
                 "blended_strict_int_for_CLE": True,
+                "local_propensity_calculation": True,
             },
         ),
         (
@@ -93,7 +95,8 @@ def create_beta_hybrid_update_config(
             {
                 **base_settings,
                 "blended_beta_compute_mode": "beta_compute_by_state_difference",
-                "blended_strict_int_for_CLE": False,
+                "blended_strict_int_for_CLE": True,
+                "local_propensity_calculation": False,
             },
         ),
         (
@@ -102,6 +105,7 @@ def create_beta_hybrid_update_config(
                 **base_settings,
                 "blended_beta_compute_mode": "beta_compute_by_state_difference",
                 "blended_strict_int_for_CLE": True,
+                "local_propensity_calculation": True,
             },
         ),
     ]

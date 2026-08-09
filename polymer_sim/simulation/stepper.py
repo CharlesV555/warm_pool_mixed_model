@@ -5,10 +5,10 @@ from dataclasses import dataclass
 import heapq
 from time import perf_counter
 from typing import Any
+import warnings
 
 from line_profiler import profile
 import numpy as np
-from scipy.sparse import csr_matrix
 
 from polymer_sim.core.elementary import ElementaryMassActionNetwork
 from polymer_sim.core.enums import ChannelBlock
@@ -185,10 +185,17 @@ class BlendedHybridConfig:
     beta_compute_mode: str = "beta_fully_compute"
     round_low_counts_after_cle: bool = True
     strict_int_for_CLE: bool = False
-    use_reaction_interval_dt: bool = False
+    local_propensity_calculation: bool = False
+
+    # 看矩阵稀疏度，可以删了
+    cle_sparsity_sampling: bool = False
+    cle_sparsity_sample_interval: int = 100
+    cle_sparsity_plot_path: str | None = None
+
+    use_reaction_interval_dt: bool = False # 用平均反应间隔自动给 CLE dt 一个基础估计
     reaction_interval_update_steps: int = 100
     reaction_interval_scale: float = 1.0
-    adaptive_cle_dt: bool = True
+    adaptive_cle_dt: bool = True # CLE 实际执行时，根据是否产生负数动态缩小或放大 dt
     cle_dt_min: float = 1e-12
     cle_dt_max: float | None = None
     cle_dt_shrink_factor: float = 0.5
@@ -207,6 +214,14 @@ class BlendedHybridConfig:
         self.beta_compute_mode = str(self.beta_compute_mode).lower()
         self.round_low_counts_after_cle = bool(self.round_low_counts_after_cle)
         self.strict_int_for_CLE = bool(self.strict_int_for_CLE)
+        self.local_propensity_calculation = bool(self.local_propensity_calculation)
+        # CLE sparsity probe insertion point 1/4:
+        # explicit config switch; default False keeps the core CLE path unchanged.
+        self.cle_sparsity_sampling = bool(self.cle_sparsity_sampling)
+        self.cle_sparsity_sample_interval = int(self.cle_sparsity_sample_interval)
+        self.cle_sparsity_plot_path = (
+            None if self.cle_sparsity_plot_path is None else str(self.cle_sparsity_plot_path)
+        )
         self.reaction_interval_update_steps = int(self.reaction_interval_update_steps)
         self.reaction_interval_scale = float(self.reaction_interval_scale)
         self.adaptive_cle_dt = bool(self.adaptive_cle_dt)
@@ -245,6 +260,8 @@ class BlendedHybridConfig:
             raise ValueError("cle_dt_growth_factor must be >= 1")
         if self.cle_dt_max_retries < 0:
             raise ValueError("cle_dt_max_retries must be >= 0")
+        if self.cle_sparsity_sample_interval <= 0:
+            raise ValueError("cle_sparsity_sample_interval must be > 0")
 
     @property
     def effective_dt_macro(self) -> float:
@@ -2123,7 +2140,7 @@ class PDMPStepper(BaseStepper):
         for sid in reactants:
             key = int(sid)
             required[key] = required.get(key, 0) + 1
-        x = np.asarray(state.x, dtype=float)
+        x = _effective_state_values_for_network(network, state.x)
         tol = max(float(self.config.hazard_tol), 1e-12)
         return all(float(x[sid]) >= float(count) - tol for sid, count in required.items())
 
@@ -2160,7 +2177,7 @@ class PDMPStepper(BaseStepper):
         reactant1 = np.asarray(getattr(network, "reactant1"), dtype=np.int64)[ids]
         reactant2 = np.asarray(getattr(network, "reactant2"), dtype=np.int64)[ids]
         homo_second_order = np.asarray(getattr(network, "homo_second_order"), dtype=bool)[ids]
-        x = np.asarray(state.x, dtype=float)
+        x = _effective_state_values_for_network(network, state.x)
         tol = max(float(self.config.hazard_tol), 1e-12)
 
         first = order == 1
@@ -3177,11 +3194,51 @@ class BlendedHybridStepper(BaseStepper):
         self._last_observed_propensity_beta_extra_channels = 0
         self._last_observed_propensity_changed_catalyst_species = 0
         self._last_observed_propensity_catalyst_affected_channels = 0
+        self._observed_propensity_cache_miss_records: list[dict[str, Any]] = []
         self._stoich_sparsity_profile = None
+        self._cle_sparsity_sampler = None
+        if self.config.cle_sparsity_sampling:
+            # CLE sparsity probe insertion point 2/4:
+            # sampler construction is gated by the explicit config switch.
+            from polymer_sim.recording.cle_sparsity_sampler import CLESparsitySampler
+
+            self._cle_sparsity_sampler = CLESparsitySampler(
+                sample_interval=self.config.cle_sparsity_sample_interval,
+                plot_path=self.config.cle_sparsity_plot_path,
+            )
 
     def invalidate_cache(self) -> None:
         self._invalidate_beta_cache()
         self._invalidate_observed_propensity_cache()
+
+    def summary_metadata(self) -> dict[str, Any]:
+        if self._cle_sparsity_sampler is None:
+            return {}
+        return {"cle_sparsity_sampling": self._cle_sparsity_sampler.summary_metadata()}
+
+    def write_observed_propensity_cache_miss_log(self, path: str | Any) -> str | None:
+        if not self._observed_propensity_cache_miss_records:
+            return None
+        from pathlib import Path
+
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# BlendedHybridStepper observed propensity cache miss log",
+            f"n_records: {len(self._observed_propensity_cache_miss_records)}",
+            "",
+        ]
+        for index, record in enumerate(self._observed_propensity_cache_miss_records, start=1):
+            lines.append(f"[{index}]")
+            lines.append(f"name: {record['name']}")
+            lines.append(f"n_channels: {record['n_channels']}")
+            lines.append(f"n_species: {record['n_species']}")
+            lines.append("reasons:")
+            for reason in record["reasons"]:
+                lines.append(f"- {reason}")
+            lines.append("")
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        return str(out_path)
 
     def step(self, state: SystemState, dt: float, context: StepperContext) -> StepResult:
         if dt <= 0.0:
@@ -3257,12 +3314,7 @@ class BlendedHybridStepper(BaseStepper):
         network = context.network
         duration = min(self._current_dt_macro(), dt)
         observed = self._rounded_nonnegative(state.x) if observed is None else np.asarray(observed, dtype=float)
-        if self.config.strict_int_for_CLE:
-            propensities = self._propensities_for_observed_cached(network, observed, state.t, "jump propensities")
-        else:
-            self._last_observed_propensity_update_path = "full_uncached"
-            propensities = self._propensities_for_x(network, observed, state.t)
-            propensities = self._clean_propensities(propensities, "jump propensities")
+        propensities = self._propensities_for_state(network, observed, state.t, "jump propensities")
         total = float(np.sum(propensities))
         state.x[:] = observed
 
@@ -3327,12 +3379,7 @@ class BlendedHybridStepper(BaseStepper):
         network = context.network
         duration = min(self._current_dt_cle(), dt)
         observed = self._rounded_nonnegative(state.x) if observed is None else np.asarray(observed, dtype=float) # 若没有传入rounded，现场做。
-        if self.config.strict_int_for_CLE: # 采取共享propensity
-            base_jump = self._propensities_for_observed_cached(network, observed, state.t, "jump propensities") # 第一次计算propensity
-        else:
-            self._last_observed_propensity_update_path = "full_uncached"
-            base_jump = self._propensities_for_x(network, observed, state.t) # 耗时大头
-            base_jump = self._clean_propensities(base_jump, "jump propensities") # 把负数换成0
+        base_jump = self._propensities_for_state(network, observed, state.t, "jump propensities")
         lambda_jump = self._clean_propensities(beta * base_jump, "split jump propensities (beta or propensity may be negative)") # 这里是全量beta*propensity,能否结合“改变的mask”来减少？
         total_jump = float(np.sum(lambda_jump))
 
@@ -3451,7 +3498,7 @@ class BlendedHybridStepper(BaseStepper):
             },
         )
         
-    @profile
+
     def _cle_increment(
         self,
         network: ReactionNetworkData,
@@ -3473,12 +3520,7 @@ class BlendedHybridStepper(BaseStepper):
         x0 = self._float_nonnegative(x_float) # 又来一次
         if base_propensities is None: # 如果没有传入缓存的propensity
             propensity_state = self._rounded_nonnegative(x0) if self.config.strict_int_for_CLE else x0
-            if self.config.strict_int_for_CLE:
-                prop = self._propensities_for_observed_cached(network, propensity_state, 0.0, "CLE propensities")
-            else:
-                self._last_observed_propensity_update_path = "full_uncached"
-                prop = self._propensities_for_x(network, propensity_state, 0.0) # 耗时项
-                prop = self._clean_propensities(prop, "CLE propensities")
+            prop = self._propensities_for_state(network, propensity_state, 0.0, "CLE propensities")
         else: # 有propensity缓存就直接用，还是已经检查过non_negative的
             prop = np.asarray(base_propensities, dtype=float)
             if prop.shape != (network.n_channels,):
@@ -3492,38 +3534,19 @@ class BlendedHybridStepper(BaseStepper):
         amounts = means + np.sqrt(np.maximum(means, 0.0)) * rng.normal(size=network.n_channels)
         self._last_continuous_channel_abs_increments = np.abs(amounts).astype(float, copy=False)
         
-        S = self._stoichiometry_matrix(network)
-        ### 测试函数
-        
+        S_dense = network.nu
+        # Sparse stoichiometry is precomputed by the core network object.
+        # Do not build csr_matrix(...) here; _cle_increment is a hot path.
+        S = network.nu_csr
+        if self._cle_sparsity_sampler is not None:
+            # CLE sparsity probe insertion point 3/4:
+            # amounts and dense S already exist here; sampling is skipped unless the config switch created a sampler.
+            self._cle_sparsity_sampler.sample(amounts, S_dense, S)
 
-        # # ---- sparsity profiling ----
-        # if not hasattr(self, "_stoich_sparsity_profile"):
-        #     nnz = np.count_nonzero(S)
-        #     total = S.size
-            
-        #     self._stoich_sparsity_profile = {
-        #         "n_reactions": S.shape[0],
-        #         "n_species": S.shape[1],
-        #         "matrix_size": total,
-        #         "nnz": nnz,
-        #         "density": nnz / total,
-        #         "sparsity": 1 - nnz / total,
-        #     }
-
-        increment = amounts @ S
-        ### 测试函数结束
-        
-        # increment = amounts @ self._stoichiometry_matrix(network) # 如何优化？
-        #尝试1：自动转化为稀疏矩阵，并采取切片更新
-        # S = csr_matrix(S)
-        # # increment = amounts @ S
-        # cle_mask = beta < 1
-
-        # amounts_cle = amounts[cle_mask]
-
-        # S_cle = S[cle_mask,:]
-
-        # increment = amounts_cle @ S_cle
+        # amounts already contains exact zeros for channels with zero CLE propensity
+        # including beta == 1 channels, so slicing S by cle_mask only builds an
+        # expensive temporary CSR matrix without changing the product.
+        increment = np.asarray(amounts @ S, dtype=float).reshape(-1)
         
         
         x_new = x0 + increment
@@ -3660,6 +3683,7 @@ class BlendedHybridStepper(BaseStepper):
             "cle_dt_min_reached": bool(result.min_dt_reached),
         }
 
+    @profile
     def _channel_betas(self, network: ReactionNetworkData, x: np.ndarray) -> np.ndarray:
         # lookup 是拓扑缓存：记录 channel -> relevant species，以及反向的 species -> affected beta channels。
         # 它只依赖 network 和 beta_species_mode，不依赖当前 state.x。
@@ -3971,6 +3995,21 @@ class BlendedHybridStepper(BaseStepper):
     def _propensities_for_x(self, network: ReactionNetworkData, x: np.ndarray, t: float) -> np.ndarray:
         return network.compute_all_propensities(SystemState(t=float(t), x=np.asarray(x, dtype=float)))
 
+    def _propensities_for_state(
+        self,
+        network: ReactionNetworkData,
+        x: np.ndarray,
+        t: float,
+        name: str,
+    ) -> np.ndarray:
+        # local_propensity_calculation 是唯一控制 BlendedHybrid propensity 是否走 cache/local update 的开关。
+        # strict_int_for_CLE 只决定调用方传进来的 x 是否是 rounded observed state，以及 mixed 内是否复用 base。
+        if self.config.local_propensity_calculation:
+            return self._propensities_for_observed_cached(network, x, t, name)
+        self._last_observed_propensity_update_path = "full_uncached"
+        propensities = self._propensities_for_x(network, x, t)
+        return self._clean_propensities(propensities, name)
+
     def _invalidate_observed_propensity_cache(self) -> None:
         self._observed_propensity_cache = None
         self._observed_propensity_state = None
@@ -3985,6 +4024,7 @@ class BlendedHybridStepper(BaseStepper):
         self._last_observed_propensity_changed_catalyst_species = 0
         self._last_observed_propensity_catalyst_affected_channels = 0
 
+    @profile
     def _propensities_for_observed_cached(
         self,
         network: ReactionNetworkData,
@@ -4007,12 +4047,18 @@ class BlendedHybridStepper(BaseStepper):
         self._last_observed_propensity_beta_extra_channels = 0
         self._last_observed_propensity_changed_catalyst_species = 0
         self._last_observed_propensity_catalyst_affected_channels = 0
-        if not self._observed_propensity_cache_matches(network): # 第一次计算会走这个路初始化propensity
+        mismatch_reasons = self._observed_propensity_cache_mismatch_reasons(network)
+        if mismatch_reasons:
+            self._warn_observed_propensity_cache_miss(name, mismatch_reasons)
             return self._recompute_observed_propensity_cache(network, values, t, name)
 
         cached_state = self._observed_propensity_state
         cached_propensities = self._observed_propensity_cache
         if cached_state is None or cached_propensities is None:
+            self._warn_observed_propensity_cache_miss(
+                name,
+                ["cache unexpectedly became incomplete after cache-match diagnostics"],
+            )
             return self._recompute_observed_propensity_cache(network, values, t, name)
 
         changed_species = np.flatnonzero(values[:n_species] != cached_state) # 对比存下来的缓存和传入的state是否一致
@@ -4043,7 +4089,7 @@ class BlendedHybridStepper(BaseStepper):
             self._last_observed_propensity_affected_updates = 0
             self._last_observed_propensity_update_path = "no_affected_channels"
             return cached_propensities
-        if affected.size >= n_channels or affected.size > self._observed_propensity_local_update_limit(n_channels):
+        if affected.size >= n_channels: # or affected.size > self._observed_propensity_local_update_limit(n_channels):
             return self._recompute_observed_propensity_cache(network, values, t, name)
 
         updated = network.compute_propensities_for_channels(affected, SystemState(t=float(t), x=values))
@@ -4126,6 +4172,49 @@ class BlendedHybridStepper(BaseStepper):
             and self._observed_propensity_network_id == id(network)
             and self._observed_propensity_cache.shape == (int(network.n_channels),)
             and self._observed_propensity_state.shape == (int(network.n_species),)
+        )
+
+    def _observed_propensity_cache_mismatch_reasons(self, network: ReactionNetworkData) -> list[str]:
+        reasons: list[str] = []
+        if self._observed_propensity_cache is None:
+            reasons.append("propensity cache is None")
+        elif self._observed_propensity_cache.shape != (int(network.n_channels),):
+            reasons.append(
+                "propensity cache shape "
+                f"{self._observed_propensity_cache.shape} != expected ({int(network.n_channels)},)"
+            )
+        if self._observed_propensity_state is None:
+            reasons.append("state cache is None")
+        elif self._observed_propensity_state.shape != (int(network.n_species),):
+            reasons.append(
+                "state cache shape "
+                f"{self._observed_propensity_state.shape} != expected ({int(network.n_species)},)"
+            )
+        if self._observed_propensity_network_id != id(network):
+            reasons.append(
+                "network id mismatch "
+                f"{self._observed_propensity_network_id!r} != {id(network)!r}"
+            )
+        return reasons
+
+    def _warn_observed_propensity_cache_miss(self, name: str, reasons: list[str]) -> None:
+        self._observed_propensity_cache_miss_records.append(
+            {
+                "name": str(name),
+                "reasons": [str(reason) for reason in reasons],
+                "n_channels": None
+                if self._observed_propensity_cache is None
+                else int(self._observed_propensity_cache.shape[0]),
+                "n_species": None
+                if self._observed_propensity_state is None
+                else int(self._observed_propensity_state.shape[0]),
+            }
+        )
+        warnings.warn(
+            "[BlendedHybridStepper] observed propensity cache miss for "
+            f"{name}; full propensity recompute is used. Reasons: {', '.join(reasons)}",
+            RuntimeWarning,
+            stacklevel=3,
         )
 
     def _recompute_observed_propensity_cache(
@@ -4358,16 +4447,12 @@ class NRMBlendedHybridStepper(BlendedHybridStepper):
         x_work = self._float_nonnegative(state.x).copy()
 
         observed_initial = self._rounded_nonnegative(x_work) if observed is None else np.asarray(observed, dtype=float)
-        if self.config.strict_int_for_CLE:
-            base_initial = self._propensities_for_observed_cached(
-                network,
-                observed_initial,
-                start_time,
-                "initial mixed propensities",
-            )
-        else:
-            base_initial = self._propensities_for_x(network, observed_initial, start_time)
-            base_initial = self._clean_propensities(base_initial, "initial mixed propensities")
+        base_initial = self._propensities_for_state(
+            network,
+            observed_initial,
+            start_time,
+            "initial mixed propensities",
+        )
         initial_cle_base_propensities = base_initial if self.config.strict_int_for_CLE else None
         total_jump_initial = float(np.sum(self._clean_propensities(beta * base_initial, "initial jump propensities")))
         total_cle_initial = float(
@@ -5005,8 +5090,32 @@ def _sample_channel( # 对离散通道抽发生的反应
     #         chosen = int(channel_id)
     #         break
     selected_channels = np.asarray(channels, dtype=np.int64)
-    selected_prop = propensities[selected_channels]
+    propensity_values = np.asarray(propensities, dtype=float)
+    if propensity_values.shape == selected_channels.shape:
+        selected_prop = propensity_values
+    else:
+        selected_prop = propensity_values[selected_channels]
     cum = np.cumsum(selected_prop)
-    chosen_idx = np.searchsorted(cum, threshold)
+    chosen_idx = min(int(np.searchsorted(cum, threshold)), int(selected_channels.size) - 1)
     chosen = selected_channels[chosen_idx]
     return chosen
+
+
+def _effective_state_values_for_network(
+    network: ReactionNetworkData | ElementaryMassActionNetwork,
+    x: np.ndarray,
+) -> np.ndarray:
+    method = getattr(network, "_effective_state_values", None)
+    if callable(method):
+        return method(x)
+    values = np.asarray(x, dtype=float)
+    mask = getattr(network, "chemostat_species_mask", None)
+    fixed = getattr(network, "chemostat_species_values", None)
+    if mask is None or fixed is None:
+        return values
+    mask_arr = np.asarray(mask, dtype=bool)
+    if mask_arr.shape != values.shape or not np.any(mask_arr):
+        return values
+    effective = np.array(values, dtype=float, copy=True)
+    effective[mask_arr] = np.asarray(fixed, dtype=float)[mask_arr]
+    return effective

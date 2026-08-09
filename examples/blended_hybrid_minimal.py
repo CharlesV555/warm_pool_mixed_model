@@ -32,8 +32,8 @@ from polymer_sim import (
 # - To change the simulation method, replace build_stepper() below.
 # - To change food handling, edit FOOD_SUPPLY_MODE:
 #   "explicit_inflow" keeps formal food INFLOW reaction channels;
-#   "constant" disables those channels during network construction and lets the
-#   runner apply a chemostat-style food projection after each accepted step.
+#   "constant" disables those channels during network construction and configures
+#   food as network-level constants; runner receives no food restriction.
 T_END = 200.0
 SEED = network_example.SEED
 MAX_STEPS = network_example.MAX_STEPS
@@ -73,12 +73,23 @@ def build_stepper() -> BlendedHybridStepper:
             use_reaction_interval_dt=False,
             reaction_interval_update_steps=1,
             strict_int_for_CLE=True,
+            local_propensity_calculation= True,
+            # optional CLE sparsity sampling and plotting 3行
+            # cle_sparsity_sampling=True,
+            # cle_sparsity_sample_interval=100,
+            # cle_sparsity_plot_path="cle_sparsity.png",
+            ###
         )
     )
 
 
 def build_food_restriction(network):
-    """Build the optional food boundary condition consumed by ExperimentRunner."""
+    """Configure optional food handling.
+
+    For FOOD_SUPPLY_MODE="constant" this mutates the network to install
+    chemostat species and returns None, so ExperimentRunner will not run a
+    post-step restriction or invalidate stepper caches.
+    """
 
     return build_food_supply_restriction(
         network,
@@ -124,6 +135,7 @@ def main() -> None:
     print(f"catalysis_mode={network.catalysis_mode}, saturation_alpha={network.saturation_alpha}")
     print(f"food_supply_mode={normalize_food_supply_mode(FOOD_SUPPLY_MODE)}")
     print(f"food_restriction={restriction is not None}")
+    print(f"food_chemostat={bool(getattr(network, 'has_chemostat_species', False))}")
     print(f"cross_catalysis_rules={network_example.CROSS_CATALYSIS_RULES}")
     print(f"final time: {result.summary.final_time:.4f}")
     print(f"n_steps: {result.summary.n_steps}")
@@ -134,6 +146,11 @@ def main() -> None:
     print(f"max species count: {float(result.summary.final_state.max()):.4f}")
     print(f"trajectory saved to: {OUTPUT_PATH}")
     
+    # 打印 CLE sparsity sampling probe information
+    # probe = result.summary.metadata["cle_sparsity_sampling"]
+    # print(probe["n_samples"])
+    # print(probe["samples"][:3])
+    # print(probe.get("plot_path"))
 
 
 if __name__ == "__main__":

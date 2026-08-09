@@ -4,12 +4,22 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
+from scipy.sparse import csr_matrix
 
 from polymer_sim.core.enums import BLOCK_NAMES, BLOCK_ORDER, ChannelBlock
 from polymer_sim.core.state import SystemState
 from polymer_sim.model.catalysis import dense_catalysis_block
 from polymer_sim.model.rules import ReactionRuleTables
 from polymer_sim.model.species import SpeciesSpace
+
+
+class NumericalGuardStop(RuntimeError):
+    """Raised when a numerical guard stops simulation before floating overflow."""
+
+    def __init__(self, reason: str, metadata: dict[str, object]):
+        super().__init__(reason)
+        self.reason = str(reason)
+        self.metadata = dict(metadata)
 
 
 @dataclass(slots=True)
@@ -85,9 +95,13 @@ class ReactionNetworkData:
     species_to_channels_indptr: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
     species_to_channels_indices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
     channel_to_catalyst_strengths: list[np.ndarray] = field(default_factory=list, init=False, repr=False)
+    chemostat_species_ids: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
+    chemostat_species_values: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float), init=False, repr=False)
+    chemostat_species_mask: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool), init=False, repr=False)
     _nu_minus_cache: np.ndarray | None = field(default=None, init=False, repr=False)
     _nu_plus_cache: np.ndarray | None = field(default=None, init=False, repr=False)
     _nu_cache: np.ndarray | None = field(default=None, init=False, repr=False)
+    _nu_csr_cache: csr_matrix | None = field(default=None, init=False, repr=False)
     _block_local_ids_cache: dict[ChannelBlock, np.ndarray] = field(default_factory=dict, init=False, repr=False)
     _block_has_catalysts_cache: dict[ChannelBlock, np.ndarray] = field(default_factory=dict, init=False, repr=False)
     _block_any_catalysts_cache: dict[ChannelBlock, bool] = field(default_factory=dict, init=False, repr=False)
@@ -123,6 +137,7 @@ class ReactionNetworkData:
         inflow_species_ids: Sequence[int] | np.ndarray | None = None,
         inflow_capacity: float | Sequence[float] | None = None,
         inflow_hill_coefficient: float | Sequence[float] = 1.0,
+        chemostat_species_counts: dict[int | str, float] | None = None,
         catalysis_mode: str = "linear",
         saturation_alpha: float = 0.25,
     ) -> "ReactionNetworkData":
@@ -306,6 +321,8 @@ class ReactionNetworkData:
             dependency_indices_dirty=False,
         )
         network._initialize_runtime_caches()
+        if chemostat_species_counts:
+            network.set_chemostat_species(chemostat_species_counts, rebuild=False)
         network.rebuild_dependency_indices()
         network.precompute_stoichiometry_matrices()
         return network
@@ -324,9 +341,62 @@ class ReactionNetworkData:
             ids = np.arange(int(self.channel_sizes[block]), dtype=np.int64)
             ids.setflags(write=False)
             self._block_local_ids_cache[block] = ids
+        if self.chemostat_species_mask.shape != (self.n_species,):
+            self.chemostat_species_mask = np.zeros(self.n_species, dtype=bool)
+        if self.chemostat_species_values.shape != (self.n_species,):
+            values = np.asarray(self.x0, dtype=float).copy()
+            self.chemostat_species_values = values
         self._all_inflow_capacity_infinite = bool(np.all(~np.isfinite(self.inflow_capacity))) if self.inflow_capacity.size else True
         self._rebuild_reverse_channel_cache()
         self._precompute_channel_reactant_terms()
+
+    def set_chemostat_species(
+        self,
+        target_counts: dict[int | str, float],
+        *,
+        rebuild: bool = True,
+    ) -> None:
+        """Treat selected species as fixed external concentrations.
+
+        Chemostatted species still appear in reaction reactant/product labels,
+        but simulation kernels read their fixed counts from this network object
+        and exclude them from state deltas, stoichiometry matrices, and
+        dependency propagation.  This replaces runner-level food projection for
+        ``food_supply_mode='constant'``.
+        """
+
+        mask = np.zeros(self.n_species, dtype=bool)
+        values = np.asarray(self.x0, dtype=float).copy()
+        ids: list[int] = []
+        for species, value in target_counts.items():
+            sid = self.species_idx(str(species)) if isinstance(species, str) else int(species)
+            if sid < 0 or sid >= self.n_species:
+                raise IndexError(f"chemostat species id out of range: {sid}")
+            count = float(value)
+            if not np.isfinite(count) or count < 0.0:
+                raise ValueError("chemostat target counts must be finite values >= 0")
+            mask[sid] = True
+            values[sid] = count
+            self.x0[sid] = count
+            ids.append(sid)
+
+        self.chemostat_species_mask = mask
+        self.chemostat_species_values = values
+        self.chemostat_species_ids = np.asarray(sorted(set(ids)), dtype=np.int64)
+        for arr in (self.chemostat_species_ids, self.chemostat_species_values, self.chemostat_species_mask):
+            arr.setflags(write=False)
+        self._nu_minus_cache = None
+        self._nu_plus_cache = None
+        self._nu_cache = None
+        self._nu_csr_cache = None
+        self.dependency_indices_dirty = True
+        if rebuild:
+            self.rebuild_dependency_indices()
+            self.precompute_stoichiometry_matrices()
+
+    @property
+    def has_chemostat_species(self) -> bool:
+        return bool(self.chemostat_species_ids.size)
 
     @property
     def n_species(self) -> int:
@@ -398,6 +468,19 @@ class ReactionNetworkData:
             self.precompute_stoichiometry_matrices()
         return self._nu_cache
 
+    @property
+    def nu_csr(self) -> csr_matrix:
+        """Return cached sparse effective stoichiometry, shape ``(n_channels, n_species)``.
+
+        This is the sparse companion to ``nu`` used by CLE-style matrix
+        multiplies.  It is built once with the dense stoichiometry cache instead
+        of being reconstructed inside stepper hot paths.
+        """
+
+        if self._nu_csr_cache is None:
+            self.precompute_stoichiometry_matrices()
+        return self._nu_csr_cache
+
     def get_channel_reactants(self, channel_id: int) -> tuple[int, ...]:
         block, local = self._block_and_local(channel_id)
         if block == ChannelBlock.LEFT_ADD:
@@ -458,35 +541,79 @@ class ReactionNetworkData:
 
         block, local = self._block_and_local(channel_id)
         if block == ChannelBlock.LEFT_ADD:
-            return _unique_ints(
+            return self._dynamic_species_ids(_unique_ints(
                 int(self.left_add_monomer[local]),
                 int(self.left_add_species[local]),
                 int(self.left_add_target[local]),
-            )
+            ))
         if block == ChannelBlock.RIGHT_ADD:
-            return _unique_ints(
+            return self._dynamic_species_ids(_unique_ints(
                 int(self.right_add_species[local]),
                 int(self.right_add_monomer[local]),
                 int(self.right_add_target[local]),
-            )
+            ))
         if block == ChannelBlock.LEFT_SPLIT:
-            return _unique_ints(
+            return self._dynamic_species_ids(_unique_ints(
                 int(self.left_split_source[local]),
                 int(self.left_split_monomer[local]),
                 int(self.left_split_rest[local]),
-            )
+            ))
         if block == ChannelBlock.OUTFLOW:
-            return np.asarray([int(self.outflow_source[local])], dtype=np.int64)
+            return self._dynamic_species_ids(np.asarray([int(self.outflow_source[local])], dtype=np.int64))
         if block == ChannelBlock.INFLOW:
-            return np.asarray([int(self.inflow_target[local])], dtype=np.int64)
-        return _unique_ints(
+            return self._dynamic_species_ids(np.asarray([int(self.inflow_target[local])], dtype=np.int64))
+        return self._dynamic_species_ids(_unique_ints(
             int(self.right_split_source[local]),
             int(self.right_split_rest[local]),
             int(self.right_split_monomer[local]),
-        )
+        ))
 
     def apply_channel_delta(self, x: np.ndarray, channel_id: int, amount: float) -> None:
         block, local = self._block_and_local(channel_id)
+        a = float(amount)
+        if not self.has_chemostat_species:
+            self._apply_channel_delta_unchecked(x, block, local, a)
+            return
+        if block == ChannelBlock.LEFT_ADD:
+            m = int(self.left_add_monomer[local])
+            sid = int(self.left_add_species[local])
+            target = int(self.left_add_target[local])
+            self._add_dynamic_delta(x, m, -a)
+            self._add_dynamic_delta(x, sid, -a)
+            self._add_dynamic_delta(x, target, a)
+            return
+        if block == ChannelBlock.RIGHT_ADD:
+            sid = int(self.right_add_species[local])
+            m = int(self.right_add_monomer[local])
+            target = int(self.right_add_target[local])
+            self._add_dynamic_delta(x, sid, -a)
+            self._add_dynamic_delta(x, m, -a)
+            self._add_dynamic_delta(x, target, a)
+            return
+        if block == ChannelBlock.LEFT_SPLIT:
+            source = int(self.left_split_source[local])
+            monomer = int(self.left_split_monomer[local])
+            rest = int(self.left_split_rest[local])
+            self._add_dynamic_delta(x, source, -a)
+            self._add_dynamic_delta(x, monomer, a)
+            self._add_dynamic_delta(x, rest, a)
+            return
+        if block == ChannelBlock.OUTFLOW:
+            source = int(self.outflow_source[local])
+            self._add_dynamic_delta(x, source, -a)
+            return
+        if block == ChannelBlock.INFLOW:
+            target = int(self.inflow_target[local])
+            self._add_dynamic_delta(x, target, a)
+            return
+        source = int(self.right_split_source[local])
+        rest = int(self.right_split_rest[local])
+        monomer = int(self.right_split_monomer[local])
+        self._add_dynamic_delta(x, source, -a)
+        self._add_dynamic_delta(x, rest, a)
+        self._add_dynamic_delta(x, monomer, a)
+
+    def _apply_channel_delta_unchecked(self, x: np.ndarray, block: ChannelBlock, local: int, amount: float) -> None:
         a = float(amount)
         if block == ChannelBlock.LEFT_ADD:
             m = int(self.left_add_monomer[local])
@@ -527,6 +654,42 @@ class ReactionNetworkData:
         x[rest] += a
         x[monomer] += a
 
+    def _add_dynamic_delta(self, x: np.ndarray, sid: int, delta: float) -> None:
+        if not bool(self.chemostat_species_mask[int(sid)]):
+            x[int(sid)] += float(delta)
+
+    def _dynamic_species_ids(self, species_ids: np.ndarray) -> np.ndarray:
+        ids = np.asarray(species_ids, dtype=np.int64)
+        if ids.size == 0 or not self.has_chemostat_species:
+            return ids
+        return ids[~self.chemostat_species_mask[ids]].astype(np.int64, copy=False)
+
+    def _count_value(self, x: np.ndarray, sid: int) -> float:
+        species_id = int(sid)
+        if self.has_chemostat_species and bool(self.chemostat_species_mask[species_id]):
+            return float(self.chemostat_species_values[species_id])
+        return float(np.asarray(x, dtype=float)[species_id])
+
+    def _count_values(self, x: np.ndarray, species_ids: np.ndarray | Sequence[int]) -> np.ndarray:
+        ids = np.asarray(species_ids, dtype=np.int64)
+        values = np.asarray(x, dtype=float)[ids]
+        if not self.has_chemostat_species or ids.size == 0:
+            return values
+        mask = self.chemostat_species_mask[ids]
+        if not np.any(mask):
+            return values
+        values = np.array(values, dtype=float, copy=True)
+        values[mask] = self.chemostat_species_values[ids[mask]]
+        return values
+
+    def _effective_state_values(self, x: np.ndarray) -> np.ndarray:
+        values = np.asarray(x, dtype=float)
+        if not self.has_chemostat_species:
+            return values
+        effective = np.array(values, dtype=float, copy=True)
+        effective[self.chemostat_species_mask] = self.chemostat_species_values[self.chemostat_species_mask]
+        return effective
+
     def precompute_stoichiometry_matrices(self) -> None:
         """Build and cache dense stoichiometry matrices for structural analyses.
 
@@ -541,17 +704,21 @@ class ReactionNetworkData:
         nu_minus = self._stoichiometry_matrix(products=False)
         nu_plus = self._stoichiometry_matrix(products=True)
         nu = nu_plus - nu_minus
+        nu_csr = csr_matrix(nu)
         for matrix in (nu_minus, nu_plus, nu):
             matrix.setflags(write=False)
         self._nu_minus_cache = nu_minus
         self._nu_plus_cache = nu_plus
         self._nu_cache = nu
+        self._nu_csr_cache = nu_csr
 
     def _stoichiometry_matrix(self, *, products: bool) -> np.ndarray:
         matrix = np.zeros((self.n_channels, self.n_species), dtype=float)
         for channel_id in range(self.n_channels):
             species = self.get_channel_products(channel_id) if products else self.get_channel_reactants(channel_id)
             for sid in species:
+                if self.has_chemostat_species and bool(self.chemostat_species_mask[int(sid)]):
+                    continue
                 matrix[int(channel_id), int(sid)] += 1.0
         return matrix
 
@@ -677,7 +844,7 @@ class ReactionNetworkData:
             return 1.0
         strengths = self._channel_catalyst_strengths(cid, cats)
         if self.catalysis_mode == "linear" or not self._uses_substrate_saturating_catalysis(channel_id):
-            return float(1.0 + np.dot(strengths, state.x[cats]))
+            return float(1.0 + np.dot(strengths, self._count_values(state.x, cats)))
 
         substrate_capacity = self._substrate_capacity(channel_id, state)
         if substrate_capacity <= 0.0:
@@ -686,7 +853,7 @@ class ReactionNetworkData:
         contribution = 0.0
         denominator_base = self.saturation_alpha * substrate_capacity
         for position, catalyst_sid in enumerate(cats):
-            x_c = max(float(state.x[int(catalyst_sid)]), 0.0)
+            x_c = max(self._count_value(state.x, int(catalyst_sid)), 0.0)
             if x_c <= 0.0:
                 continue
             strength = float(strengths[position])
@@ -699,21 +866,21 @@ class ReactionNetworkData:
         if block == ChannelBlock.LEFT_ADD:
             m = int(self.left_add_monomer[local])
             sid = int(self.left_add_species[local])
-            return float(self.left_add_rates[local] * _pair_count(x[m], x[sid], m == sid))
+            return float(self.left_add_rates[local] * _pair_count(self._count_value(x, m), self._count_value(x, sid), m == sid))
         if block == ChannelBlock.RIGHT_ADD:
             sid = int(self.right_add_species[local])
             m = int(self.right_add_monomer[local])
-            return float(self.right_add_rates[local] * _pair_count(x[sid], x[m], sid == m))
+            return float(self.right_add_rates[local] * _pair_count(self._count_value(x, sid), self._count_value(x, m), sid == m))
         if block == ChannelBlock.LEFT_SPLIT:
             source = int(self.left_split_source[local])
-            return float(self.left_split_rates[local] * self.left_split_multiplicity[local] * max(float(x[source]), 0.0))
+            return float(self.left_split_rates[local] * self.left_split_multiplicity[local] * max(self._count_value(x, source), 0.0))
         if block == ChannelBlock.OUTFLOW:
             source = int(self.outflow_source[local])
-            return float(self.outflow_rates[local] * max(float(x[source]), 0.0))
+            return float(self.outflow_rates[local] * max(self._count_value(x, source), 0.0))
         if block == ChannelBlock.INFLOW:
             return float(self.inflow_rates[local] * self._inflow_capacity_factor(local, x))
         source = int(self.right_split_source[local])
-        return float(self.right_split_rates[local] * self.right_split_multiplicity[local] * max(float(x[source]), 0.0))
+        return float(self.right_split_rates[local] * self.right_split_multiplicity[local] * max(self._count_value(x, source), 0.0))
 
     def compute_propensity(self, channel_id: int, state: SystemState) -> float:
         base = self.compute_base_propensity(channel_id, state)
@@ -823,7 +990,8 @@ class ReactionNetworkData:
             strengths = self._cat_row(channel_id)[cats].astype(float, copy=True)
             cats.setflags(write=False)
             strengths.setflags(write=False)
-            deps = _unique_concat(base_deps, cats)
+            deps = _unique_concat(base_deps, self._dynamic_species_ids(cats))
+            deps = self._dynamic_species_ids(deps)
             deps.setflags(write=False)
             channel_to_species.append(deps)
             channel_to_catalysts.append(cats)
@@ -928,9 +1096,9 @@ class ReactionNetworkData:
     def _base_dependency_species(self, channel_id: int) -> np.ndarray:
         block, local = self._block_and_local(channel_id)
         if block == ChannelBlock.INFLOW:
-            return np.asarray([int(self.inflow_target[local])], dtype=np.int64)
+            return self._dynamic_species_ids(np.asarray([int(self.inflow_target[local])], dtype=np.int64))
         reactants = self.get_channel_reactants(channel_id)
-        return np.asarray(sorted(set(int(sid) for sid in reactants)), dtype=np.int64)
+        return self._dynamic_species_ids(np.asarray(sorted(set(int(sid) for sid in reactants)), dtype=np.int64))
 
     def _scan_channel_catalysts(self, channel_id: int) -> np.ndarray:
         row = self._cat_row(channel_id)
@@ -1126,8 +1294,8 @@ class ReactionNetworkData:
             return 0.0
 
         x = state.x
-        x_a = max(float(x[a]), 0.0)
-        x_b = max(float(x[b]), 0.0)
+        x_a = max(self._count_value(x, a), 0.0)
+        x_b = max(self._count_value(x, b), 0.0)
         if a == b:
             return float(np.floor(x_a / 2.0))
         return float(min(x_a, x_b))
@@ -1165,21 +1333,29 @@ class ReactionNetworkData:
         if block_e == ChannelBlock.LEFT_ADD:
             m = self.left_add_monomer[ids]
             sid = self.left_add_species[ids]
-            return self.left_add_rates[ids] * _pair_count_array(x[m], x[sid], m == sid)
+            return self.left_add_rates[ids] * _pair_count_array(
+                self._count_values(x, m),
+                self._count_values(x, sid),
+                m == sid,
+            )
         if block_e == ChannelBlock.RIGHT_ADD:
             sid = self.right_add_species[ids]
             m = self.right_add_monomer[ids]
-            return self.right_add_rates[ids] * _pair_count_array(x[sid], x[m], sid == m)
+            return self.right_add_rates[ids] * _pair_count_array(
+                self._count_values(x, sid),
+                self._count_values(x, m),
+                sid == m,
+            )
         if block_e == ChannelBlock.LEFT_SPLIT:
             source = self.left_split_source[ids]
-            return self.left_split_rates[ids] * self.left_split_multiplicity[ids] * np.maximum(x[source], 0.0)
+            return self.left_split_rates[ids] * self.left_split_multiplicity[ids] * np.maximum(self._count_values(x, source), 0.0)
         if block_e == ChannelBlock.OUTFLOW:
             source = self.outflow_source[ids]
-            return self.outflow_rates[ids] * np.maximum(x[source], 0.0)
+            return self.outflow_rates[ids] * np.maximum(self._count_values(x, source), 0.0)
         if block_e == ChannelBlock.INFLOW:
             return self.inflow_rates[ids] * self._inflow_capacity_factor_values(ids, x)
         source = self.right_split_source[ids]
-        return self.right_split_rates[ids] * self.right_split_multiplicity[ids] * np.maximum(x[source], 0.0)
+        return self.right_split_rates[ids] * self.right_split_multiplicity[ids] * np.maximum(self._count_values(x, source), 0.0)
 
     def _apply_block_catalysis(
         self,
@@ -1215,10 +1391,12 @@ class ReactionNetworkData:
             if np.any(active):
                 if use_sparse:
                     factors = self._sparse_substrate_saturating_factors(block_e, ids, capacity, x)
+                    self._check_catalytic_multiply_guard(block_e, values[active], factors[active], x)
                     values[active] *= factors[active]
                 else:
                     cat_block = self._cat_block(block_e)
                     factors = self._substrate_saturating_factors(cat_block[ids[active]], capacity[active], x)
+                    self._check_catalytic_multiply_guard(block_e, values[active], factors, x)
                     values[active] *= factors
             np.maximum(values, 0.0, out=values)
             return values
@@ -1231,12 +1409,58 @@ class ReactionNetworkData:
         if np.any(active):
             if use_sparse:
                 factors = self._sparse_linear_catalytic_factors(block_e, ids, x)
+                self._check_catalytic_multiply_guard(block_e, values[active], factors[active], x)
                 values[active] *= factors[active]
             else:
                 cat_block = self._cat_block(block_e)
-                values[active] *= 1.0 + cat_block[ids[active]] @ x
+                factors = 1.0 + cat_block[ids[active]] @ self._effective_state_values(x)
+                self._check_catalytic_multiply_guard(block_e, values[active], factors, x)
+                values[active] *= factors
         np.maximum(values, 0.0, out=values)
         return values
+
+    def _check_catalytic_multiply_guard(
+        self,
+        block: ChannelBlock,
+        values: np.ndarray,
+        factors: np.ndarray,
+        x: np.ndarray,
+    ) -> None:
+        threshold = 0.5 * float(np.finfo(float).max)
+        base_values = np.asarray(values, dtype=float)
+        factor_values = np.asarray(factors, dtype=float)
+        if base_values.size == 0:
+            return
+
+        abs_base = np.abs(base_values)
+        abs_factor = np.abs(factor_values)
+        finite = np.isfinite(abs_base) & np.isfinite(abs_factor)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            safe_limit = threshold / abs_factor
+        risky = (~finite) | ((abs_factor > 0.0) & (abs_base > safe_limit))
+        if not np.any(risky):
+            return
+
+        projected = np.full(abs_base.shape, np.inf, dtype=float)
+        safe = finite & (abs_factor > 0.0) & (abs_base <= safe_limit)
+        np.multiply(abs_base, abs_factor, out=projected, where=safe)
+        projected[finite & (abs_factor == 0.0)] = 0.0
+        x_values = np.asarray(x, dtype=float)
+        raise NumericalGuardStop(
+            "numerical_guard_catalysis_overflow_risk",
+            {
+                "stop_reason": "numerical_guard_catalysis_overflow_risk",
+                "guard": "catalytic_propensity_multiply",
+                "threshold_fraction_of_float_max": 0.5,
+                "threshold": float(threshold),
+                "block_type": block.name,
+                "n_risky_entries": int(np.count_nonzero(risky)),
+                "max_state": float(np.nanmax(x_values)) if x_values.size else 0.0,
+                "max_base_propensity": float(np.nanmax(abs_base)) if abs_base.size else 0.0,
+                "max_catalytic_factor": float(np.nanmax(abs_factor)) if abs_factor.size else 0.0,
+                "max_projected_propensity": float(np.nanmax(projected)) if projected.size else 0.0,
+            },
+        )
 
     def _local_ids_for_block(self, block: ChannelBlock, local_ids: np.ndarray | None) -> np.ndarray:
         if local_ids is None:
@@ -1291,13 +1515,13 @@ class ReactionNetworkData:
         if local_ids is all_ids:
             contribution = np.bincount(
                 cat_local_ids,
-                weights=strengths * np.asarray(x, dtype=float)[cat_species_ids],
+                weights=strengths * self._count_values(x, cat_species_ids),
                 minlength=int(self.channel_sizes[block]),
             )
             factors += contribution
             return factors
 
-        x_values = np.asarray(x, dtype=float)
+        x_values = self._effective_state_values(x)
         positions, entries = self._csr_entries_for_local_ids(row_ptr, local_ids)
         if entries.size:
             contribution = np.bincount(
@@ -1323,7 +1547,7 @@ class ReactionNetworkData:
         if cat_species_ids.size == 0:
             return factors
 
-        x_values = np.maximum(np.asarray(x, dtype=float), 0.0)
+        x_values = np.maximum(self._effective_state_values(x), 0.0)
         all_ids = self._block_local_ids_cache.get(block)
         if local_ids is all_ids:
             cap_by_entry = np.asarray(capacity, dtype=float)[cat_local_ids]
@@ -1409,8 +1633,8 @@ class ReactionNetworkData:
         else:
             return np.zeros(local_ids.shape, dtype=float)
 
-        x_a = np.maximum(x[a], 0.0)
-        x_b = np.maximum(x[b], 0.0)
+        x_a = np.maximum(self._count_values(x, a), 0.0)
+        x_b = np.maximum(self._count_values(x, b), 0.0)
         same = a == b
         capacity = np.minimum(x_a, x_b)
         if np.any(same):
@@ -1426,7 +1650,7 @@ class ReactionNetworkData:
     ) -> np.ndarray:
         if cat_rows.size == 0:
             return np.ones(capacity.shape, dtype=float)
-        x_c = np.maximum(np.asarray(x, dtype=float), 0.0)
+        x_c = np.maximum(self._effective_state_values(x), 0.0)
         cap = np.asarray(capacity, dtype=float)
         denom = self.saturation_alpha * cap[:, None] + x_c[None, :]
         scaled = np.zeros_like(denom, dtype=float)
@@ -1440,7 +1664,7 @@ class ReactionNetworkData:
         if capacity <= 0.0:
             return 0.0
         target = int(self.inflow_target[int(local_id)])
-        count = max(float(x[target]), 0.0)
+        count = max(self._count_value(x, target), 0.0)
         if count >= capacity:
             return 0.0
         hill = float(self.inflow_hill_coefficient[int(local_id)])
@@ -1464,7 +1688,7 @@ class ReactionNetworkData:
             return factors
 
         targets = self.inflow_target[ids[positive]]
-        counts = np.maximum(x[targets], 0.0)
+        counts = np.maximum(self._count_values(x, targets), 0.0)
         capacity = capacities[positive]
         hill = self.inflow_hill_coefficient[ids[positive]]
         ratios = counts / capacity

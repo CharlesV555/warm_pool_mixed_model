@@ -5,7 +5,7 @@ from polymer_sim.core.elementary import (
     ElementaryMassActionNetwork,
     build_elementary_mass_action_network,
 )
-from polymer_sim.core.network import ReactionNetworkData
+from polymer_sim.core.network import NumericalGuardStop, ReactionNetworkData
 from polymer_sim.core.state import SystemState
 
 __all__ = [
@@ -14,6 +14,7 @@ __all__ = [
     "DEFAULT_STANDARD_ZERO_ORDER_INFLOW",
     "ElementaryExpansionConfig",
     "ElementaryMassActionNetwork",
+    "NumericalGuardStop",
     "ReactionNetworkData",
     "SystemState",
     "build_elementary_mass_action_network",

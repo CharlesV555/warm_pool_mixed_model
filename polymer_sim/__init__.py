@@ -6,7 +6,7 @@ from polymer_sim.core.elementary import (
     ElementaryMassActionNetwork,
     build_elementary_mass_action_network,
 )
-from polymer_sim.core.network import ReactionNetworkData
+from polymer_sim.core.network import NumericalGuardStop, ReactionNetworkData
 from polymer_sim.core.state import SystemState
 from polymer_sim.experiment.runner import ExperimentRunner, RunResult
 from polymer_sim.model.catalysis import (
@@ -55,6 +55,9 @@ from polymer_sim.partition.pdmp import (
 from polymer_sim.recording import (
     animate_reaction_network_state_tree,
     BaseRecorder,
+    CLESparsitySample,
+    CLESparsitySampler,
+    DTStatistics,
     FastNetworkReportRecorder,
     format_stepper_info,
     RunSummary,
@@ -66,6 +69,8 @@ from polymer_sim.recording import (
     load_summary,
     load_timing_summary,
     load_trajectory_record,
+    trajectory_dt_statistics,
+    trajectory_final_time,
     plot_event_time_distribution,
     plot_final_state_distribution,
     plot_mean_std_over_runs,
@@ -79,6 +84,7 @@ from polymer_sim.recording import (
     plot_species_with_outflow,
     plot_time_series,
     RunTimingReport,
+    save_cle_sparsity_plot,
     save_summary,
     save_run_timing_report,
     save_timing_summary,
@@ -144,6 +150,7 @@ __all__ = [
     "HybridStepper",
     "NoBlendingStrategy",
     "NRMBlendedHybridStepper",
+    "NumericalGuardStop",
     "OptimizedNRMConfig",
     "OptimizedNRMStepper",
     "PDMPConfig",
@@ -153,10 +160,14 @@ __all__ = [
     "PartitionResult",
     "PartitionStrategy",
     "BaseRecorder",
+    "CLESparsitySample",
+    "CLESparsitySampler",
+    "DTStatistics",
     "ReactionNetworkData",
     "ReactionRuleTables",
     "RunSummary",
     "RunTimingReport",
+    "save_cle_sparsity_plot",
     "RunResult",
     "RestrictionContext",
     "RestrictionController",
@@ -193,6 +204,7 @@ __all__ = [
     "load_summary",
     "load_timing_summary",
     "load_trajectory_record",
+    "trajectory_dt_statistics",
     "longest_polymer_species_ids",
     "plot_event_time_distribution",
     "plot_final_state_distribution",
@@ -211,6 +223,7 @@ __all__ = [
     "save_run_timing_report",
     "save_timing_summary",
     "save_trajectory_record",
+    "trajectory_final_time",
     "ScalingPDMPConfig",
     "ScalingPDMPPartitionStrategy",
     "scale_all_catalytic_strengths",

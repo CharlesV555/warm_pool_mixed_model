@@ -366,6 +366,7 @@ def _run_matrix_cell_body(
     save_trajectory_record(trajectory_path, trajectory)
     summary = result.summary
     final_state = np.asarray(summary.final_state, dtype=float)
+    cache_miss_log_path = write_stepper_cache_miss_log(stepper, run_dir, safe_stem)
     return {
         "status": "ok",
         "config_id": str(config_id),
@@ -384,12 +385,14 @@ def _run_matrix_cell_body(
         "process_rss_after_mb": rss_after,
         "process_rss_delta_mb": None if rss_before is None or rss_after is None else float(rss_after - rss_before),
         "trajectory_path": str(trajectory_path),
+        "observed_propensity_cache_miss_log_path": "" if cache_miss_log_path is None else str(cache_miss_log_path),
         "n_trajectory_points": int(trajectory.times.shape[0]),
         "n_species": int(network.n_species),
         "n_channels": int(network.n_channels),
         "food_supply_mode": normalized_food_supply_mode(spec),
         "uses_explicit_food_inflow": bool(spec_uses_explicit_food_inflow(spec)),
         "uses_food_restriction": restriction is not None,
+        "uses_food_chemostat": bool(getattr(network, "has_chemostat_species", False)),
         "final_total_abundance": float(final_state.sum()),
         "max_species_count": float(final_state.max()) if final_state.size else 0.0,
         "error": "",
@@ -489,6 +492,7 @@ def _run_task_capture_errors(task: dict[str, Any]) -> dict[str, Any]:
             "n_events": None,
             "wall_runtime_seconds": None,
             "trajectory_path": "",
+            "observed_propensity_cache_miss_log_path": "",
             "python_memory_peak_mb": None,
             "profile_prof_path": "",
             "profile_report_path": "",
@@ -510,10 +514,20 @@ def _print_task_result(result: dict[str, Any]) -> None:
         "[matrix] "
         f"status={status} config={result.get('config_id')} network={result.get('network')} "
         f"method={result.get('method')} sim_time={result.get('simulation_final_time')} "
-        f"events={result.get('n_events')} wall={result.get('wall_runtime_seconds')} "
+        f"steps={result.get('n_steps')} events={result.get('n_events')} "
+        f"stop={result.get('stop_reason')} wall={result.get('wall_runtime_seconds')} "
         f"trajectory={result.get('trajectory_path')} profile={result.get('profile_report_path')} "
         f"error={result.get('error')}"
     )
+
+
+def write_stepper_cache_miss_log(stepper: Any, run_dir: Path, safe_stem: str) -> Path | None:
+    writer = getattr(stepper, "write_observed_propensity_cache_miss_log", None)
+    if writer is None:
+        return None
+    log_path = run_dir / "profiles" / f"{safe_stem}_observed_propensity_cache_miss.txt"
+    written = writer(log_path)
+    return None if written is None else Path(written)
 
 
 def parse_config_cell(value: Any) -> dict[str, Any]:
@@ -563,6 +577,7 @@ def disabled_result(config_id: str, network: str, *, error: str = "") -> dict[st
         "n_events": None,
         "wall_runtime_seconds": None,
         "trajectory_path": "",
+        "observed_propensity_cache_miss_log_path": "",
         "python_memory_peak_mb": None,
         "profile_prof_path": "",
         "profile_report_path": "",

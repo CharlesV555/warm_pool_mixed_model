@@ -55,7 +55,7 @@ def test_strict_2018_prepares_polymer_network_as_standard_elementary_srn():
     assert np.all(elementary.reaction_order <= 2)
 
 
-def test_compare_constant_food_disables_reactionnetwork_inflow_and_builds_restriction():
+def test_compare_constant_food_disables_reactionnetwork_inflow_and_configures_chemostat():
     network, _catalysis_result, spec = common.build_network("linear_cross_len3", food_supply_mode="constant")
 
     assert isinstance(network, ReactionNetworkData)
@@ -63,7 +63,8 @@ def test_compare_constant_food_disables_reactionnetwork_inflow_and_builds_restri
     assert network.channel_sizes[ChannelBlock.INFLOW] == 0
 
     restriction = common.build_compare_food_restriction(network, spec)
-    assert restriction is not None
+    assert restriction is None
+    assert network.has_chemostat_species
 
 
 def test_compare_explicit_food_keeps_reactionnetwork_inflow_channels():
@@ -86,7 +87,8 @@ def test_compare_constant_food_omits_manual_elementary_food_io():
     assert metadata["expected_partition"]["explicit_food_inflow_reactions"] is False
     notes = [str(label.get("note", "")) for label in network.reaction_labels]
     assert not any(note.startswith("food inflow") or note.startswith("food outflow") for note in notes)
-    assert common.build_compare_food_restriction(network, spec) is not None
+    assert common.build_compare_food_restriction(network, spec) is None
+    assert network.has_chemostat_species
 
 
 def test_finite_markov_scaling_partition_accepts_averageable_fast_subnetwork():

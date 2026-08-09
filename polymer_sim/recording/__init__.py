@@ -9,6 +9,7 @@
 """
 
 from polymer_sim.recording.base import BaseRecorder, BaseRunSummary, BaseTrajectoryRecord
+from polymer_sim.recording.cle_sparsity_sampler import CLESparsitySample, CLESparsitySampler, save_cle_sparsity_plot
 from polymer_sim.recording.fast_network_report import FastNetworkReportRecorder
 from polymer_sim.recording.plot_single_run import (
     animate_reaction_network_state_tree,
@@ -35,10 +36,13 @@ from polymer_sim.recording.timing import (
     save_timing_summary,
 )
 from polymer_sim.recording.trajectory import (
+    DTStatistics,
     TrajectoryRecord,
     TrajectoryRecorder,
     load_trajectory_record,
     save_trajectory_record,
+    trajectory_dt_statistics,
+    trajectory_final_time,
 )
 
 __all__ = [
@@ -46,6 +50,9 @@ __all__ = [
     "BaseRecorder",
     "BaseRunSummary",
     "BaseTrajectoryRecord",
+    "CLESparsitySample",
+    "CLESparsitySampler",
+    "DTStatistics",
     "FastNetworkReportRecorder",
     "RunSummary",
     "RunTimingReport",
@@ -71,7 +78,10 @@ __all__ = [
     "plot_species_with_outflow",
     "plot_time_series",
     "save_summary",
+    "save_cle_sparsity_plot",
     "save_run_timing_report",
     "save_timing_summary",
     "save_trajectory_record",
+    "trajectory_dt_statistics",
+    "trajectory_final_time",
 ]

@@ -106,13 +106,15 @@ def test_food_supply_mode_helper_supports_explicit_and_constant_modes():
     assert normalize_food_supply_mode("chemostat") == "constant"
     assert build_food_supply_restriction(network, mode="explicit_inflow") is None
 
-    restriction = build_food_supply_restriction(
+    constant_restriction = build_food_supply_restriction(
         network,
         mode="constant",
         food_species=("0", "1"),
         food_count=10.0,
     )
-    assert isinstance(restriction, RestrictionController)
+    assert constant_restriction is None
+    assert network.has_chemostat_species
+    assert set(network.chemostat_species_ids.tolist()) == {network.species_idx("0"), network.species_idx("1")}
 
 
 def test_constant_food_mode_runs_without_explicit_inflow_channels():
@@ -124,13 +126,15 @@ def test_constant_food_mode_runs_without_explicit_inflow_channels():
     )
     assert network.channel_sizes[ChannelBlock.INFLOW] == 0
 
-    recorder = TrajectoryRecorder()
     restriction = build_food_supply_restriction(
         network,
         mode="constant",
         food_species=("0", "1"),
         food_count=10.0,
     )
+    assert restriction is None
+
+    recorder = TrajectoryRecorder()
     result = ExperimentRunner().run_one(
         network,
         SSAStepper(),
@@ -146,7 +150,37 @@ def test_constant_food_mode_runs_without_explicit_inflow_channels():
     assert result.summary.final_time == 0.5
     assert np.allclose(trajectory.states[:, zero_sid], 10.0)
     assert np.allclose(trajectory.states[:, one_sid], 10.0)
-    assert trajectory.run_metadata["food_replenishment"]["target_counts"] == [10.0, 10.0]
+    assert "food_replenishment" not in trajectory.run_metadata
+
+
+def test_constant_food_is_network_level_chemostat_not_state_projection():
+    network = build_n3_wh_network(
+        initial_counts={"0": 10.0, "1": 10.0},
+        k_right_add=1.0,
+        k_nonfood_outflow=0.0,
+        k_food_inflow=0.0,
+    )
+    restriction = build_food_supply_restriction(
+        network,
+        mode="constant",
+        food_species=("0", "1"),
+        food_count=10.0,
+    )
+    assert restriction is None
+
+    zero = network.species_idx("0")
+    dimer = network.species_idx("00")
+    channel_id = network.channel_id(ChannelBlock.RIGHT_ADD, int(network.right_add_local_id[zero, zero]))
+    state = SystemState.from_x0(network.x0)
+    network.apply_channel_update(state, channel_id)
+
+    assert state.x[zero] == 10.0
+    assert state.x[dimer] == 1.0
+    assert zero not in network.get_channel_changed_species(channel_id).tolist()
+    assert network.affected_channels_for_species([zero]).size == 0
+
+    state.x[zero] = 0.0
+    assert network.compute_base_propensity(channel_id, state) == 45.0
 
 
 def test_runner_can_stop_by_max_runtime_seconds():

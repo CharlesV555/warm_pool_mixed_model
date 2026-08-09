@@ -226,7 +226,7 @@ def normalize_food_supply_mode(mode: str | None) -> str:
 
     Supported canonical modes:
     - ``explicit_inflow``: food supply is represented by formal INFLOW channels.
-    - ``constant``: food is restored to fixed counts by a runner restriction.
+    - ``constant``: food species are configured as network-level chemostats.
     - ``upper_limit``: food is capped from above but not replenished.
     - ``none``: no food-supply restriction is applied.
     """
@@ -249,11 +249,11 @@ def build_food_supply_restriction(
 ) -> RestrictionController | None:
     """Build the optional restriction for a selected food-supply mode.
 
-    This helper deliberately does not edit the reaction network.  Callers that
-    choose ``constant`` should usually build the network with food INFLOW
-    disabled, e.g. ``k_food_inflow=0`` for the WH example.  Callers that choose
-    ``explicit_inflow`` should configure formal INFLOW channels in the network
-    and pass the returned ``None`` through to the runner.
+    ``constant`` is implemented by configuring the network itself: food counts
+    become fixed parameters in propensity evaluation and are excluded from
+    dynamic state deltas/dependency propagation.  The helper returns ``None`` in
+    that mode so ``ExperimentRunner`` does not apply a post-step projection and
+    does not invalidate stepper caches.
     """
 
     normalized = normalize_food_supply_mode(mode)
@@ -267,7 +267,10 @@ def build_food_supply_restriction(
         counts=food_counts,
     )
     if normalized == "constant":
-        return RestrictionController([FoodReplenishmentRestriction(target_counts=targets)])
+        if not hasattr(network, "set_chemostat_species"):
+            raise TypeError("constant food mode requires a network with set_chemostat_species(...)")
+        network.set_chemostat_species(targets)
+        return None
     if normalized == "upper_limit":
         return RestrictionController([FoodUpperLimitRestriction(max_counts=targets)])
     raise AssertionError(f"unhandled food supply mode: {normalized}")

@@ -114,6 +114,7 @@ class RunSettings:
     blended_beta_species_mode: str = "reactants"
     blended_beta_compute_mode: str = "beta_fully_compute"
     blended_strict_int_for_CLE: bool = False
+    local_propensity_calculation: bool = True
     pdmp_ode_step: float = 0.001
     pdmp_n0: float = 500.0
     pdmp_mu: float = 1.0
@@ -708,7 +709,8 @@ def spec_uses_explicit_food_inflow(spec: NetworkSpec) -> bool:
 
     ``upper_limit`` keeps the explicit inflow channels and adds a cap
     restriction.  ``constant`` disables the inflow channels because food is
-    provided by a chemostat-style state projection in the runner.
+    provided by network-level chemostat parameters rather than a runner
+    restriction.
     """
 
     mode = normalized_food_supply_mode(spec)
@@ -906,6 +908,7 @@ def make_blended_config(settings: RunSettings) -> BlendedHybridConfig:
         beta_species_mode=str(settings.blended_beta_species_mode),
         beta_compute_mode=str(settings.blended_beta_compute_mode),
         strict_int_for_CLE=bool(settings.blended_strict_int_for_CLE),
+        local_propensity_calculation=bool(settings.local_propensity_calculation),
     )
 
 
@@ -1106,6 +1109,7 @@ def run_method(
         "food_supply_mode": normalized_food_supply_mode(spec),
         "uses_explicit_food_inflow": bool(spec_uses_explicit_food_inflow(spec)),
         "uses_food_restriction": restriction is not None,
+        "uses_food_chemostat": bool(getattr(network, "has_chemostat_species", False)),
         "final_total_abundance": float(final_state.sum()),
         "max_species_count": float(final_state.max()) if final_state.size else 0.0,
         "network_spec": asdict(spec),
@@ -1152,6 +1156,7 @@ def skipped_run_record(
         else normalize_food_supply_mode(network_spec(network_name).food_supply_mode),
         "uses_explicit_food_inflow": False,
         "uses_food_restriction": False,
+        "uses_food_chemostat": False,
         "final_total_abundance": 0.0,
         "max_species_count": 0.0,
         "network_spec": asdict(network_spec_for_run(network_name, food_supply_mode=settings.food_supply_mode)),
@@ -1270,6 +1275,7 @@ def write_tables(records: Sequence[dict[str, Any]], output_dir: Path | str) -> d
             "food_supply_mode",
             "uses_explicit_food_inflow",
             "uses_food_restriction",
+            "uses_food_chemostat",
         ]
         with records_csv.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1335,6 +1341,7 @@ def write_simulation_summary_tables(records: Sequence[dict[str, Any]], output_di
         "food_supply_mode",
         "uses_explicit_food_inflow",
         "uses_food_restriction",
+        "uses_food_chemostat",
     ]
     with summary_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1422,6 +1429,7 @@ def main_single(method: str) -> None:
         blended_dt_macro=float(args.blended_dt_macro),
         blended_beta_compute_mode=str(args.blended_beta_compute_mode),
         blended_strict_int_for_CLE=bool(args.blended_strict_int_for_CLE),
+        local_propensity_calculation=bool(args.local_propensity_calculation),
         pdmp_ode_step=float(args.pdmp_ode_step),
     )
     records: list[dict[str, Any]] = []
@@ -1498,6 +1506,9 @@ def _single_parser(method: str) -> argparse.ArgumentParser:
     parser.add_argument("--blended-strict-int-for-cle", dest="blended_strict_int_for_CLE", action="store_true")
     parser.add_argument("--no-blended-strict-int-for-cle", dest="blended_strict_int_for_CLE", action="store_false")
     parser.set_defaults(blended_strict_int_for_CLE=DEFAULT_SETTINGS.blended_strict_int_for_CLE)
+    parser.add_argument("--local-propensity-calculation", dest="local_propensity_calculation", action="store_true")
+    parser.add_argument("--no-local-propensity-calculation", dest="local_propensity_calculation", action="store_false")
+    parser.set_defaults(local_propensity_calculation=DEFAULT_SETTINGS.local_propensity_calculation)
     parser.add_argument("--pdmp-ode-step", type=float, default=DEFAULT_SETTINGS.pdmp_ode_step)
     parser.add_argument("--profile", dest="profile", action="store_true", default=True)
     parser.add_argument("--no-profile", dest="profile", action="store_false")
@@ -1708,6 +1719,7 @@ def _simulation_summary_record(record: dict[str, Any]) -> dict[str, Any]:
         "food_supply_mode": pick("food_supply_mode"),
         "uses_explicit_food_inflow": pick("uses_explicit_food_inflow"),
         "uses_food_restriction": pick("uses_food_restriction"),
+        "uses_food_chemostat": pick("uses_food_chemostat"),
     }
 
 

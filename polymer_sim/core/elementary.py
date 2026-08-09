@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
+from scipy.sparse import csr_matrix
 
 from polymer_sim.core.enums import ChannelBlock
 from polymer_sim.core.network import ReactionNetworkData
@@ -96,7 +97,11 @@ class ElementaryMassActionNetwork:
     first_order_channels: np.ndarray = field(init=False, repr=False)
     second_order_channels: np.ndarray = field(init=False, repr=False)
     all_channels: np.ndarray = field(init=False, repr=False)
+    chemostat_species_ids: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64), init=False, repr=False)
+    chemostat_species_values: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float), init=False, repr=False)
+    chemostat_species_mask: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool), init=False, repr=False)
     _nu_cache: np.ndarray = field(init=False, repr=False)
+    _nu_csr_cache: csr_matrix = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.x0 = np.asarray(self.x0, dtype=float)
@@ -122,8 +127,11 @@ class ElementaryMassActionNetwork:
             raise ValueError("reaction_labels length must match n_channels")
         if self.polymer_species_count <= 0:
             self.polymer_species_count = len(self.species_names)
+        self.chemostat_species_mask = np.zeros(len(self.species_names), dtype=bool)
+        self.chemostat_species_values = np.asarray(self.x0, dtype=float).copy()
         self._nu_cache = self.nu_plus - self.nu_minus
         self._nu_cache.setflags(write=False)
+        self._nu_csr_cache = csr_matrix(self._nu_cache)
         self._precompute_propensity_terms()
         self.rebuild_dependency_indices()
 
@@ -138,6 +146,78 @@ class ElementaryMassActionNetwork:
     @property
     def nu(self) -> np.ndarray:
         return self._nu_cache
+
+    @property
+    def nu_csr(self) -> csr_matrix:
+        """Return cached sparse effective stoichiometry, shape ``(n_channels, n_species)``."""
+
+        return self._nu_csr_cache
+
+    @property
+    def has_chemostat_species(self) -> bool:
+        return bool(self.chemostat_species_ids.size)
+
+    def set_chemostat_species(self, target_counts: dict[int | str, float]) -> None:
+        """Convert selected species to fixed external parameters.
+
+        Any reactant stoichiometry involving a chemostat species is absorbed
+        into the channel's rate constant using the same combinatorial
+        mass-action factor used by the simulator.  Chemostat species are then
+        removed from dynamic reactant/product stoichiometry and dependency
+        indices.
+        """
+
+        if self.has_chemostat_species:
+            current = {
+                int(sid): float(self.chemostat_species_values[int(sid)])
+                for sid in self.chemostat_species_ids
+            }
+            requested = {
+                self.species_idx(str(species)) if isinstance(species, str) else int(species): float(value)
+                for species, value in target_counts.items()
+            }
+            if current == requested:
+                return
+            raise RuntimeError("ElementaryMassActionNetwork chemostat species are already configured")
+
+        mask = np.zeros(self.n_species, dtype=bool)
+        values = np.asarray(self.x0, dtype=float).copy()
+        ids: list[int] = []
+        for species, value in target_counts.items():
+            sid = self.species_idx(str(species)) if isinstance(species, str) else int(species)
+            if sid < 0 or sid >= self.n_species:
+                raise IndexError(f"chemostat species id out of range: {sid}")
+            count = float(value)
+            if not np.isfinite(count) or count < 0.0:
+                raise ValueError("chemostat target counts must be finite values >= 0")
+            mask[sid] = True
+            values[sid] = count
+            self.x0[sid] = count
+            ids.append(sid)
+
+        if not ids:
+            return
+        for sid in ids:
+            stoich = np.rint(self.nu_minus[:, int(sid)]).astype(np.int64, copy=False)
+            factors = np.ones(self.n_channels, dtype=float)
+            positive = stoich > 0
+            if np.any(positive):
+                count = float(values[int(sid)])
+                factors[positive] = [_mass_action_constant_factor(count, int(order)) for order in stoich[positive]]
+                self.rate_constants *= factors
+            self.nu_minus[:, int(sid)] = 0.0
+            self.nu_plus[:, int(sid)] = 0.0
+
+        self.chemostat_species_mask = mask
+        self.chemostat_species_values = values
+        self.chemostat_species_ids = np.asarray(sorted(set(ids)), dtype=np.int64)
+        for arr in (self.chemostat_species_ids, self.chemostat_species_values, self.chemostat_species_mask):
+            arr.setflags(write=False)
+        self._nu_cache = self.nu_plus - self.nu_minus
+        self._nu_cache.setflags(write=False)
+        self._nu_csr_cache = csr_matrix(self._nu_cache)
+        self._precompute_propensity_terms()
+        self.rebuild_dependency_indices()
 
     def species_idx(self, name: str) -> int:
         return self.name_to_idx[name]
@@ -687,3 +767,18 @@ def build_elementary_mass_action_network(
     """Precompute an elementary mass-action view of a polymer-rule network."""
 
     return _ElementaryBuilder(network, config or ElementaryExpansionConfig()).build()
+
+
+def _mass_action_constant_factor(count: float, order: int) -> float:
+    value = max(float(count), 0.0)
+    stoich = int(order)
+    if stoich <= 0:
+        return 1.0
+    if stoich == 1:
+        return value
+    if stoich == 2:
+        return 0.5 * value * max(value - 1.0, 0.0)
+    factor = 1.0
+    for offset in range(stoich):
+        factor *= max(value - float(offset), 0.0) / float(offset + 1)
+    return factor

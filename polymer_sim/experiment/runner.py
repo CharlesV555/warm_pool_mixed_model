@@ -7,7 +7,7 @@ from typing import Iterable
 import numpy as np
 
 from polymer_sim.core.elementary import ElementaryMassActionNetwork
-from polymer_sim.core.network import ReactionNetworkData
+from polymer_sim.core.network import NumericalGuardStop, ReactionNetworkData
 from polymer_sim.core.state import SystemState
 from polymer_sim.partition.pdmp import PDMPPartitionStrategy
 from polymer_sim.partition.strategies import BlendingStrategy, PartitionStrategy
@@ -64,6 +64,7 @@ class ExperimentRunner:
         timing_next_event_sample = int(timing_report_interval_events)
         timing_next_sim_sample_index = 0
         timing_last_sample_wall = 0.0
+        numerical_guard_metadata: dict[str, object] | None = None
 
         rng = np.random.default_rng(int(seed))
         state = SystemState.from_x0(network.x0 if x0 is None else x0)
@@ -105,7 +106,14 @@ class ExperimentRunner:
             step_dt = remaining if dt is None else min(float(dt), remaining)
             timing_step_start_sim_time = float(state.t)
             timing_step_started_at = perf_counter()
-            result = stepper.step(state, step_dt, context) # step所在地
+            try:
+                result = stepper.step(state, step_dt, context) # step所在地
+            except NumericalGuardStop as exc:
+                stop_reason = str(exc.metadata.get("stop_reason", exc.reason))
+                if timing_enabled:
+                    timing_step_elapsed += perf_counter() - timing_step_started_at
+                numerical_guard_metadata = dict(exc.metadata)
+                break
             if timing_enabled:
                 timing_step_elapsed += perf_counter() - timing_step_started_at
                 timing_next_sim_sample_index = _accumulate_simulation_clock_timing(
@@ -200,6 +208,8 @@ class ExperimentRunner:
             recorded.metadata["stop_reason"] = stop_reason
             recorded.metadata["stepper_name"] = stepper_metadata["name"]
             recorded.metadata["stepper_info"] = dict(stepper_metadata)
+            if numerical_guard_metadata is not None:
+                recorded.metadata["numerical_guard"] = dict(numerical_guard_metadata)
             summary = recorded
         else:
             summary = RunSummary(
@@ -212,9 +222,19 @@ class ExperimentRunner:
                     "stop_reason": stop_reason,
                     "stepper_name": stepper_metadata["name"],
                     "stepper_info": dict(stepper_metadata),
+                    **(
+                        {"numerical_guard": dict(numerical_guard_metadata)}
+                        if numerical_guard_metadata is not None
+                        else {}
+                    ),
                 },
                 species_names=list(network.species_names),
             )
+        # CLE sparsity probe insertion point 4/4:
+        # optional stepper diagnostics are merged only into lightweight summary metadata.
+        stepper_summary_metadata = _stepper_summary_metadata(stepper)
+        if stepper_summary_metadata:
+            summary.metadata.update(stepper_summary_metadata)
         if timing_enabled:
             report = RunTimingReport(
                 seed=int(seed),
@@ -381,6 +401,18 @@ def _stepper_timing_metadata(stepper: BaseStepper) -> dict[str, object]:
     if isinstance(nrm_config, dict):
         metadata["nrm_config"] = dict(nrm_config)
     return metadata
+
+
+def _stepper_summary_metadata(stepper: BaseStepper) -> dict[str, object]:
+    metadata_fn = getattr(stepper, "summary_metadata", None)
+    if not callable(metadata_fn):
+        return {}
+    metadata = metadata_fn()
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, dict):
+        raise TypeError("stepper.summary_metadata() must return a dict or None")
+    return dict(metadata)
 
 
 def _stepper_metadata(stepper: BaseStepper) -> dict[str, object]:

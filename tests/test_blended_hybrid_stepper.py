@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 
 import polymer_sim.simulation.stepper as stepper_module
@@ -301,6 +303,8 @@ def test_blended_hybrid_splits_outflow_channels_like_reactions():
     nu = stepper._stoichiometry_matrix(network)
 
     assert network.get_channel_block(outflow_channel) == ChannelBlock.OUTFLOW
+    assert network.nu_csr is network.nu_csr
+    assert np.array_equal(network.nu_csr.toarray(), nu)
     assert propensities[outflow_channel] == 40.0
     assert beta[outflow_channel] == 0.5
     assert beta[outflow_channel] * propensities[outflow_channel] == 20.0
@@ -331,6 +335,8 @@ def test_blended_hybrid_keeps_inflow_continuous():
     nu = stepper._stoichiometry_matrix(network)
 
     assert network.get_channel_block(inflow_channel) == ChannelBlock.INFLOW
+    assert network.nu_csr is network.nu_csr
+    assert np.array_equal(network.nu_csr.toarray(), nu)
     assert propensities[inflow_channel] == 5.0
     assert beta[inflow_channel] == 0.0
     assert beta[inflow_channel] * propensities[inflow_channel] == 0.0
@@ -662,6 +668,7 @@ def test_blended_hybrid_strict_int_for_cle_reuses_mixed_jump_propensities():
             dt_cle=1e-6,
             adaptive_cle_dt=False,
             strict_int_for_CLE=True,
+            local_propensity_calculation=True,
         )
     )
 
@@ -697,6 +704,7 @@ def test_blended_hybrid_observed_propensity_reuses_beta_affected_sets(monkeypatc
             i2=30.0,
             dt_cle=0.01,
             strict_int_for_CLE=True,
+            local_propensity_calculation=True,
             beta_compute_mode="beta_compute_by_state_difference",
         )
     )
@@ -728,6 +736,48 @@ def test_blended_hybrid_observed_propensity_reuses_beta_affected_sets(monkeypatc
     assert stepper._last_observed_propensity_update_path == "local_update"
 
 
+def test_blended_hybrid_local_propensity_calculation_without_strict_int():
+    class CountingLocalPropensityStepper(BlendedHybridStepper):
+        def __init__(self, config: BlendedHybridConfig):
+            super().__init__(config)
+            self.full_propensity_calls = 0
+
+        def _propensities_for_x(self, network, x, t):
+            self.full_propensity_calls += 1
+            return super()._propensities_for_x(network, x, t)
+
+        def _observed_propensity_local_update_limit(self, n_channels: int) -> int:
+            return int(n_channels)
+
+    network = make_network(initial_count=100.0)
+    x = np.full(network.n_species, 100.0, dtype=float)
+    sid = network.species_idx("AAA")
+    stepper = CountingLocalPropensityStepper(
+        BlendedHybridConfig(
+            i1=10.0,
+            i2=30.0,
+            dt_cle=0.01,
+            strict_int_for_CLE=False,
+            local_propensity_calculation=True,
+        )
+    )
+
+    prop0 = stepper._propensities_for_state(network, x, 0.0, "cached propensities").copy()
+    assert stepper.full_propensity_calls == 1
+    assert stepper._last_observed_propensity_update_path == "full_recompute"
+
+    x_changed = x.copy()
+    x_changed[sid] = 20.0
+    prop1 = stepper._propensities_for_state(network, x_changed, 0.0, "cached propensities")
+    expected = network.compute_all_propensities(SystemState(t=0.0, x=x_changed))
+
+    assert np.allclose(prop0, network.compute_all_propensities(SystemState(t=0.0, x=x)))
+    assert np.allclose(prop1, expected)
+    assert stepper.full_propensity_calls == 1
+    assert stepper._last_observed_propensity_update_path == "local_update"
+    assert stepper._last_observed_propensity_affected_updates > 0
+
+
 def test_blended_hybrid_observed_propensity_reuse_adds_changed_catalyst_channels(monkeypatch):
     class LocalObservedPropensityStepper(BlendedHybridStepper):
         def _observed_propensity_local_update_limit(self, n_channels: int) -> int:
@@ -747,6 +797,7 @@ def test_blended_hybrid_observed_propensity_reuse_adds_changed_catalyst_channels
             i2=30.0,
             dt_cle=0.01,
             strict_int_for_CLE=True,
+            local_propensity_calculation=True,
             beta_compute_mode="beta_compute_by_state_difference",
         )
     )
@@ -798,3 +849,44 @@ def test_blended_hybrid_runner_compatibility():
     assert np.isclose(result.state.t, 0.05)
     assert np.all(np.isfinite(result.state.x))
     assert np.all(result.state.x >= 0.0)
+
+
+def test_blended_hybrid_cle_sparsity_sampler_writes_summary_not_trajectory():
+    network = make_network(initial_count=20.0)
+    plot_path = Path("tests") / "_cle_sparsity_sampler_plot_tmp.png"
+    plot_path.unlink(missing_ok=True)
+    result = ExperimentRunner().run_one(
+        network,
+        BlendedHybridStepper(
+            BlendedHybridConfig(
+                i1=-2.0,
+                i2=-1.0,
+                dt_cle=0.01,
+                adaptive_cle_dt=False,
+                cle_sparsity_sampling=True,
+                cle_sparsity_sample_interval=1,
+                cle_sparsity_plot_path=str(plot_path),
+            )
+        ),
+        t_end=0.02,
+        seed=41,
+        max_steps=10,
+    )
+
+    metadata = result.summary.metadata["cle_sparsity_sampling"]
+    assert metadata["enabled"] is True
+    assert metadata["sample_interval"] == 1
+    assert metadata["cle_increment_calls"] >= 1
+    assert metadata["n_samples"] == metadata["cle_increment_calls"]
+    assert metadata["plot_path"] == str(plot_path)
+    assert plot_path.exists()
+    plot_path.unlink(missing_ok=True)
+
+    sample = metadata["samples"][0]
+    assert sample["amounts_shape"] == [network.n_channels]
+    assert sample["stoichiometry_shape"] == [network.n_channels, network.n_species]
+    assert sample["csr_stoichiometry_shape"] == [network.n_channels, network.n_species]
+    assert 0.0 <= sample["amounts_zero_fraction"] <= 1.0
+    assert 0.0 <= sample["amounts_nonzero_fraction"] <= 1.0
+    assert 0.0 <= sample["stoichiometry_zero_fraction"] <= 1.0
+    assert 0.0 <= sample["stoichiometry_nonzero_fraction"] <= 1.0
