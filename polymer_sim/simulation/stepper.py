@@ -4024,7 +4024,7 @@ class BlendedHybridStepper(BaseStepper):
         self._last_observed_propensity_changed_catalyst_species = 0
         self._last_observed_propensity_catalyst_affected_channels = 0
 
-    @profile
+
     def _propensities_for_observed_cached(
         self,
         network: ReactionNetworkData,

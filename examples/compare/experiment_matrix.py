@@ -376,6 +376,8 @@ def _run_matrix_cell_body(
         "simulation_final_time": float(summary.final_time),
         "n_steps": int(summary.n_steps),
         "n_events": int(summary.n_events),
+        "ssa_steps": int(summary.metadata.get("ssa_steps", 0)),
+        "con_steps": int(summary.metadata.get("con_steps", 0)),
         "stop_reason": str(summary.metadata.get("stop_reason")),
         "wall_runtime_seconds": float(wall_runtime_seconds),
         "network_build_wall_seconds": float(build_wall_seconds),
@@ -490,6 +492,8 @@ def _run_task_capture_errors(task: dict[str, Any]) -> dict[str, Any]:
             "simulation_final_time": None,
             "n_steps": None,
             "n_events": None,
+            "ssa_steps": None,
+            "con_steps": None,
             "wall_runtime_seconds": None,
             "trajectory_path": "",
             "observed_propensity_cache_miss_log_path": "",
@@ -515,6 +519,7 @@ def _print_task_result(result: dict[str, Any]) -> None:
         f"status={status} config={result.get('config_id')} network={result.get('network')} "
         f"method={result.get('method')} sim_time={result.get('simulation_final_time')} "
         f"steps={result.get('n_steps')} events={result.get('n_events')} "
+        f"ssa_steps={result.get('ssa_steps')} con_steps={result.get('con_steps')} "
         f"stop={result.get('stop_reason')} wall={result.get('wall_runtime_seconds')} "
         f"trajectory={result.get('trajectory_path')} profile={result.get('profile_report_path')} "
         f"error={result.get('error')}"
@@ -575,6 +580,8 @@ def disabled_result(config_id: str, network: str, *, error: str = "") -> dict[st
         "simulation_final_time": None,
         "n_steps": None,
         "n_events": None,
+        "ssa_steps": None,
+        "con_steps": None,
         "wall_runtime_seconds": None,
         "trajectory_path": "",
         "observed_propensity_cache_miss_log_path": "",

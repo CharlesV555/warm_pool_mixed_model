@@ -73,20 +73,20 @@ class NetworkSpec:
     max_len: int = 0
     alphabet: tuple[str, ...] = ("0", "1")
     food_species: tuple[str, ...] = ()
-    food_supply_mode: str = "explicit_inflow"
-    initial_food_count: float = 1000.0
-    food_max_count: float = 1000.0
-    k_left_add: float = 0.01
-    k_right_add: float = 0.01
-    k_left_split: float = 0.011
-    k_right_split: float = 0.011
+    food_supply_mode: str = "constant" # explicit_inflow, constant
+    initial_food_count: float = 10.0
+    food_max_count: float = 10.0
+    k_left_add: float = 0.1
+    k_right_add: float = 0.1
+    k_left_split: float = 0.11
+    k_right_split: float = 0.11
     k_nonfood_outflow: float = 1.5
     food_inflow_rate: float = 10000.0
     food_inflow_hill_coefficient: float = 2.0
     use_hill_capped_food_inflow: bool = True
     catalysis_mode: str = "substrate_saturating"
     saturation_alpha: float = 0.01
-    catalytic_gamma: float = 1000.0
+    catalytic_gamma: float = 100.0
     catalysis_seed: int = 123
     cross_catalysis_rules: tuple[tuple[str, str], ...] = (("0000", "0"),)
 
@@ -104,13 +104,13 @@ class RunSettings:
     nrm_propensity_tol: float = 0.0
     nrm_heap_rebuild_factor: float = 4.0
     nrm_diagnostics: bool = True
-    blended_i1: float = 100.0
-    blended_i2: float = 150.0
-    blended_dt_cle: float = 0.00033981
+    blended_i1: float = 50.0
+    blended_i2: float = 70.0
+    blended_dt_cle: float = 0.01
     # Keep the pure-CLE macro step no larger than the CLE micro step by default.
     # The fast dimerization benchmark is stiff enough that dt_macro=0.01 can
     # drive explicit CLE/Euler updates to NaN/inf before the wall-clock stop.
-    blended_dt_macro: float = 0.00033981
+    blended_dt_macro: float = 0.1
     blended_beta_species_mode: str = "reactants"
     blended_beta_compute_mode: str = "beta_fully_compute"
     blended_strict_int_for_CLE: bool = False
@@ -149,8 +149,8 @@ NETWORK_SPECS: dict[str, NetworkSpec] = {
         name="polymer_food_dimer_inhibition_len3",
         kind="polymer_food_dimer_inhibition_len3",
         food_species=("0", "1"),
-        initial_food_count=100.0,
-        food_max_count=100.0,
+        initial_food_count=10.0,
+        food_max_count=10.0,
     ),
     "quasi_disjoint_slow_fast": NetworkSpec(
         name="quasi_disjoint_slow_fast",
@@ -193,6 +193,22 @@ NETWORK_SPECS: dict[str, NetworkSpec] = {
         food_species=("A",),
         food_supply_mode="constant",
         cross_catalysis_rules=(("AAAAAAAA", "A"),),
+    ),
+    "polymer_a_len9_a9_catalyzes_a_constant_food": NetworkSpec(
+        name="polymer_a_len9_a9_catalyzes_a_constant_food",
+        max_len=9,
+        alphabet=("A",),
+        food_species=("A",),
+        food_supply_mode="constant",
+        cross_catalysis_rules=(("AAAAAAAAA", "A"),),
+    ),
+    "polymer_a_len10_a10_catalyzes_a_constant_food": NetworkSpec(
+        name="polymer_a_len10_a10_catalyzes_a_constant_food",
+        max_len=10,
+        alphabet=("A",),
+        food_species=("A",),
+        food_supply_mode="constant",
+        cross_catalysis_rules=(("AAAAAAAAAA", "A"),),
     ),
     "polymer_len10_two_stage_1_catalysis": NetworkSpec(
         name="polymer_len10_two_stage_1_catalysis",

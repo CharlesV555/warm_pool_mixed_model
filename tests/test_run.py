@@ -6,6 +6,7 @@ import numpy as np
 
 from polymer_sim import (
     ChannelBlock,
+    CLEStepper,
     ExperimentRunner,
     FixedPartitionStrategy,
     HybridStepper,
@@ -39,6 +40,17 @@ def test_ssa_runs():
     assert result.state.t == 0.5
     assert result.summary.n_steps >= 1
     assert recorder.finalize().states.shape[1] == network.n_species
+
+
+def test_runner_lightweight_step_mode_counts():
+    network = make_network()
+    ssa_result = ExperimentRunner().run_one(network, SSAStepper(), t_end=0.5, seed=11)
+    assert ssa_result.summary.metadata["ssa_steps"] == ssa_result.summary.n_events
+    assert ssa_result.summary.metadata["con_steps"] == 0
+
+    cle_result = ExperimentRunner().run_one(network, CLEStepper(), t_end=0.1, seed=12, dt=0.05)
+    assert cle_result.summary.metadata["ssa_steps"] == 0
+    assert cle_result.summary.metadata["con_steps"] == cle_result.summary.n_steps
 
 
 def test_runner_stops_on_catalytic_overflow_guard():

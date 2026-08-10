@@ -11,6 +11,7 @@ from polymer_sim.core.state import SystemState
 from polymer_sim.model.catalysis import dense_catalysis_block
 from polymer_sim.model.rules import ReactionRuleTables
 from polymer_sim.model.species import SpeciesSpace
+from line_profiler import profile
 
 
 class NumericalGuardStop(RuntimeError):
@@ -851,13 +852,12 @@ class ReactionNetworkData:
             return 1.0
 
         contribution = 0.0
-        denominator_base = self.saturation_alpha * substrate_capacity
         for position, catalyst_sid in enumerate(cats):
             x_c = max(self._count_value(state.x, int(catalyst_sid)), 0.0)
             if x_c <= 0.0:
                 continue
             strength = float(strengths[position])
-            contribution += strength * substrate_capacity * x_c / (denominator_base + x_c)
+            contribution += strength * min(x_c, substrate_capacity)
         return float(1.0 + contribution)
 
     def compute_base_propensity(self, channel_id: int, state: SystemState) -> float:
@@ -1282,7 +1282,7 @@ class ReactionNetworkData:
         block = self.get_channel_block(channel_id)
         return block in (ChannelBlock.LEFT_ADD, ChannelBlock.RIGHT_ADD)
 
-    def _substrate_capacity(self, channel_id: int, state: SystemState) -> float:
+    def _substrate_capacity(self, channel_id: int, state: SystemState) -> float: # 计算当前状态下，这个加聚反应最多还能凑出多少组可反应底物对。
         block, local = self._block_and_local(channel_id)
         if block == ChannelBlock.LEFT_ADD:
             a = int(self.left_add_monomer[local])
@@ -1294,11 +1294,11 @@ class ReactionNetworkData:
             return 0.0
 
         x = state.x
-        x_a = max(self._count_value(x, a), 0.0)
+        x_a = max(self._count_value(x, a), 0.0) # 避免负数影响
         x_b = max(self._count_value(x, b), 0.0)
         if a == b:
             return float(np.floor(x_a / 2.0))
-        return float(min(x_a, x_b))
+        return float(min(x_a, x_b)) # 由少的那个决定能凑出多少对
 
     def _block_bounds(self, block: ChannelBlock | int) -> tuple[int, int]:
         block_e = ChannelBlock(int(block))
@@ -1357,6 +1357,7 @@ class ReactionNetworkData:
         source = self.right_split_source[ids]
         return self.right_split_rates[ids] * self.right_split_multiplicity[ids] * np.maximum(self._count_values(x, source), 0.0)
 
+    @profile
     def _apply_block_catalysis(
         self,
         block: ChannelBlock | int,
@@ -1552,14 +1553,7 @@ class ReactionNetworkData:
         if local_ids is all_ids:
             cap_by_entry = np.asarray(capacity, dtype=float)[cat_local_ids]
             x_c = x_values[cat_species_ids]
-            denom = self.saturation_alpha * cap_by_entry + x_c
-            weights = np.zeros(cat_species_ids.shape, dtype=float)
-            np.divide(
-                strengths * cap_by_entry * x_c,
-                denom,
-                out=weights,
-                where=denom > 0.0,
-            )
+            weights = strengths * np.minimum(x_c, cap_by_entry)
             contribution = np.bincount(
                 cat_local_ids,
                 weights=weights,
@@ -1576,14 +1570,7 @@ class ReactionNetworkData:
         if entries.size:
             cap_by_entry = np.asarray(capacity, dtype=float)[positions]
             x_c = x_values[cat_species_ids[entries]]
-            denom = self.saturation_alpha * cap_by_entry + x_c
-            weights = np.zeros(entries.shape, dtype=float)
-            np.divide(
-                strengths[entries] * cap_by_entry * x_c,
-                denom,
-                out=weights,
-                where=denom > 0.0,
-            )
+            weights = strengths[entries] * np.minimum(x_c, cap_by_entry)
             contribution = np.bincount(
                 positions,
                 weights=weights,
@@ -1652,9 +1639,7 @@ class ReactionNetworkData:
             return np.ones(capacity.shape, dtype=float)
         x_c = np.maximum(self._effective_state_values(x), 0.0)
         cap = np.asarray(capacity, dtype=float)
-        denom = self.saturation_alpha * cap[:, None] + x_c[None, :]
-        scaled = np.zeros_like(denom, dtype=float)
-        np.divide(cap[:, None] * x_c[None, :], denom, out=scaled, where=denom > 0.0)
+        scaled = np.minimum(cap[:, None], x_c[None, :])
         return 1.0 + np.sum(cat_rows * scaled, axis=1)
 
     def _inflow_capacity_factor(self, local_id: int, x: np.ndarray) -> float:

@@ -65,6 +65,8 @@ class ExperimentRunner:
         timing_next_sim_sample_index = 0
         timing_last_sample_wall = 0.0
         numerical_guard_metadata: dict[str, object] | None = None
+        ssa_steps = 0
+        con_steps = 0
 
         rng = np.random.default_rng(int(seed))
         state = SystemState.from_x0(network.x0 if x0 is None else x0)
@@ -114,6 +116,8 @@ class ExperimentRunner:
                     timing_step_elapsed += perf_counter() - timing_step_started_at
                 numerical_guard_metadata = dict(exc.metadata)
                 break
+            ssa_steps += int(_is_occurred_ssa_step(result))
+            con_steps += int(_is_continuous_or_mixed_step(result))
             if timing_enabled:
                 timing_step_elapsed += perf_counter() - timing_step_started_at
                 timing_next_sim_sample_index = _accumulate_simulation_clock_timing(
@@ -208,6 +212,8 @@ class ExperimentRunner:
             recorded.metadata["stop_reason"] = stop_reason
             recorded.metadata["stepper_name"] = stepper_metadata["name"]
             recorded.metadata["stepper_info"] = dict(stepper_metadata)
+            recorded.metadata["ssa_steps"] = int(ssa_steps)
+            recorded.metadata["con_steps"] = int(con_steps)
             if numerical_guard_metadata is not None:
                 recorded.metadata["numerical_guard"] = dict(numerical_guard_metadata)
             summary = recorded
@@ -222,6 +228,8 @@ class ExperimentRunner:
                     "stop_reason": stop_reason,
                     "stepper_name": stepper_metadata["name"],
                     "stepper_info": dict(stepper_metadata),
+                    "ssa_steps": int(ssa_steps),
+                    "con_steps": int(con_steps),
                     **(
                         {"numerical_guard": dict(numerical_guard_metadata)}
                         if numerical_guard_metadata is not None
@@ -430,6 +438,25 @@ def _stepper_metadata(stepper: BaseStepper) -> dict[str, object]:
     if partition_config is not None:
         metadata["partition_config"] = _config_metadata(partition_config)
     return metadata
+
+
+def _is_occurred_ssa_step(result: StepResult) -> bool:
+    details = result.details if isinstance(result.details, dict) else {}
+    mode = str(details.get("mode", ""))
+    return bool(result.event_occurred and mode in {"", "ssa"})
+
+
+def _is_continuous_or_mixed_step(result: StepResult) -> bool:
+    details = result.details if isinstance(result.details, dict) else {}
+    mode = str(details.get("mode", ""))
+    return mode in {
+        "cle",
+        "mixed_cle",
+        "mixed_jump",
+        "mixed_cle_retry",
+        "nrm_blended_cle",
+        "nrm_blended_mixed",
+    }
 
 
 def _config_metadata(config: object) -> dict[str, object]:

@@ -34,14 +34,14 @@ from polymer_sim import (
 #   "explicit_inflow" keeps formal food INFLOW reaction channels;
 #   "constant" disables those channels during network construction and configures
 #   food as network-level constants; runner receives no food restriction.
-T_END = 200.0
+T_END = 400.0
 SEED = network_example.SEED
 MAX_STEPS = network_example.MAX_STEPS
 MAX_TIMES = 60.0
 BLENDED_I1 = 50.0
 BLENDED_I2 = 80.0
-BLENDED_DT_CLE = 0.000389
-BLENDED_DT_MACRO = 0.01
+BLENDED_DT_CLE = 0.01
+BLENDED_DT_MACRO = 0.1
 OUTPUT_PATH = EXAMPLES_DIR / "blended_hybrid_minimal_trajectory.npz"
 FOOD_SUPPLY_MODE = "constant"
 
@@ -79,6 +79,11 @@ def build_stepper() -> BlendedHybridStepper:
             # cle_sparsity_sample_interval=100,
             # cle_sparsity_plot_path="cle_sparsity.png",
             ###
+
+            beta_species_mode = "reactants_products",
+            beta_compute_mode= "beta_fully_compute",
+            adaptive_cle_dt = False ,# CLE 实际执行时，根据是否产生负数动态缩小或放大 dt
+            
         )
     )
 

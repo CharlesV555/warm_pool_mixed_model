@@ -6,6 +6,8 @@ Networks:
 - polymer_a_len5_a5_catalyzes_a_constant_food: max length 5, AAAAA catalyzes A addition.
 - polymer_a_len6_a6_catalyzes_a_constant_food: max length 6, AAAAAA catalyzes A addition.
 - polymer_a_len8_a8_catalyzes_a_constant_food: max length 8, AAAAAAAA catalyzes A addition.
+- polymer_a_len9_a9_catalyzes_a_constant_food: max length 9, AAAAAAAAA catalyzes A addition.
+- polymer_a_len10_a10_catalyzes_a_constant_food: max length 10, AAAAAAAAAA catalyzes A addition.
 
 Food handling:
 - The monomer A is a food species.
@@ -43,9 +45,11 @@ from experiment_matrix import (
 
 
 DEFAULT_A_POLYMER_NETWORKS = (
-    "polymer_a_len5_a5_catalyzes_a_constant_food",
-    "polymer_a_len6_a6_catalyzes_a_constant_food",
+    # "polymer_a_len5_a5_catalyzes_a_constant_food",
+    # "polymer_a_len6_a6_catalyzes_a_constant_food",
     "polymer_a_len8_a8_catalyzes_a_constant_food",
+    "polymer_a_len9_a9_catalyzes_a_constant_food",
+    "polymer_a_len10_a10_catalyzes_a_constant_food",
 )
 
 
@@ -61,7 +65,7 @@ def create_a_polymer_update_config(
     blended_dt_cle: float = DEFAULT_SETTINGS.blended_dt_cle,
     blended_dt_macro: float = DEFAULT_SETTINGS.blended_dt_macro,
 ) -> pd.DataFrame:
-    """Create the 3-network x 4-method matrix requested for the A-polymer example."""
+    """Create the A-polymer network x method matrix."""
 
     base_settings: dict[str, Any] = {
         "seed": int(seed),

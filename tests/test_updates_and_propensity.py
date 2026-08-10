@@ -362,7 +362,7 @@ def test_substrate_saturating_propensity_uses_per_catalyst_capacity():
     network.set_catalytic_strength(channel, catalyst_sid=bb, strength=0.25, rebuild=True)
 
     substrate_capacity = 4.0
-    effective_per_catalyst = substrate_capacity * 4.0 / (0.25 * substrate_capacity + 4.0)
+    effective_per_catalyst = min(4.0, substrate_capacity)
     expected_factor = 1.0 + 0.5 * effective_per_catalyst + 0.25 * effective_per_catalyst
     assert network.compute_base_propensity(channel, state) == 80.0
     assert network.get_catalytic_factor(channel, state) == pytest.approx(expected_factor)
