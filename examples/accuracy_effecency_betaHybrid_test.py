@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
-import traceback
+import os
 import sys
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +61,9 @@ MAX_RUNTIME_SECONDS = 3_600.0
 # simulation time then becomes the t_end for all blended runs on that network.
 SSA_RUNS_PER_NETWORK = 100
 BLENDED_RUNS_PER_PARAMETER = 30
+
+# Parallelism.  A value of None uses all visible CPUs, capped by task count.
+PARALLEL_WORKERS: int | None = None
 
 # BlendedHybridConfig parameter scan.  i1/i2 form a triangular grid:
 # i1 is sampled in [20, 100]; i2 is sampled in [40, 120]; keep i2 >= i1 + 20.
@@ -157,7 +162,6 @@ def run() -> dict[str, Any]:
 
         ssa_dir = network_dir / "ssa"
         ssa_records = run_ssa_batch(
-            network=network,
             network_case=network_case,
             output_dir=ssa_dir,
             seed_rng=seed_rng,
@@ -173,7 +177,6 @@ def run() -> dict[str, Any]:
         for parameter_case in blended_cases:
             blended_dir = network_dir / parameter_case.label
             blended_records = run_blended_batch(
-                network=network,
                 network_case=network_case,
                 parameter_case=parameter_case,
                 t_end=blended_t_end,
@@ -188,6 +191,7 @@ def run() -> dict[str, Any]:
         "output_root": str(output_root),
         "seed_source": "np.random.default_rng() without fixed seed",
         "stop_conditions": stop_condition_metadata(),
+        "parallel": parallel_metadata(),
         "network_cases": [asdict(case) for case in network_cases],
         "blended_parameter_cases": [asdict(case) | {"label": case.label} for case in blended_cases],
         "n_records": len(all_records),
@@ -316,34 +320,30 @@ def terminal_matched_addition_channels(
 
 def run_ssa_batch(
     *,
-    network: ReactionNetworkData,
     network_case: NetworkCase,
     output_dir: Path,
     seed_rng: np.random.Generator,
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    records = []
+    tasks = []
     for run_index in range(int(SSA_RUNS_PER_NETWORK)):
-        seed = next_seed(seed_rng)
-        record = run_single(
-            network=network,
-            network_case=network_case,
-            method="ssa",
-            run_index=run_index,
-            seed=seed,
-            t_end=float(BASE_T_END),
-            output_dir=output_dir,
-            parameter_case=None,
+        tasks.append(
+            {
+                "network_case": network_case,
+                "method": "ssa",
+                "run_index": int(run_index),
+                "seed": next_seed(seed_rng),
+                "t_end": float(BASE_T_END),
+                "output_dir": output_dir,
+                "parameter_case": None,
+            }
         )
-        records.append(record)
-        _write_json(output_dir / "records.json", records)
-        print_single_record(record)
+    records = run_tasks_parallel(tasks, output_dir)
     return records
 
 
 def run_blended_batch(
     *,
-    network: ReactionNetworkData,
     network_case: NetworkCase,
     parameter_case: BlendedParameterCase,
     t_end: float,
@@ -351,23 +351,70 @@ def run_blended_batch(
     seed_rng: np.random.Generator,
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    records = []
+    tasks = []
     for run_index in range(int(BLENDED_RUNS_PER_PARAMETER)):
-        seed = next_seed(seed_rng)
-        record = run_single(
-            network=network,
-            network_case=network_case,
-            method="blended",
-            run_index=run_index,
-            seed=seed,
-            t_end=float(t_end),
-            output_dir=output_dir,
-            parameter_case=parameter_case,
+        tasks.append(
+            {
+                "network_case": network_case,
+                "method": "blended",
+                "run_index": int(run_index),
+                "seed": next_seed(seed_rng),
+                "t_end": float(t_end),
+                "output_dir": output_dir,
+                "parameter_case": parameter_case,
+            }
         )
-        records.append(record)
-        _write_json(output_dir / "records.json", records)
-        print_single_record(record)
+    records = run_tasks_parallel(tasks, output_dir)
     return records
+
+
+def run_tasks_parallel(tasks: list[dict[str, Any]], output_dir: Path) -> list[dict[str, Any]]:
+    if not tasks:
+        return []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    worker_count = resolve_worker_count(len(tasks))
+    print(f"[{RUN_NAME}] submitting {len(tasks)} tasks with workers={worker_count} output={output_dir}")
+    records: list[dict[str, Any]] = []
+    if worker_count <= 1:
+        for task in tasks:
+            record = run_single_task(task)
+            records.append(record)
+            _write_json(output_dir / "records.json", sorted_records(records))
+            print_single_record(record)
+        return sorted_records(records)
+
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        future_to_task = {executor.submit(run_single_task, task): task for task in tasks}
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            try:
+                record = future.result()
+            except Exception as exc:
+                record = task_error_record(task, exc)
+            records.append(record)
+            _write_json(output_dir / "records.json", sorted_records(records))
+            print_single_record(record)
+    return sorted_records(records)
+
+
+def run_single_task(task: dict[str, Any]) -> dict[str, Any]:
+    network_case = task["network_case"]
+    if not isinstance(network_case, NetworkCase):
+        network_case = NetworkCase(**dict(network_case))
+    parameter_case = task.get("parameter_case")
+    if parameter_case is not None and not isinstance(parameter_case, BlendedParameterCase):
+        parameter_case = BlendedParameterCase(**dict(parameter_case))
+    network, _ = build_network_case(network_case)
+    return run_single(
+        network=network,
+        network_case=network_case,
+        method=str(task["method"]),
+        run_index=int(task["run_index"]),
+        seed=int(task["seed"]),
+        t_end=float(task["t_end"]),
+        output_dir=Path(task["output_dir"]),
+        parameter_case=parameter_case,
+    )
 
 
 def run_single(
@@ -437,7 +484,7 @@ def run_single(
             "trajectory_path": str(trajectory_path),
             "final_total_abundance": float(final_state.sum()),
             "max_species_count": float(final_state.max()) if final_state.size else 0.0,
-            "parameter_case": None if parameter_case is None else asdict(parameter_case) | {"label": parameter_case.label},
+            "parameter_case": parameter_payload(parameter_case),
             "error": "",
             "traceback_path": "",
         }
@@ -454,7 +501,7 @@ def run_single(
                     "max_runtime_seconds": float(MAX_RUNTIME_SECONDS),
                     "wall_runtime_seconds": float(wall_runtime),
                     "stop_reason": stop_reason,
-                    "parameter_case": None if parameter_case is None else asdict(parameter_case) | {"label": parameter_case.label},
+                    "parameter_case": parameter_payload(parameter_case),
                 }
             )
             save_trajectory_record(trajectory_path, trajectory_record)
@@ -483,7 +530,7 @@ def run_single(
             "con_steps": None,
             "stop_reason": stop_reason,
             "trajectory_path": "",
-            "parameter_case": None if parameter_case is None else asdict(parameter_case) | {"label": parameter_case.label},
+            "parameter_case": parameter_payload(parameter_case),
             "error": error,
             "traceback_path": traceback_path,
         }
@@ -546,6 +593,67 @@ def network_error_record(network_case: NetworkCase, exc: Exception) -> dict[str,
     }
 
 
+def task_error_record(task: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    network_case = task["network_case"]
+    if not isinstance(network_case, NetworkCase):
+        network_case = NetworkCase(**dict(network_case))
+    parameter_case = task.get("parameter_case")
+    return {
+        "status": "error",
+        "network": network_case.name,
+        "max_len": int(network_case.max_len),
+        "method": str(task.get("method", "unknown")),
+        "run_index": int(task.get("run_index", -1)),
+        "seed": int(task.get("seed", 0)),
+        "requested_t_end": float(task.get("t_end", 0.0)),
+        "simulation_final_time": None,
+        "wall_runtime_seconds": None,
+        "n_steps": None,
+        "n_events": None,
+        "ssa_steps": None,
+        "con_steps": None,
+        "stop_reason": "worker_exception",
+        "trajectory_path": "",
+        "parameter_case": parameter_payload(parameter_case),
+        "error": repr(exc),
+        "traceback_path": "",
+    }
+
+
+def sorted_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        records,
+        key=lambda record: (
+            str(record.get("network", "")),
+            str(record.get("method", "")),
+            _parameter_sort_key(record.get("parameter_case")),
+            int(record.get("run_index") if record.get("run_index") is not None else -1),
+        ),
+    )
+
+
+def _parameter_sort_key(value: Any) -> int:
+    if isinstance(value, dict) and value.get("index") is not None:
+        return int(value["index"])
+    return -1
+
+
+def parameter_payload(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, BlendedParameterCase):
+        return asdict(value) | {"label": value.label}
+    data = dict(value)
+    label = data.get("label")
+    if label is None:
+        try:
+            label = BlendedParameterCase(**data).label
+        except Exception:
+            label = ""
+    data["label"] = str(label)
+    return data
+
+
 def error_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     errors = [record for record in records if record.get("status") != "ok"]
     reasons: dict[str, int] = {}
@@ -572,6 +680,26 @@ def print_error_summary(summary: dict[str, Any]) -> None:
         f"[{RUN_NAME}] error_summary: n_errors={summary.get('n_errors')} "
         f"reasons={summary.get('reasons')} messages={summary.get('messages')}"
     )
+
+
+def resolve_worker_count(task_count: int) -> int:
+    if int(task_count) <= 0:
+        return 0
+    if PARALLEL_WORKERS is None:
+        requested = os.cpu_count() or 1
+    else:
+        requested = int(PARALLEL_WORKERS)
+    return max(1, min(int(requested), int(task_count)))
+
+
+def parallel_metadata() -> dict[str, Any]:
+    return {
+        "backend": "process",
+        "parallel_workers": None if PARALLEL_WORKERS is None else int(PARALLEL_WORKERS),
+        "resolved_cpu_count": os.cpu_count(),
+        "stage_order": "per network: parallel SSA -> median t_end -> parallel blended per parameter case",
+        "network_rebuild_per_worker": True,
+    }
 
 
 def next_seed(rng: np.random.Generator) -> int:
@@ -620,7 +748,65 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
+def apply_environment_overrides() -> None:
+    # Optional smoke-test/runtime overrides.  Defaults above remain authoritative
+    # when these environment variables are absent.
+    global NETWORK_MAX_LENGTHS
+    global SSA_RUNS_PER_NETWORK
+    global BLENDED_RUNS_PER_PARAMETER
+    global BASE_T_END
+    global MAX_STEPS
+    global MAX_RUNTIME_SECONDS
+    global PARALLEL_WORKERS
+    global I1_LINEAR_SPACE
+    global I2_LINEAR_SPACE
+
+    NETWORK_MAX_LENGTHS = _env_int_tuple("BETA_TEST_NETWORK_MAX_LENGTHS", NETWORK_MAX_LENGTHS)
+    SSA_RUNS_PER_NETWORK = _env_int("BETA_TEST_SSA_RUNS", SSA_RUNS_PER_NETWORK)
+    BLENDED_RUNS_PER_PARAMETER = _env_int("BETA_TEST_BLENDED_RUNS", BLENDED_RUNS_PER_PARAMETER)
+    BASE_T_END = _env_float("BETA_TEST_BASE_T_END", BASE_T_END)
+    MAX_STEPS = _env_int("BETA_TEST_MAX_STEPS", MAX_STEPS)
+    MAX_RUNTIME_SECONDS = _env_float("BETA_TEST_MAX_RUNTIME_SECONDS", MAX_RUNTIME_SECONDS)
+    PARALLEL_WORKERS = _env_optional_int("BETA_TEST_WORKERS", PARALLEL_WORKERS)
+    I1_LINEAR_SPACE = np.asarray(_env_float_tuple("BETA_TEST_I1_VALUES", tuple(I1_LINEAR_SPACE)), dtype=float)
+    I2_LINEAR_SPACE = np.asarray(_env_float_tuple("BETA_TEST_I2_VALUES", tuple(I2_LINEAR_SPACE)), dtype=float)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(default) if value is None or not value.strip() else int(value)
+
+
+def _env_optional_int(name: str, default: int | None) -> int | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    if value.strip().lower() in {"none", "null"}:
+        return None
+    return int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    return float(default) if value is None or not value.strip() else float(value)
+
+
+def _env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return tuple(int(item) for item in default)
+    return tuple(int(item.strip()) for item in value.split(",") if item.strip())
+
+
+def _env_float_tuple(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return tuple(float(item) for item in default)
+    return tuple(float(item.strip()) for item in value.split(",") if item.strip())
+
+
 def main() -> None:
+    apply_environment_overrides()
     run()
 
 
