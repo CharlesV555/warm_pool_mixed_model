@@ -62,8 +62,8 @@ BLENDED_RUNS_PER_PARAMETER = 30
 
 # BlendedHybridConfig parameter scan.  i1/i2 form a triangular grid:
 # i1 is sampled in [20, 100]; i2 is sampled in [40, 120]; keep i2 >= i1 + 20.
-I1_LINEAR_SPACE = np.linspace(20.0, 100.0, num=10)
-I2_LINEAR_SPACE = np.linspace(40.0, 120.0, num=10)
+I1_LINEAR_SPACE = np.linspace(20.0, 100.0, num=5)
+I2_LINEAR_SPACE = np.linspace(40.0, 120.0, num=5)
 I2_MIN_GAP = 20.0
 
 # Fixed blended parameters displayed here and copied into metadata.
