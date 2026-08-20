@@ -184,7 +184,7 @@ class BlendedHybridConfig:
     beta_species_mode: str = "reactants_products"
     beta_compute_mode: str = "beta_fully_compute"
     round_low_counts_after_cle: bool = True
-    strict_int_for_CLE: bool = False
+    strict_int_for_CLE: bool = True
     local_propensity_calculation: bool = False
 
     # 看矩阵稀疏度，可以删了
@@ -195,7 +195,7 @@ class BlendedHybridConfig:
     use_reaction_interval_dt: bool = False # 用平均反应间隔自动给 CLE dt 一个基础估计
     reaction_interval_update_steps: int = 100
     reaction_interval_scale: float = 1.0
-    adaptive_cle_dt: bool = True # CLE 实际执行时，根据是否产生负数动态缩小或放大 dt
+    adaptive_cle_dt: bool = False # CLE 实际执行时，根据是否产生负数动态缩小或放大 dt
     cle_dt_min: float = 1e-12
     cle_dt_max: float | None = None
     cle_dt_shrink_factor: float = 0.5
