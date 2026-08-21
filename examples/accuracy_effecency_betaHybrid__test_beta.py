@@ -144,9 +144,12 @@ def run() -> dict[str, Any]:
         "blended_parameter_cases": [asdict(case) | {"label": case.label} for case in blended_cases],
         "n_records": len(all_records),
         "error_summary": base.error_summary(all_records),
+        "batch_report": base.batch_report(all_records),
         "records": all_records,
     }
+    write_json(output_root / "batch_report.json", payload["batch_report"])
     write_json(output_root / "run_metadata.json", payload)
+    print_batch_report(payload["batch_report"])
     print_error_summary(payload["error_summary"])
     print(f"[{RUN_NAME}] wrote metadata: {output_root / 'run_metadata.json'}")
     return payload
@@ -378,6 +381,30 @@ def run_single(
             "error": error,
             "traceback_path": traceback_path,
         }
+        partial_path = output_dir / f"run_{int(run_index):04d}_seed_{int(seed)}_partial.npz"
+        if base.try_save_partial_trajectory(
+            recorder,
+            partial_path,
+            metadata={
+                "network": str(analysis_network),
+                "physical_network": network_case.name,
+                "method": method,
+                "run_index": int(run_index),
+                "seed": int(seed),
+                "requested_t_end": base.json_float_or_none(t_end),
+                "max_steps": int(max_steps),
+                "max_runtime_seconds": float(max_runtime_seconds),
+                "wall_runtime_seconds": float(wall_runtime),
+                "stop_reason": stop_reason,
+                "partial_after_error": True,
+                "error": error,
+                "parameter_case": base.parameter_payload(parameter_case),
+            },
+        ):
+            record["trajectory_path"] = str(partial_path)
+            record["partial_trajectory_saved"] = True
+        else:
+            record["partial_trajectory_saved"] = False
     write_json(output_dir / f"{method}_run_{int(run_index):04d}_record.json", record)
     return record
 
@@ -469,6 +496,18 @@ def print_error_summary(summary: dict[str, Any]) -> None:
         f"[{RUN_NAME}] error_summary: n_errors={summary.get('n_errors')} "
         f"reasons={summary.get('reasons')} messages={summary.get('messages')}"
     )
+
+
+def print_batch_report(report: dict[str, Any]) -> None:
+    print(f"[{RUN_NAME}] batch_report n_records={report.get('n_records')}")
+    for method, item in dict(report.get("by_method", {})).items():
+        print(
+            f"[{RUN_NAME}] batch_report method={method} "
+            f"n_total={item.get('n_total')} n_ok={item.get('n_ok')} "
+            f"n_error={item.get('n_error')} n_reached_t_end={item.get('n_reached_t_end')} "
+            f"stop_reasons={item.get('stop_reasons')} "
+            f"simulation_final_time_quantiles={item.get('simulation_final_time_quantiles')}"
+        )
 
 
 def write_json(path: Path, payload: Any) -> None:

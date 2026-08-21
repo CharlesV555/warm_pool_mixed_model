@@ -26,6 +26,7 @@ from polymer_sim import (  # noqa: E402
     StepResult,
     TrajectoryRecorder,
     build_reaction_rule_tables,
+    build_food_supply_restriction,
     clear_all_catalysis,
     generate_fixed_species_space,
     save_trajectory_record,
@@ -41,6 +42,9 @@ RUN_NAME = "accuracy_effecency_betaHybrid_test"
 NETWORK_MAX_LENGTHS = (8, 10, 12)
 MONOMERS = ("A", "B")
 INITIAL_MONOMER_COUNT = 10.0
+FOOD_SUPPLY_MODE = "constant"
+FOOD_SPECIES = MONOMERS
+FOOD_COUNT = INITIAL_MONOMER_COUNT
 
 # Base reaction coefficients are written explicitly for later scale edits.
 K_POLY_LEFT = 0.1
@@ -242,9 +246,12 @@ def run() -> dict[str, Any]:
         "blended_parameter_cases": [asdict(case) | {"label": case.label} for case in blended_cases],
         "n_records": len(all_records),
         "error_summary": error_summary(all_records),
+        "batch_report": batch_report(all_records),
         "records": all_records,
     }
+    _write_json(output_root / "batch_report.json", payload["batch_report"])
     _write_json(output_root / "run_metadata.json", payload)
+    print_batch_report(payload["batch_report"])
     print_error_summary(payload["error_summary"])
     print(f"[{RUN_NAME}] wrote metadata: {output_root / 'run_metadata.json'}")
     return payload
@@ -294,6 +301,12 @@ def build_network_case(case: NetworkCase) -> tuple[ReactionNetworkData, dict[str
         ],
         catalysis_mode=str(CATALYSIS_MODE),
         saturation_alpha=float(SATURATION_ALPHA),
+    )
+    build_food_supply_restriction(
+        network,
+        mode=str(FOOD_SUPPLY_MODE),
+        food_species=tuple(FOOD_SPECIES),
+        food_count=float(FOOD_COUNT),
     )
     catalysis = assign_longest_pure_cross_catalysis(network, case.max_len)
     return network, catalysis
@@ -580,6 +593,29 @@ def run_single(
             "error": error,
             "traceback_path": traceback_path,
         }
+        partial_path = output_dir / f"run_{int(run_index):04d}_seed_{int(seed)}_partial.npz"
+        if try_save_partial_trajectory(
+            recorder,
+            partial_path,
+            metadata={
+                "network": network_case.name,
+                "method": method,
+                "run_index": int(run_index),
+                "seed": int(seed),
+                "requested_t_end": json_float_or_none(t_end),
+                "max_steps": int(MAX_STEPS),
+                "max_runtime_seconds": float(MAX_RUNTIME_SECONDS),
+                "wall_runtime_seconds": float(wall_runtime),
+                "stop_reason": stop_reason,
+                "partial_after_error": True,
+                "error": error,
+                "parameter_case": parameter_payload(parameter_case),
+            },
+        ):
+            record["trajectory_path"] = str(partial_path)
+            record["partial_trajectory_saved"] = True
+        else:
+            record["partial_trajectory_saved"] = False
     _write_json(output_dir / f"{method}_run_{int(run_index):04d}_record.json", record)
     return record
 
@@ -628,6 +664,23 @@ def json_float_or_none(value: Any) -> float | None:
         return None
     result = float(value)
     return float(result) if np.isfinite(result) else None
+
+
+def try_save_partial_trajectory(
+    recorder: TrajectoryRecorder,
+    path: Path,
+    *,
+    metadata: dict[str, Any],
+) -> bool:
+    try:
+        record = recorder.finalize()
+        if record.times.size <= 1:
+            return False
+        record.run_metadata.update(metadata)
+        save_trajectory_record(path, record)
+        return True
+    except Exception:
+        return False
 
 
 def network_error_record(network_case: NetworkCase, exc: Exception) -> dict[str, Any]:
@@ -787,7 +840,86 @@ def base_rate_metadata() -> dict[str, Any]:
         "catalysis_mode": str(CATALYSIS_MODE),
         "saturation_alpha": float(SATURATION_ALPHA),
         "catalytic_gamma": float(CATALYTIC_GAMMA),
+        "food_supply_mode": str(FOOD_SUPPLY_MODE),
+        "food_species": [str(name) for name in FOOD_SPECIES],
+        "food_count": float(FOOD_COUNT),
     }
+
+
+def batch_report(records: list[dict[str, Any]]) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "n_records": len(records),
+        "by_method": {},
+    }
+    methods = sorted({str(record.get("method", "unknown")) for record in records})
+    for method in methods:
+        method_records = [record for record in records if str(record.get("method", "unknown")) == method]
+        ok_records = [record for record in method_records if record.get("status") == "ok"]
+        error_records = [record for record in method_records if record.get("status") != "ok"]
+        report["by_method"][method] = {
+            "n_total": len(method_records),
+            "n_ok": len(ok_records),
+            "n_error": len(error_records),
+            "n_reached_t_end": sum(1 for record in ok_records if record.get("stop_reason") == "reached_t_end"),
+            "stop_reasons": count_values(record.get("stop_reason") for record in method_records),
+            "error_messages": count_values(
+                record.get("error") for record in error_records if str(record.get("error", "")).strip()
+            ),
+            "simulation_final_time_quantiles": finite_quantiles(
+                record.get("simulation_final_time") for record in ok_records
+            ),
+            "requested_t_end_quantiles": finite_quantiles(
+                record.get("requested_t_end") for record in method_records
+            ),
+            "wall_runtime_seconds_quantiles": finite_quantiles(
+                record.get("wall_runtime_seconds") for record in method_records
+            ),
+        }
+    return report
+
+
+def count_values(values) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = str(value)
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def finite_quantiles(values) -> dict[str, float | None]:
+    clean = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            item = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(item):
+            clean.append(item)
+    if not clean:
+        return {"n": 0, "min": None, "q25": None, "median": None, "q75": None, "max": None}
+    arr = np.asarray(clean, dtype=float)
+    return {
+        "n": int(arr.size),
+        "min": float(np.quantile(arr, 0.0)),
+        "q25": float(np.quantile(arr, 0.25)),
+        "median": float(np.quantile(arr, 0.5)),
+        "q75": float(np.quantile(arr, 0.75)),
+        "max": float(np.quantile(arr, 1.0)),
+    }
+
+
+def print_batch_report(report: dict[str, Any]) -> None:
+    print(f"[{RUN_NAME}] batch_report n_records={report.get('n_records')}")
+    for method, item in dict(report.get("by_method", {})).items():
+        print(
+            f"[{RUN_NAME}] batch_report method={method} "
+            f"n_total={item.get('n_total')} n_ok={item.get('n_ok')} "
+            f"n_error={item.get('n_error')} n_reached_t_end={item.get('n_reached_t_end')} "
+            f"stop_reasons={item.get('stop_reasons')} "
+            f"simulation_final_time_quantiles={item.get('simulation_final_time_quantiles')}"
+        )
 
 
 def print_single_record(record: dict[str, Any]) -> None:
