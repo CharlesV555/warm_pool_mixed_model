@@ -4047,10 +4047,12 @@ class BlendedHybridStepper(BaseStepper):
         self._last_observed_propensity_beta_extra_channels = 0
         self._last_observed_propensity_changed_catalyst_species = 0
         self._last_observed_propensity_catalyst_affected_channels = 0
-        mismatch_reasons = self._observed_propensity_cache_mismatch_reasons(network)
-        if mismatch_reasons:
-            self._warn_observed_propensity_cache_miss(name, mismatch_reasons)
-            return self._recompute_observed_propensity_cache(network, values, t, name)
+        
+        # 如果缓存更新就会报道，现在不用了
+        # mismatch_reasons = self._observed_propensity_cache_mismatch_reasons(network)
+        # if mismatch_reasons:
+        #     self._warn_observed_propensity_cache_miss(name, mismatch_reasons)
+        #     return self._recompute_observed_propensity_cache(network, values, t, name)
 
         cached_state = self._observed_propensity_state
         cached_propensities = self._observed_propensity_cache
