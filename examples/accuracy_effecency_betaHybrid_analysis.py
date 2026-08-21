@@ -317,20 +317,51 @@ def load_group_samples(rows: list[RunRow], time_points: np.ndarray) -> tuple[np.
     for row in rows:
         if row.trajectory_path is None or not row.trajectory_path.exists():
             continue
+        file_size = row.trajectory_path.stat().st_size
+        load_started = perf_counter()
         try:
             record = load_trajectory_record(row.trajectory_path)
         except Exception as exc:
             print(f"[analysis] skip trajectory load error: {row.trajectory_path} {exc!r}")
             continue
+        load_elapsed = perf_counter() - load_started
+        times_shape = tuple(np.asarray(record.times).shape)
+        states_shape = tuple(np.asarray(record.states).shape)
         if not species_names:
             species_names = list(record.species_names)
         elif list(record.species_names) != species_names:
             print(f"[analysis] skip species mismatch: {row.trajectory_path}")
             continue
-        samples.append(sample_trajectory_states(record.times, record.states, time_points))
+        sample_started = perf_counter()
+        sampled = sample_trajectory_states(record.times, record.states, time_points)
+        sample_elapsed = perf_counter() - sample_started
+        samples.append(sampled)
+        print(
+            f"[analysis] trajectory method={row.method} label={row.algorithm_label} "
+            f"run={row.raw.get('run_index')} file={row.trajectory_path.name} "
+            f"size={format_bytes(file_size)} load={load_elapsed:.3f}s "
+            f"times_shape={times_shape} states_shape={states_shape} "
+            f"sample={sample_elapsed:.3f}s sampled_shape={sampled.shape}"
+        )
     if not samples:
         return np.empty((0, len(time_points), 0), dtype=float), species_names
-    return np.stack(samples, axis=0), species_names
+    stack_started = perf_counter()
+    stacked = np.stack(samples, axis=0)
+    print(
+        f"[analysis] stacked group label={rows[0].algorithm_label if rows else ''} "
+        f"n_trajectories={len(samples)} stack={perf_counter() - stack_started:.3f}s "
+        f"stacked_shape={stacked.shape}"
+    )
+    return stacked, species_names
+
+
+def format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024.0 or unit == "GiB":
+            return f"{value:.2f}{unit}"
+        value /= 1024.0
+    return f"{value:.2f}GiB"
 
 
 def sample_trajectory_states(times: np.ndarray, states: np.ndarray, time_points: np.ndarray) -> np.ndarray:
