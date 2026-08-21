@@ -48,8 +48,9 @@ DEFAULT_A_POLYMER_NETWORKS = (
     # "polymer_a_len5_a5_catalyzes_a_constant_food",
     # "polymer_a_len6_a6_catalyzes_a_constant_food",
     "polymer_a_len8_a8_catalyzes_a_constant_food",
-    "polymer_a_len9_a9_catalyzes_a_constant_food",
+    # "polymer_a_len9_a9_catalyzes_a_constant_food",
     "polymer_a_len10_a10_catalyzes_a_constant_food",
+    "polymer_a_len12_a12_catalyzes_a_constant_food",
 )
 
 
