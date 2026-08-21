@@ -23,6 +23,7 @@ from polymer_sim import (  # noqa: E402
     ExperimentRunner,
     ReactionNetworkData,
     SSAStepper,
+    StepResult,
     TrajectoryRecorder,
     build_reaction_rule_tables,
     clear_all_catalysis,
@@ -53,12 +54,14 @@ CATALYTIC_GAMMA = 10.0
 
 # Stop conditions for every single run.  "Memory exploded" is handled by
 # catching MemoryError and preserving the per-run summary written so far.
+# SSA has no simulation-clock limit; BASE_T_END is only the blended fallback
+# if all SSA runs fail to produce a finite final simulation time.
 BASE_T_END = 10_000.0
 MAX_STEPS = 100_000_000
 MAX_RUNTIME_SECONDS = 3_600.0
 
-# Run counts.  SSA is run first for each network.  The median SSA final
-# simulation time then becomes the t_end for all blended runs on that network.
+# Run counts.  SSA is run first for each network without a t_end limit.  The
+# median SSA final simulation time then becomes the t_end for all blended runs.
 SSA_RUNS_PER_NETWORK = 100
 BLENDED_RUNS_PER_PARAMETER = 30
 
@@ -121,6 +124,49 @@ class BlendedParameterCase:
             f"blended_p{int(self.index):03d}"
             f"_i1_{_float_label(self.i1)}"
             f"_i2_{_float_label(self.i2)}"
+        )
+
+
+class InfiniteHorizonSSAStepper(SSAStepper):
+    """SSA stepper variant for calibration runs with no simulation t_end.
+
+    The base SSAStepper advances by dt when no channel is active.  With
+    dt=inf, that would turn an inactive finite-time run into final_time=inf.
+    Here inactivity returns zero advancement so ExperimentRunner stops with
+    no_progress at the last finite simulation time.
+    """
+
+    def step(self, state, dt: float, context) -> StepResult:
+        if np.isfinite(float(dt)):
+            return super().step(state, dt, context)
+
+        network = context.network
+        propensities = self._get_propensities(network, state)
+        total = float(np.sum(propensities))
+        if total <= 0.0:
+            state.step_count += 1
+            return StepResult(advanced_time=0.0, event_occurred=False, propensity_sum=0.0)
+
+        rng = context.rng
+        tau = float(rng.exponential(1.0 / total))
+        threshold = float(rng.random() * total)
+        cumulative = np.cumsum(propensities)
+        chosen = int(np.searchsorted(cumulative, threshold))
+        if chosen >= int(network.n_channels):
+            chosen = int(network.n_channels - 1)
+
+        changed_species = network.get_channel_changed_species(chosen)
+        network.apply_channel_update(state, chosen)
+        state.t += tau
+        state.step_count += 1
+        state.event_count += 1
+        self._update_cached_propensities(network, state, changed_species)
+        return StepResult(
+            advanced_time=tau,
+            event_occurred=True,
+            channel_id=chosen,
+            propensity_sum=total,
+            tau=tau,
         )
 
 
@@ -333,7 +379,7 @@ def run_ssa_batch(
                 "method": "ssa",
                 "run_index": int(run_index),
                 "seed": next_seed(seed_rng),
-                "t_end": float(BASE_T_END),
+                "t_end": None,
                 "output_dir": output_dir,
                 "parameter_case": None,
             }
@@ -411,7 +457,7 @@ def run_single_task(task: dict[str, Any]) -> dict[str, Any]:
         method=str(task["method"]),
         run_index=int(task["run_index"]),
         seed=int(task["seed"]),
-        t_end=float(task["t_end"]),
+        t_end=runner_t_end(task.get("t_end")),
         output_dir=Path(task["output_dir"]),
         parameter_case=parameter_case,
     )
@@ -473,7 +519,7 @@ def run_single(
             "method": method,
             "run_index": int(run_index),
             "seed": int(seed),
-            "requested_t_end": float(t_end),
+            "requested_t_end": json_float_or_none(t_end),
             "simulation_final_time": float(summary.final_time),
             "wall_runtime_seconds": float(wall_runtime),
             "n_steps": int(summary.n_steps),
@@ -496,7 +542,7 @@ def run_single(
                     "method": method,
                     "run_index": int(run_index),
                     "seed": int(seed),
-                    "requested_t_end": float(t_end),
+                    "requested_t_end": json_float_or_none(t_end),
                     "max_steps": int(MAX_STEPS),
                     "max_runtime_seconds": float(MAX_RUNTIME_SECONDS),
                     "wall_runtime_seconds": float(wall_runtime),
@@ -521,7 +567,7 @@ def run_single(
             "method": method,
             "run_index": int(run_index),
             "seed": int(seed),
-            "requested_t_end": float(t_end),
+            "requested_t_end": json_float_or_none(t_end),
             "simulation_final_time": None,
             "wall_runtime_seconds": float(wall_runtime),
             "n_steps": None,
@@ -540,7 +586,7 @@ def run_single(
 
 def make_stepper(method: str, parameter_case: BlendedParameterCase | None):
     if method == "ssa":
-        return SSAStepper()
+        return InfiniteHorizonSSAStepper()
     if method == "blended":
         if parameter_case is None:
             raise ValueError("parameter_case is required for blended runs")
@@ -568,7 +614,20 @@ def median_final_time(records: list[dict[str, Any]], *, fallback: float) -> floa
     if not values:
         return float(fallback)
     median = float(np.median(np.asarray(values, dtype=float)))
-    return min(max(median, 0.0), float(BASE_T_END))
+    return max(median, 0.0)
+
+
+def runner_t_end(value: Any) -> float:
+    # None means "no simulation-clock limit"; max_steps/max_runtime_seconds
+    # remain active and determine when the SSA calibration run stops.
+    return float("inf") if value is None else float(value)
+
+
+def json_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    result = float(value)
+    return float(result) if np.isfinite(result) else None
 
 
 def network_error_record(network_case: NetworkCase, exc: Exception) -> dict[str, Any]:
@@ -605,7 +664,7 @@ def task_error_record(task: dict[str, Any], exc: Exception) -> dict[str, Any]:
         "method": str(task.get("method", "unknown")),
         "run_index": int(task.get("run_index", -1)),
         "seed": int(task.get("seed", 0)),
-        "requested_t_end": float(task.get("t_end", 0.0)),
+        "requested_t_end": json_float_or_none(task.get("t_end")),
         "simulation_final_time": None,
         "wall_runtime_seconds": None,
         "n_steps": None,
@@ -709,7 +768,10 @@ def next_seed(rng: np.random.Generator) -> int:
 def stop_condition_metadata() -> dict[str, Any]:
     return {
         "memory_error": "caught MemoryError and stopped the single run",
-        "t_end": float(BASE_T_END),
+        "ssa_t_end": None,
+        "ssa_t_end_note": "SSA calibration runs have no simulation-clock limit",
+        "blended_t_end": "median finite SSA simulation_final_time per network",
+        "blended_fallback_t_end": float(BASE_T_END),
         "max_steps": int(MAX_STEPS),
         "max_runtime_seconds": float(MAX_RUNTIME_SECONDS),
     }

@@ -6,6 +6,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import matplotlib
@@ -187,9 +188,11 @@ def distribution_comparison_rows(
     output: list[dict[str, Any]] = []
     moment_paths: list[Path] = []
     for network, network_rows in group_by(rows, lambda row: row.network).items():
+        network_started = perf_counter()
         groups = group_by(network_rows, lambda row: row.algorithm_label)
         ssa_rows = groups.get("ssa", [])
         if not ssa_rows:
+            print(f"[analysis] network={network} skipped: no SSA rows")
             continue
         common_t_end = median(
             [
@@ -199,13 +202,31 @@ def distribution_comparison_rows(
             ]
         )
         if common_t_end is None or common_t_end <= 0.0:
+            print(f"[analysis] network={network} skipped: invalid common_t_end={common_t_end}")
             continue
         time_points = np.linspace(0.0, float(common_t_end), int(n_time_points))
+        print(
+            f"[analysis] network={network} common_t_end={common_t_end:.6g} "
+            f"time_points={len(time_points)} labels={len(groups)}"
+        )
+
+        load_started = perf_counter()
         ssa_samples, species_names = load_group_samples(ssa_rows, time_points)
+        print(
+            f"[analysis] network={network} label=ssa "
+            f"load+sample={perf_counter() - load_started:.3f}s "
+            f"samples_shape={ssa_samples.shape}"
+        )
         if ssa_samples.size == 0:
+            print(f"[analysis] network={network} skipped: no usable SSA samples")
             continue
+        moment_started = perf_counter()
         ssa_first = np.nanmean(ssa_samples, axis=0)
         ssa_second = np.nanmean(np.square(ssa_samples), axis=0)
+        print(
+            f"[analysis] network={network} label=ssa "
+            f"moments={perf_counter() - moment_started:.3f}s"
+        )
 
         network_moment_path = out_dir / f"{safe_name(network)}_moments.npz"
         moment_payload: dict[str, np.ndarray] = {
@@ -218,20 +239,40 @@ def distribution_comparison_rows(
         for label, label_rows in groups.items():
             if label == "ssa":
                 continue
+            label_started = perf_counter()
+            load_started = perf_counter()
             samples, _ = load_group_samples(label_rows, time_points)
+            print(
+                f"[analysis] network={network} label={label} "
+                f"load+sample={perf_counter() - load_started:.3f}s "
+                f"samples_shape={samples.shape}"
+            )
             if samples.size == 0:
+                print(f"[analysis] network={network} label={label} skipped: no usable samples")
                 continue
+            moment_started = perf_counter()
             first = np.nanmean(samples, axis=0)
             second = np.nanmean(np.square(samples), axis=0)
             moment_payload[f"{safe_name(label)}_first_moment"] = first
             moment_payload[f"{safe_name(label)}_second_raw_moment"] = second
+            print(
+                f"[analysis] network={network} label={label} "
+                f"moments={perf_counter() - moment_started:.3f}s"
+            )
 
+            swd_started = perf_counter()
             swd_values = sliced_wasserstein_by_time(
                 ssa_samples,
                 samples,
                 n_projections=int(n_projections),
                 rng=rng,
             )
+            print(
+                f"[analysis] network={network} label={label} "
+                f"sliced_wasserstein={perf_counter() - swd_started:.3f}s "
+                f"projections={int(n_projections)}"
+            )
+            row_started = perf_counter()
             first_l2 = vector_l2_by_time(first - ssa_first)
             second_l2 = vector_l2_by_time(second - ssa_second)
             first_mean_abs = vector_mean_abs_by_time(first - ssa_first)
@@ -253,9 +294,20 @@ def distribution_comparison_rows(
                         "sliced_wasserstein_distance": float(swd_values[index]),
                     }
                 )
+            print(
+                f"[analysis] network={network} label={label} "
+                f"row_build={perf_counter() - row_started:.3f}s "
+                f"total_label={perf_counter() - label_started:.3f}s"
+            )
 
+        save_started = perf_counter()
         np.savez_compressed(network_moment_path, **moment_payload)
+        print(
+            f"[analysis] network={network} moment_save={perf_counter() - save_started:.3f}s "
+            f"path={network_moment_path}"
+        )
         moment_paths.append(network_moment_path)
+        print(f"[analysis] network={network} total={perf_counter() - network_started:.3f}s")
     return output, moment_paths
 
 
