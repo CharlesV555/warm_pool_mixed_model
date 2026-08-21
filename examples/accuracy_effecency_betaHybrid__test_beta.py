@@ -27,7 +27,13 @@ RUN_NAME = "accuracy_effecency_betaHybrid__test_beta"
 # network, the median finite final time is computed for each blended parameter
 # case. The maximum of those medians is then used as the network-level SSA
 # t_end. SSA has its own wall-time limit.
-SSA_MAX_RUNTIME_SECONDS = 3_600.0
+BLENDED_MAX_STEPS = base.MAX_STEPS
+BLENDED_MAX_WALL_TIME_SECONDS = base.MAX_RUNTIME_SECONDS
+
+SSA_T_END_RULE = "max_median_blended_final_time_per_network"
+SSA_MAX_STEPS = base.MAX_STEPS
+SSA_MAX_WALL_TIME_SECONDS = 3_600.0
+SSA_FALLBACK_T_END = base.BASE_T_END
 
 
 def run() -> dict[str, Any]:
@@ -102,13 +108,13 @@ def run() -> dict[str, Any]:
 
         ssa_t_end = max(
             (float(item["median_final_time"]) for item in network_blended_medians),
-            default=float(base.BASE_T_END),
+            default=float(SSA_FALLBACK_T_END),
         )
         write_json(
             network_dir / "blended_t_end_calibration.json",
             {
                 "network": network_case.name,
-                "ssa_t_end_rule": "max median blended simulation_final_time across parameter cases",
+                "ssa_t_end_rule": str(SSA_T_END_RULE),
                 "ssa_t_end": float(ssa_t_end),
                 "blended_parameter_medians": network_blended_medians,
             },
@@ -175,8 +181,8 @@ def run_blended_calibration_batch(
                 "t_end": None,
                 "output_dir": output_dir,
                 "parameter_case": parameter_case,
-                "max_steps": int(base.MAX_STEPS),
-                "max_runtime_seconds": float(base.MAX_RUNTIME_SECONDS),
+                "max_steps": int(BLENDED_MAX_STEPS),
+                "max_runtime_seconds": float(BLENDED_MAX_WALL_TIME_SECONDS),
             }
         )
     return run_tasks_parallel(tasks, output_dir)
@@ -202,8 +208,8 @@ def run_ssa_to_t_end_batch(
                 "t_end": float(t_end),
                 "output_dir": output_dir,
                 "parameter_case": None,
-                "max_steps": int(base.MAX_STEPS),
-                "max_runtime_seconds": float(SSA_MAX_RUNTIME_SECONDS),
+                "max_steps": int(SSA_MAX_STEPS),
+                "max_runtime_seconds": float(SSA_MAX_WALL_TIME_SECONDS),
             }
         )
     return run_tasks_parallel(tasks, output_dir)
@@ -469,11 +475,13 @@ def stop_condition_metadata() -> dict[str, Any]:
         "memory_error": "caught MemoryError and stopped the single run",
         "blended_t_end": None,
         "blended_t_end_note": "blended calibration runs have no simulation-clock limit",
-        "ssa_t_end": "max median finite blended simulation_final_time per network across parameter cases",
-        "ssa_fallback_t_end": float(base.BASE_T_END),
-        "max_steps": int(base.MAX_STEPS),
-        "blended_max_runtime_seconds": float(base.MAX_RUNTIME_SECONDS),
-        "ssa_max_runtime_seconds": float(SSA_MAX_RUNTIME_SECONDS),
+        "blended_max_steps": int(BLENDED_MAX_STEPS),
+        "blended_max_wall_time_seconds": float(BLENDED_MAX_WALL_TIME_SECONDS),
+        "ssa_t_end_rule": str(SSA_T_END_RULE),
+        "ssa_t_end": "computed per network from blended calibration",
+        "ssa_fallback_t_end": float(SSA_FALLBACK_T_END),
+        "ssa_max_steps": int(SSA_MAX_STEPS),
+        "ssa_max_wall_time_seconds": float(SSA_MAX_WALL_TIME_SECONDS),
     }
 
 
@@ -516,9 +524,28 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def apply_environment_overrides() -> None:
-    global SSA_MAX_RUNTIME_SECONDS
+    global BLENDED_MAX_STEPS
+    global BLENDED_MAX_WALL_TIME_SECONDS
+    global SSA_MAX_STEPS
+    global SSA_MAX_WALL_TIME_SECONDS
+    global SSA_FALLBACK_T_END
     base.apply_environment_overrides()
-    SSA_MAX_RUNTIME_SECONDS = env_float("BETA_TEST_SSA_MAX_RUNTIME_SECONDS", SSA_MAX_RUNTIME_SECONDS)
+    BLENDED_MAX_STEPS = env_int("BETA_TEST_BLENDED_MAX_STEPS", base.MAX_STEPS)
+    BLENDED_MAX_WALL_TIME_SECONDS = env_float(
+        "BETA_TEST_BLENDED_MAX_WALL_TIME_SECONDS",
+        base.MAX_RUNTIME_SECONDS,
+    )
+    SSA_MAX_STEPS = env_int("BETA_TEST_SSA_MAX_STEPS", base.MAX_STEPS)
+    SSA_MAX_WALL_TIME_SECONDS = env_float(
+        "BETA_TEST_SSA_MAX_WALL_TIME_SECONDS",
+        env_float("BETA_TEST_SSA_MAX_RUNTIME_SECONDS", SSA_MAX_WALL_TIME_SECONDS),
+    )
+    SSA_FALLBACK_T_END = env_float("BETA_TEST_SSA_FALLBACK_T_END", base.BASE_T_END)
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(default) if value is None or not value.strip() else int(value)
 
 
 def env_float(name: str, default: float) -> float:
