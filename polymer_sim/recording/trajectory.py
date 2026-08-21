@@ -18,6 +18,26 @@ import numpy as np
 from polymer_sim.recording.base import BaseRecorder, BaseTrajectoryRecord, PathLike
 
 
+SIDECAR_FORMAT = "polymer_sim_trajectory_sidecar_v1"
+SIDECAR_TIMES_NAME = "times.npy"
+SIDECAR_STATES_NAME = "states.npy"
+SIDECAR_SPECIES_NAMES_NAME = "species_names.json"
+SIDECAR_METADATA_NAME = "metadata.json"
+
+
+def _as_float_array_preserve_mmap(value: np.ndarray) -> np.ndarray:
+    """Convert array-like values to floating arrays without materializing mmap arrays."""
+
+    if isinstance(value, np.memmap):
+        if np.issubdtype(value.dtype, np.floating):
+            return value
+        return np.asarray(value, dtype=float)
+    arr = np.asarray(value)
+    if np.issubdtype(arr.dtype, np.floating):
+        return arr
+    return arr.astype(float)
+
+
 @dataclass(slots=True)
 class DTStatistics:
     """Lightweight accepted-step interval statistics from a trajectory file."""
@@ -68,10 +88,10 @@ class TrajectoryRecord(BaseTrajectoryRecord):
     accepted_step_intervals: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        self.times = np.asarray(self.times, dtype=float)
-        self.states = np.asarray(self.states, dtype=float)
+        self.times = _as_float_array_preserve_mmap(self.times)
+        self.states = _as_float_array_preserve_mmap(self.states)
         if self.accepted_step_intervals is not None:
-            self.accepted_step_intervals = np.asarray(self.accepted_step_intervals, dtype=float)
+            self.accepted_step_intervals = _as_float_array_preserve_mmap(self.accepted_step_intervals)
             if self.accepted_step_intervals.ndim != 1:
                 raise ValueError("accepted_step_intervals must have shape (T - 1,)")
         if self.times.ndim != 1:
@@ -424,3 +444,222 @@ def trajectory_final_time(path: PathLike) -> float:
         if times.size == 0:
             raise ValueError("trajectory contains no time points")
         return float(times[-1])
+
+
+# ---------------------------------------------------------------------------
+# mmap sidecar trajectory I/O.
+#
+# These definitions intentionally appear after the legacy functions above so
+# they preserve the public names while adding the new storage path without
+# changing call sites.  Existing ``.npz`` files remain readable; newly saved
+# records write both the legacy ``.npz`` and a same-name sidecar directory.
+# ---------------------------------------------------------------------------
+
+
+def trajectory_sidecar_dir(path: PathLike) -> Path:
+    """Return the default sidecar directory for a trajectory path.
+
+    ``run_001.npz`` maps to ``run_001/``. Passing an existing directory returns
+    it unchanged, which lets offline tools accept either path style.
+    """
+
+    path_obj = Path(path)
+    if path_obj.is_dir():
+        return path_obj
+    if path_obj.suffix:
+        return path_obj.with_suffix("")
+    return path_obj
+
+
+def has_trajectory_sidecar(path: PathLike) -> bool:
+    """Return True when the mmap-friendly sidecar trajectory exists."""
+
+    sidecar = trajectory_sidecar_dir(path)
+    return (
+        sidecar.is_dir()
+        and (sidecar / SIDECAR_TIMES_NAME).exists()
+        and (sidecar / SIDECAR_STATES_NAME).exists()
+        and (sidecar / SIDECAR_SPECIES_NAMES_NAME).exists()
+        and (sidecar / SIDECAR_METADATA_NAME).exists()
+    )
+
+
+def save_trajectory_sidecar(path: PathLike, record: TrajectoryRecord) -> Path:
+    """Write the mmap-friendly sidecar representation and return its directory."""
+
+    sidecar = trajectory_sidecar_dir(path)
+    sidecar.mkdir(parents=True, exist_ok=True)
+    np.save(sidecar / SIDECAR_TIMES_NAME, np.asarray(record.times, dtype=float))
+    np.save(sidecar / SIDECAR_STATES_NAME, np.asarray(record.states, dtype=float))
+    (sidecar / SIDECAR_SPECIES_NAMES_NAME).write_text(
+        json.dumps(list(record.species_names), ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    metadata_payload = {
+        "format": SIDECAR_FORMAT,
+        "run_metadata": record.run_metadata,
+        "times_shape": list(np.asarray(record.times).shape),
+        "states_shape": list(np.asarray(record.states).shape),
+        "accepted_step_intervals_source": "times_diff",
+    }
+    (sidecar / SIDECAR_METADATA_NAME).write_text(
+        json.dumps(metadata_payload, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    return sidecar
+
+
+def save_trajectory_record(path: PathLike, record: TrajectoryRecord, *, write_sidecar: bool = True) -> None:
+    """Save one complete trajectory.
+
+    The legacy compressed ``.npz`` file is still written for compatibility.
+    By default, a same-name sidecar directory is also written:
+    ``times.npy``, ``states.npy``, ``species_names.json`` and ``metadata.json``.
+    The sidecar arrays are uncompressed ``.npy`` files so readers can use mmap
+    and sample a few rows without loading the full state matrix.
+    """
+
+    path_obj = Path(path)
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path_obj,
+        times=record.times,
+        states=record.states,
+        accepted_step_intervals=(
+            np.asarray(record.accepted_step_intervals, dtype=float)
+            if record.accepted_step_intervals is not None
+            else np.diff(np.asarray(record.times, dtype=float))
+        ),
+        species_names=np.asarray(record.species_names, dtype=object),
+        run_metadata_json=json.dumps(record.run_metadata, ensure_ascii=True),
+    )
+    if write_sidecar:
+        save_trajectory_sidecar(path_obj, record)
+
+
+def load_trajectory_arrays(
+    path: PathLike,
+    *,
+    mmap: bool | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, Any]]:
+    """Load trajectory arrays and metadata.
+
+    If a sidecar exists, ``mmap=None`` and ``mmap=True`` load ``times.npy`` and
+    ``states.npy`` with ``mmap_mode='r'``. ``mmap=False`` forces eager loading.
+    If no sidecar exists, this falls back to the legacy compressed ``.npz``.
+    """
+
+    path_obj = Path(path)
+    prefer_sidecar = mmap is not False
+    if path_obj.is_dir() or (prefer_sidecar and has_trajectory_sidecar(path_obj)):
+        sidecar = trajectory_sidecar_dir(path_obj)
+        mmap_mode = "r" if mmap is not False else None
+        times = np.load(sidecar / SIDECAR_TIMES_NAME, mmap_mode=mmap_mode, allow_pickle=False)
+        states = np.load(sidecar / SIDECAR_STATES_NAME, mmap_mode=mmap_mode, allow_pickle=False)
+        species_names = json.loads((sidecar / SIDECAR_SPECIES_NAMES_NAME).read_text(encoding="utf-8"))
+        metadata_payload = json.loads((sidecar / SIDECAR_METADATA_NAME).read_text(encoding="utf-8"))
+        metadata = metadata_payload.get("run_metadata", metadata_payload)
+        return times, states, [str(name) for name in species_names], dict(metadata)
+
+    with np.load(path_obj, allow_pickle=True) as data:
+        metadata = json.loads(str(data["run_metadata_json"]))
+        return (
+            np.asarray(data["times"], dtype=float),
+            np.asarray(data["states"], dtype=float),
+            [str(name) for name in data["species_names"].tolist()],
+            metadata,
+        )
+
+
+def load_trajectory_record(path: PathLike, *, mmap: bool | None = None) -> TrajectoryRecord:
+    """Load one complete trajectory from sidecar/mmap or legacy npz."""
+
+    path_obj = Path(path)
+    if path_obj.is_dir() or (mmap is not False and has_trajectory_sidecar(path_obj)):
+        times, states, species_names, metadata = load_trajectory_arrays(path_obj, mmap=mmap)
+        return TrajectoryRecord(
+            times=times,
+            states=states,
+            species_names=species_names,
+            run_metadata=metadata,
+            accepted_step_intervals=np.diff(np.asarray(times, dtype=float)),
+        )
+
+    with np.load(path_obj, allow_pickle=True) as data:
+        metadata = json.loads(str(data["run_metadata_json"]))
+        times = np.asarray(data["times"], dtype=float)
+        return TrajectoryRecord(
+            times=times,
+            states=np.asarray(data["states"], dtype=float),
+            species_names=[str(name) for name in data["species_names"].tolist()],
+            run_metadata=metadata,
+            accepted_step_intervals=(
+                np.asarray(data["accepted_step_intervals"], dtype=float)
+                if "accepted_step_intervals" in data.files
+                else np.diff(times)
+            ),
+        )
+
+
+def _load_accepted_step_intervals(path: PathLike) -> np.ndarray:
+    """Load accepted-step intervals without materializing the full state matrix."""
+
+    if Path(path).is_dir() or has_trajectory_sidecar(path):
+        times = np.load(trajectory_sidecar_dir(path) / SIDECAR_TIMES_NAME, mmap_mode="r", allow_pickle=False)
+        intervals = np.diff(np.asarray(times, dtype=float))
+    else:
+        with np.load(Path(path), allow_pickle=False) as data:
+            if "accepted_step_intervals" in data.files:
+                intervals = np.asarray(data["accepted_step_intervals"], dtype=float)
+            else:
+                intervals = np.diff(np.asarray(data["times"], dtype=float))
+    if intervals.ndim != 1:
+        raise ValueError("accepted_step_intervals must have shape (T - 1,)")
+    return intervals
+
+
+def trajectory_final_time(path: PathLike) -> float:
+    """Return the final simulation time without loading the full state matrix."""
+
+    if Path(path).is_dir() or has_trajectory_sidecar(path):
+        times = np.load(trajectory_sidecar_dir(path) / SIDECAR_TIMES_NAME, mmap_mode="r", allow_pickle=False)
+    else:
+        with np.load(Path(path), allow_pickle=False) as data:
+            times = np.asarray(data["times"], dtype=float)
+    if times.ndim != 1:
+        raise ValueError("trajectory times must have shape (T,)")
+    if times.size == 0:
+        raise ValueError("trajectory contains no time points")
+    return float(times[-1])
+
+
+def sample_trajectory_states_from_path(
+    path: PathLike,
+    time_points: np.ndarray,
+    *,
+    mmap: bool | None = None,
+) -> tuple[np.ndarray, list[str], dict[str, Any]]:
+    """Sample trajectory states at requested times without loading all states.
+
+    The returned state array has shape ``(len(time_points), n_species)``. With a
+    sidecar, only selected rows of ``states.npy`` are read from disk.
+    """
+
+    times, states, species_names, metadata = load_trajectory_arrays(path, mmap=mmap)
+    t = np.asarray(times, dtype=float)
+    points = np.asarray(time_points, dtype=float)
+    if t.ndim != 1 or states.ndim != 2 or states.shape[0] != t.shape[0]:
+        raise ValueError("invalid trajectory arrays")
+    result = np.full((points.size, states.shape[1]), np.nan, dtype=float)
+    if t.size:
+        indices = np.searchsorted(t, points, side="right") - 1
+        valid = (indices >= 0) & (points <= t[-1] + 1e-12)
+        if np.any(valid):
+            result[valid] = np.asarray(states[indices[valid]], dtype=float)
+    return result, species_names, {
+        "storage": "sidecar" if has_trajectory_sidecar(path) else "npz",
+        "mmap": bool(mmap is not False and has_trajectory_sidecar(path)),
+        "times_shape": tuple(t.shape),
+        "states_shape": tuple(states.shape),
+        "metadata": metadata,
+    }

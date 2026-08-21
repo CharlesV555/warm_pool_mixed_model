@@ -15,8 +15,12 @@ from polymer_sim import (
     TrajectoryRecorder,
     build_reaction_rule_tables,
     generate_fixed_species_space,
+    has_trajectory_sidecar,
+    load_trajectory_record,
+    sample_trajectory_states_from_path,
     save_trajectory_record,
     trajectory_dt_statistics,
+    trajectory_sidecar_dir,
 )
 
 
@@ -81,22 +85,68 @@ def test_trajectory_dt_statistics_reads_intervals_without_states():
     ExperimentRunner().run_one(network, SSAStepper(), t_end=0.5, seed=13, recorder=recorder)
     record = recorder.finalize()
     path = Path("tests") / "_trajectory_dt_statistics_tmp.npz"
+    sidecar = trajectory_sidecar_dir(path)
     plot_path = Path("tests") / "_trajectory_dt_statistics_tmp.png"
     path.unlink(missing_ok=True)
+    shutil.rmtree(sidecar, ignore_errors=True)
     plot_path.unlink(missing_ok=True)
 
-    save_trajectory_record(path, record)
-    stats = trajectory_dt_statistics(path, bins=5, plot_path=plot_path, x_log=True)
+    try:
+        save_trajectory_record(path, record)
+        stats = trajectory_dt_statistics(path, bins=5, plot_path=plot_path, x_log=True)
 
-    assert stats.count == record.times.size - 1
-    assert stats.histogram_counts.sum() == stats.count
-    assert np.all(stats.histogram_edges > 0.0)
-    assert stats.plot_path == str(plot_path)
-    assert plot_path.exists()
-    assert "accepted_step_intervals" in np.load(path, allow_pickle=False).files
+        assert stats.count == record.times.size - 1
+        assert stats.histogram_counts.sum() == stats.count
+        assert np.all(stats.histogram_edges > 0.0)
+        assert stats.plot_path == str(plot_path)
+        assert plot_path.exists()
+        assert "accepted_step_intervals" in np.load(path, allow_pickle=False).files
+    finally:
+        path.unlink(missing_ok=True)
+        shutil.rmtree(sidecar, ignore_errors=True)
+        plot_path.unlink(missing_ok=True)
 
+
+def test_trajectory_sidecar_mmap_and_sampling():
+    network = make_network()
+    recorder = TrajectoryRecorder()
+    ExperimentRunner().run_one(network, SSAStepper(), t_end=0.5, seed=14, recorder=recorder)
+    record = recorder.finalize()
+    path = Path("tests") / "_trajectory_sidecar_tmp.npz"
+    sidecar = trajectory_sidecar_dir(path)
+    shutil.rmtree(sidecar, ignore_errors=True)
     path.unlink(missing_ok=True)
-    plot_path.unlink(missing_ok=True)
+
+    try:
+        save_trajectory_record(path, record)
+
+        assert path.exists()
+        assert has_trajectory_sidecar(path)
+        assert (sidecar / "times.npy").exists()
+        assert (sidecar / "states.npy").exists()
+        assert (sidecar / "species_names.json").exists()
+        assert (sidecar / "metadata.json").exists()
+
+        mmap_record = load_trajectory_record(path)
+        assert isinstance(mmap_record.times, np.memmap)
+        assert isinstance(mmap_record.states, np.memmap)
+        assert np.allclose(mmap_record.states[-1], record.states[-1])
+
+        eager_record = load_trajectory_record(path, mmap=False)
+        assert not isinstance(eager_record.states, np.memmap)
+        assert np.allclose(eager_record.states[-1], record.states[-1])
+
+        sample_points = np.asarray([0.0, float(record.times[-1])], dtype=float)
+        sampled, species_names, info = sample_trajectory_states_from_path(path, sample_points, mmap=True)
+        assert info["storage"] == "sidecar"
+        assert info["mmap"] is True
+        assert species_names == record.species_names
+        assert sampled.shape == (2, network.n_species)
+        assert np.allclose(sampled[0], record.states[0])
+        assert np.allclose(sampled[-1], record.states[-1])
+    finally:
+        path.unlink(missing_ok=True)
+        shutil.rmtree(sidecar, ignore_errors=True)
 
 
 def test_hybrid_skeleton_runs():

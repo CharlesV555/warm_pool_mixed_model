@@ -18,7 +18,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from polymer_sim import load_trajectory_record  # noqa: E402
+from polymer_sim import has_trajectory_sidecar, sample_trajectory_states_from_path, trajectory_sidecar_dir  # noqa: E402
 
 
 RUN_METADATA_NAME = "run_metadata.json"
@@ -317,31 +317,31 @@ def load_group_samples(rows: list[RunRow], time_points: np.ndarray) -> tuple[np.
     for row in rows:
         if row.trajectory_path is None or not row.trajectory_path.exists():
             continue
-        file_size = row.trajectory_path.stat().st_size
+        file_size = trajectory_storage_size(row.trajectory_path)
         load_started = perf_counter()
         try:
-            record = load_trajectory_record(row.trajectory_path)
+            sampled, loaded_species_names, load_info = sample_trajectory_states_from_path(
+                row.trajectory_path,
+                time_points,
+                mmap=True,
+            )
         except Exception as exc:
             print(f"[analysis] skip trajectory load error: {row.trajectory_path} {exc!r}")
             continue
         load_elapsed = perf_counter() - load_started
-        times_shape = tuple(np.asarray(record.times).shape)
-        states_shape = tuple(np.asarray(record.states).shape)
         if not species_names:
-            species_names = list(record.species_names)
-        elif list(record.species_names) != species_names:
+            species_names = list(loaded_species_names)
+        elif list(loaded_species_names) != species_names:
             print(f"[analysis] skip species mismatch: {row.trajectory_path}")
             continue
-        sample_started = perf_counter()
-        sampled = sample_trajectory_states(record.times, record.states, time_points)
-        sample_elapsed = perf_counter() - sample_started
         samples.append(sampled)
         print(
             f"[analysis] trajectory method={row.method} label={row.algorithm_label} "
             f"run={row.raw.get('run_index')} file={row.trajectory_path.name} "
-            f"size={format_bytes(file_size)} load={load_elapsed:.3f}s "
-            f"times_shape={times_shape} states_shape={states_shape} "
-            f"sample={sample_elapsed:.3f}s sampled_shape={sampled.shape}"
+            f"storage={load_info['storage']} mmap={load_info['mmap']} "
+            f"size={format_bytes(file_size)} load+sample={load_elapsed:.3f}s "
+            f"times_shape={load_info['times_shape']} states_shape={load_info['states_shape']} "
+            f"sampled_shape={sampled.shape}"
         )
     if not samples:
         return np.empty((0, len(time_points), 0), dtype=float), species_names
@@ -364,9 +364,16 @@ def format_bytes(size: int) -> str:
     return f"{value:.2f}GiB"
 
 
+def trajectory_storage_size(path: Path) -> int:
+    if has_trajectory_sidecar(path):
+        sidecar = trajectory_sidecar_dir(path)
+        return sum(item.stat().st_size for item in sidecar.iterdir() if item.is_file())
+    return path.stat().st_size
+
+
 def sample_trajectory_states(times: np.ndarray, states: np.ndarray, time_points: np.ndarray) -> np.ndarray:
     t = np.asarray(times, dtype=float)
-    x = np.asarray(states, dtype=float)
+    x = states if isinstance(states, np.memmap) else np.asarray(states, dtype=float)
     points = np.asarray(time_points, dtype=float)
     if t.ndim != 1 or x.ndim != 2 or x.shape[0] != t.shape[0]:
         raise ValueError("invalid trajectory arrays")
