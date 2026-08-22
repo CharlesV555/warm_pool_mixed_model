@@ -18,7 +18,12 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from polymer_sim import has_trajectory_sidecar, sample_trajectory_states_from_path, trajectory_sidecar_dir  # noqa: E402
+from polymer_sim import (  # noqa: E402
+    has_trajectory_sidecar,
+    sample_trajectory_states_from_path,
+    trajectory_sidecar_dir,
+    trajectory_storage_exists,
+)
 
 
 RUN_METADATA_NAME = "run_metadata.json"
@@ -315,7 +320,7 @@ def load_group_samples(rows: list[RunRow], time_points: np.ndarray) -> tuple[np.
     samples = []
     species_names: list[str] = []
     for row in rows:
-        if row.trajectory_path is None or not row.trajectory_path.exists():
+        if row.trajectory_path is None or not trajectory_storage_exists(row.trajectory_path):
             continue
         file_size = trajectory_storage_size(row.trajectory_path)
         load_started = perf_counter()
@@ -368,7 +373,7 @@ def trajectory_storage_size(path: Path) -> int:
     if has_trajectory_sidecar(path):
         sidecar = trajectory_sidecar_dir(path)
         return sum(item.stat().st_size for item in sidecar.iterdir() if item.is_file())
-    return path.stat().st_size
+    return path.stat().st_size if path.exists() else 0
 
 
 def sample_trajectory_states(times: np.ndarray, states: np.ndarray, time_points: np.ndarray) -> np.ndarray:

@@ -21,6 +21,7 @@ from polymer_sim import (
     save_trajectory_record,
     trajectory_dt_statistics,
     trajectory_sidecar_dir,
+    trajectory_storage_exists,
 )
 
 
@@ -100,7 +101,8 @@ def test_trajectory_dt_statistics_reads_intervals_without_states():
         assert np.all(stats.histogram_edges > 0.0)
         assert stats.plot_path == str(plot_path)
         assert plot_path.exists()
-        assert "accepted_step_intervals" in np.load(path, allow_pickle=False).files
+        assert not path.exists()
+        assert trajectory_storage_exists(path)
     finally:
         path.unlink(missing_ok=True)
         shutil.rmtree(sidecar, ignore_errors=True)
@@ -120,7 +122,8 @@ def test_trajectory_sidecar_mmap_and_sampling():
     try:
         save_trajectory_record(path, record)
 
-        assert path.exists()
+        assert not path.exists()
+        assert trajectory_storage_exists(path)
         assert has_trajectory_sidecar(path)
         assert (sidecar / "times.npy").exists()
         assert (sidecar / "states.npy").exists()
@@ -144,6 +147,30 @@ def test_trajectory_sidecar_mmap_and_sampling():
         assert sampled.shape == (2, network.n_species)
         assert np.allclose(sampled[0], record.states[0])
         assert np.allclose(sampled[-1], record.states[-1])
+    finally:
+        path.unlink(missing_ok=True)
+        shutil.rmtree(sidecar, ignore_errors=True)
+
+
+def test_trajectory_npz_fallback_when_sidecar_is_absent():
+    network = make_network()
+    recorder = TrajectoryRecorder()
+    ExperimentRunner().run_one(network, SSAStepper(), t_end=0.5, seed=15, recorder=recorder)
+    record = recorder.finalize()
+    path = Path("tests") / "_trajectory_npz_fallback_tmp.npz"
+    sidecar = trajectory_sidecar_dir(path)
+    shutil.rmtree(sidecar, ignore_errors=True)
+    path.unlink(missing_ok=True)
+
+    try:
+        save_trajectory_record(path, record, write_sidecar=False, write_npz=True)
+
+        assert path.exists()
+        assert not has_trajectory_sidecar(path)
+        loaded = load_trajectory_record(path)
+        assert not isinstance(loaded.states, np.memmap)
+        assert np.allclose(loaded.states[-1], record.states[-1])
+        assert "accepted_step_intervals" in np.load(path, allow_pickle=False).files
     finally:
         path.unlink(missing_ok=True)
         shutil.rmtree(sidecar, ignore_errors=True)

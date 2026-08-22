@@ -277,6 +277,97 @@ class TrajectoryRecorder(BaseRecorder):
         )
 
 
+class WindowedTrajectoryRecorder(BaseRecorder):
+    """Record states only when the simulation time is inside configured windows.
+
+    The saved object is still a normal ``TrajectoryRecord`` so offline analysis
+    can read it through ``load_trajectory_record``.  This recorder is intended
+    for batch accuracy tests where full step-by-step trajectories are too large
+    but states near selected sampling times are enough.
+    """
+
+    def __init__(self, *, windows: np.ndarray, include_initial_state: bool = True):
+        arr = np.asarray(windows, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            raise ValueError("windows must have shape (n_windows, 2)")
+        if np.any(~np.isfinite(arr)):
+            raise ValueError("windows must be finite")
+        starts = np.minimum(arr[:, 0], arr[:, 1])
+        ends = np.maximum(arr[:, 0], arr[:, 1])
+        self.windows = np.column_stack([starts, ends])
+        self.include_initial_state = bool(include_initial_state)
+        self._species_names: list[str] = []
+        self._times: list[float] = []
+        self._states: list[np.ndarray] = []
+        self._metadata: dict = {}
+        self._accepted_step_intervals: list[float] = []
+        self._last_time: float = 0.0
+        self._n_steps: int = 0
+        self._n_events: int = 0
+        self._recorded_window_indices: list[int] = []
+
+    def initialize(self, species_names: list[str], initial_state: np.ndarray, metadata: dict | None = None) -> None:
+        self._species_names = list(species_names)
+        self._metadata = dict(metadata or {})
+        self._metadata["recording_mode"] = "windowed_trajectory"
+        self._metadata["sampling_windows"] = self.windows.tolist()
+        self._times = []
+        self._states = []
+        self._accepted_step_intervals = []
+        self._last_time = 0.0
+        self._n_steps = 0
+        self._n_events = 0
+        self._recorded_window_indices = []
+        if self.include_initial_state and self._window_indices_for_time(0.0).size:
+            self._append_record(0.0, initial_state, self._window_indices_for_time(0.0))
+
+    def record_step(
+        self,
+        *,
+        time: float,
+        state: np.ndarray,
+        step_count: int,
+        event_count: int,
+        event_time: float | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        current_time = float(time)
+        self._accepted_step_intervals.append(float(max(current_time - self._last_time, 0.0)))
+        self._last_time = current_time
+        self._n_steps = int(step_count)
+        self._n_events = int(event_count)
+        indices = self._window_indices_for_time(current_time)
+        if indices.size:
+            self._append_record(current_time, state, indices)
+
+    def finalize(self) -> TrajectoryRecord:
+        self._metadata["n_steps"] = int(self._n_steps)
+        self._metadata["n_events"] = int(self._n_events)
+        self._metadata["recorded_window_indices"] = list(self._recorded_window_indices)
+        if self._states:
+            states = np.vstack(self._states)
+            times = np.asarray(self._times, dtype=float)
+        else:
+            states = np.empty((0, len(self._species_names)), dtype=float)
+            times = np.empty(0, dtype=float)
+        return TrajectoryRecord(
+            times=times,
+            states=states,
+            species_names=list(self._species_names),
+            run_metadata=dict(self._metadata),
+            accepted_step_intervals=np.asarray(self._accepted_step_intervals, dtype=float),
+        )
+
+    def _append_record(self, time: float, state: np.ndarray, indices: np.ndarray) -> None:
+        self._times.append(float(time))
+        self._states.append(np.asarray(state, dtype=float).copy())
+        self._recorded_window_indices.append(int(indices[0]))
+
+    def _window_indices_for_time(self, time: float) -> np.ndarray:
+        value = float(time)
+        return np.flatnonzero((self.windows[:, 0] <= value) & (value <= self.windows[:, 1]))
+
+
 def save_trajectory_record(path: PathLike, record: TrajectoryRecord) -> None:
     """保存单次完整轨迹记录到压缩 npz 文件。"""
 
@@ -452,7 +543,8 @@ def trajectory_final_time(path: PathLike) -> float:
 # These definitions intentionally appear after the legacy functions above so
 # they preserve the public names while adding the new storage path without
 # changing call sites.  Existing ``.npz`` files remain readable; newly saved
-# records write both the legacy ``.npz`` and a same-name sidecar directory.
+# records write the same-name sidecar directory by default and only write the
+# legacy ``.npz`` when explicitly requested.
 # ---------------------------------------------------------------------------
 
 
@@ -484,6 +576,12 @@ def has_trajectory_sidecar(path: PathLike) -> bool:
     )
 
 
+def trajectory_storage_exists(path: PathLike) -> bool:
+    """Return True if either sidecar storage or a legacy npz file exists."""
+
+    return has_trajectory_sidecar(path) or Path(path).exists()
+
+
 def save_trajectory_sidecar(path: PathLike, record: TrajectoryRecord) -> Path:
     """Write the mmap-friendly sidecar representation and return its directory."""
 
@@ -509,32 +607,41 @@ def save_trajectory_sidecar(path: PathLike, record: TrajectoryRecord) -> Path:
     return sidecar
 
 
-def save_trajectory_record(path: PathLike, record: TrajectoryRecord, *, write_sidecar: bool = True) -> None:
+def save_trajectory_record(
+    path: PathLike,
+    record: TrajectoryRecord,
+    *,
+    write_sidecar: bool = True,
+    write_npz: bool = False,
+) -> None:
     """Save one complete trajectory.
 
-    The legacy compressed ``.npz`` file is still written for compatibility.
-    By default, a same-name sidecar directory is also written:
+    By default this writes only the mmap-friendly sidecar directory:
     ``times.npy``, ``states.npy``, ``species_names.json`` and ``metadata.json``.
-    The sidecar arrays are uncompressed ``.npy`` files so readers can use mmap
-    and sample a few rows without loading the full state matrix.
+    The legacy compressed ``.npz`` file can still be written by passing
+    ``write_npz=True``. Readers check sidecar storage first and only fall back
+    to ``.npz`` when the sidecar is absent.
     """
 
+    if not write_sidecar and not write_npz:
+        raise ValueError("at least one of write_sidecar or write_npz must be True")
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        path_obj,
-        times=record.times,
-        states=record.states,
-        accepted_step_intervals=(
-            np.asarray(record.accepted_step_intervals, dtype=float)
-            if record.accepted_step_intervals is not None
-            else np.diff(np.asarray(record.times, dtype=float))
-        ),
-        species_names=np.asarray(record.species_names, dtype=object),
-        run_metadata_json=json.dumps(record.run_metadata, ensure_ascii=True),
-    )
     if write_sidecar:
         save_trajectory_sidecar(path_obj, record)
+    if write_npz:
+        np.savez_compressed(
+            path_obj,
+            times=record.times,
+            states=record.states,
+            accepted_step_intervals=(
+                np.asarray(record.accepted_step_intervals, dtype=float)
+                if record.accepted_step_intervals is not None
+                else np.diff(np.asarray(record.times, dtype=float))
+            ),
+            species_names=np.asarray(record.species_names, dtype=object),
+            run_metadata_json=json.dumps(record.run_metadata, ensure_ascii=True),
+        )
 
 
 def load_trajectory_arrays(
@@ -550,8 +657,7 @@ def load_trajectory_arrays(
     """
 
     path_obj = Path(path)
-    prefer_sidecar = mmap is not False
-    if path_obj.is_dir() or (prefer_sidecar and has_trajectory_sidecar(path_obj)):
+    if path_obj.is_dir() or has_trajectory_sidecar(path_obj):
         sidecar = trajectory_sidecar_dir(path_obj)
         mmap_mode = "r" if mmap is not False else None
         times = np.load(sidecar / SIDECAR_TIMES_NAME, mmap_mode=mmap_mode, allow_pickle=False)
@@ -575,7 +681,7 @@ def load_trajectory_record(path: PathLike, *, mmap: bool | None = None) -> Traje
     """Load one complete trajectory from sidecar/mmap or legacy npz."""
 
     path_obj = Path(path)
-    if path_obj.is_dir() or (mmap is not False and has_trajectory_sidecar(path_obj)):
+    if path_obj.is_dir() or has_trajectory_sidecar(path_obj):
         times, states, species_names, metadata = load_trajectory_arrays(path_obj, mmap=mmap)
         return TrajectoryRecord(
             times=times,

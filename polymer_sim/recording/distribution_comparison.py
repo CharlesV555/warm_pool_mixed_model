@@ -18,10 +18,9 @@ Expected batch data structures
        ]
    }
 
-2. A folder containing trajectory ``.npz`` files written by
-   ``save_trajectory_record(...)`` in ``polymer_sim.recording.trajectory``.
-   Each file contains ``times``, ``states``, ``species_names``, and
-   ``run_metadata_json``.
+2. A folder containing trajectory sidecar directories or legacy ``.npz`` files
+   written by ``save_trajectory_record(...)`` in
+   ``polymer_sim.recording.trajectory``.
 
 If future batch metadata adds new fields, change the metadata readers in
 ``_metadata_rows(...)``, ``_trajectory_path_from_row(...)``, and
@@ -52,6 +51,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from polymer_sim.recording.base import PathLike
+from polymer_sim.recording.trajectory import (
+    has_trajectory_sidecar,
+    load_trajectory_arrays,
+    trajectory_storage_exists,
+)
 
 
 @dataclass(slots=True)
@@ -239,7 +243,7 @@ def resolve_batch_trajectory_items(
                 if trajectory_path is None:
                     continue
                 group = _group_from_row(row, group_key)
-                if group is None and trajectory_path.exists():
+                if group is None and trajectory_storage_exists(trajectory_path):
                     group = _group_from_trajectory_metadata(trajectory_path, group_key)
                 group = "unknown" if group is None else str(group).lower()
                 if wanted is not None and group not in wanted:
@@ -255,7 +259,7 @@ def resolve_batch_trajectory_items(
                 )
             continue
 
-        if source.suffix.lower() != ".npz":
+        if not trajectory_storage_exists(source):
             continue
         group = _group_from_trajectory_metadata(source, group_key) or "unknown"
         group = str(group).lower()
@@ -307,17 +311,15 @@ def extract_species_time_samples(
     manifest_rows = []
 
     for item in items:
-        with np.load(item.trajectory_path, allow_pickle=True) as data:
-            times = np.asarray(data["times"], dtype=float)
-            states = np.asarray(data["states"], dtype=float)
-            values = _sample_species_values(
-                times,
-                states,
-                points,
-                species_ids_list,
-                outside=outside,
-            )
-            loaded_mb = _nbytes_mb(times, states)
+        times, states, _trajectory_species_names, _metadata = load_trajectory_arrays(item.trajectory_path, mmap=True)
+        values = _sample_species_values(
+            np.asarray(times, dtype=float),
+            states,
+            points,
+            species_ids_list,
+            outside=outside,
+        )
+        loaded_mb = _nbytes_mb(times, values)
 
         sample_path = output_dir / _sample_filename(item)
         np.savez_compressed(
@@ -631,9 +633,14 @@ def _source_to_paths(
 ) -> list[Path]:
     if isinstance(batch_source, (str, Path)):
         path = Path(batch_source)
+        if has_trajectory_sidecar(path):
+            return [path]
         if path.is_dir():
             iterator = path.rglob(pattern) if recursive else path.glob(pattern)
-            return sorted(item for item in iterator if item.is_file())
+            files = [item for item in iterator if item.is_file()]
+            sidecar_iterator = path.rglob("*") if recursive else path.iterdir()
+            sidecars = [item for item in sidecar_iterator if item.is_dir() and has_trajectory_sidecar(item)]
+            return sorted([*files, *sidecars])
         return [path]
     return [Path(item) for item in batch_source]
 
@@ -706,10 +713,11 @@ def _label_from_row(row: dict, index: int) -> str:
 
 
 def _trajectory_metadata(path: Path) -> dict:
-    with np.load(path, allow_pickle=True) as data:
-        if "run_metadata_json" not in data:
-            return {}
-        return json.loads(str(data["run_metadata_json"]))
+    try:
+        _times, _states, _species_names, metadata = load_trajectory_arrays(path, mmap=True)
+    except Exception:
+        return {}
+    return dict(metadata)
 
 
 def _group_from_trajectory_metadata(path: Path, group_key: str) -> str | None:
@@ -719,8 +727,8 @@ def _group_from_trajectory_metadata(path: Path, group_key: str) -> str | None:
 
 
 def _trajectory_species_names(path: Path) -> list[str]:
-    with np.load(path, allow_pickle=True) as data:
-        return [str(name) for name in data["species_names"].tolist()]
+    _times, _states, species_names, _metadata = load_trajectory_arrays(path, mmap=True)
+    return list(species_names)
 
 
 def _resolve_species_selection(

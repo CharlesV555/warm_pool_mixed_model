@@ -113,6 +113,11 @@
   - `runner.py`：`ExperimentRunner.run_one(...)`，墙钟停止、restriction、recorder、timing report。
 - `polymer_sim/recording/`
   - trajectory、summary、timing、plot、distribution comparison、fast network report；
+  - trajectory 持久化当前决策：`save_trajectory_record(...)` 默认只写 sidecar 目录
+    `trajectory_name/{times.npy, states.npy, species_names.json, metadata.json}`；
+    不默认写 `.npz`。只有显式传 `write_npz=True` 才生成 legacy `.npz`。
+    读取/分析入口应先检查 sidecar，sidecar 不存在时再 fallback 到 `.npz`。
+    判断轨迹是否存在应使用 `trajectory_storage_exists(...)`，不要只用 `Path.exists()` 检查 `.npz` 路径。
   - 当前新增未跟踪 `cle_sparsity_sampler.py`，只做 CLE 稀疏性采样和画图，不改模拟状态。
 - `polymer_sim/analysis/`
   - RAF/maxRAF/irrRAF 静态分析。

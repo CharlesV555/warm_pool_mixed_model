@@ -39,6 +39,7 @@ from polymer_sim.recording.trajectory import (
     DTStatistics,
     TrajectoryRecord,
     TrajectoryRecorder,
+    WindowedTrajectoryRecorder,
     has_trajectory_sidecar,
     load_trajectory_arrays,
     load_trajectory_record,
@@ -48,6 +49,7 @@ from polymer_sim.recording.trajectory import (
     trajectory_dt_statistics,
     trajectory_final_time,
     trajectory_sidecar_dir,
+    trajectory_storage_exists,
 )
 
 __all__ = [
@@ -66,6 +68,7 @@ __all__ = [
     "TimingSummary",
     "TrajectoryRecord",
     "TrajectoryRecorder",
+    "WindowedTrajectoryRecorder",
     "format_stepper_info",
     "load_summary",
     "load_timing_summary",
@@ -94,4 +97,5 @@ __all__ = [
     "trajectory_dt_statistics",
     "trajectory_final_time",
     "trajectory_sidecar_dir",
+    "trajectory_storage_exists",
 ]

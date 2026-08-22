@@ -66,6 +66,7 @@ from polymer_sim.recording import (
     TimingSummary,
     TrajectoryRecord,
     TrajectoryRecorder,
+    WindowedTrajectoryRecorder,
     has_trajectory_sidecar,
     load_trajectory_arrays,
     load_summary,
@@ -94,6 +95,7 @@ from polymer_sim.recording import (
     save_trajectory_record,
     save_trajectory_sidecar,
     trajectory_sidecar_dir,
+    trajectory_storage_exists,
 )
 from polymer_sim.simulation.stepper import (
     BaseStepper,
@@ -186,6 +188,7 @@ __all__ = [
     "TimingSummary",
     "TrajectoryRecord",
     "TrajectoryRecorder",
+    "WindowedTrajectoryRecorder",
     "TrimerOutflowRestriction",
     "build_n3_wh_network",
     "build_n3_wh_reaction_index",
@@ -234,6 +237,7 @@ __all__ = [
     "has_trajectory_sidecar",
     "trajectory_final_time",
     "trajectory_sidecar_dir",
+    "trajectory_storage_exists",
     "ScalingPDMPConfig",
     "ScalingPDMPPartitionStrategy",
     "scale_all_catalytic_strengths",

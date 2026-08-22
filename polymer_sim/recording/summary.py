@@ -24,6 +24,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from polymer_sim.recording.base import BaseRecorder, BaseRunSummary, PathLike
+from polymer_sim.recording.trajectory import load_trajectory_arrays, trajectory_storage_exists
 
 
 @dataclass(slots=True)
@@ -682,9 +683,8 @@ def _time_points_array(time_points: Iterable[float]) -> np.ndarray:
 
 def _load_molecule_numbers(item: BatchRunItem, time_points: np.ndarray) -> np.ndarray:
     trajectory_path = _resolve_trajectory_path(item)
-    with np.load(trajectory_path, allow_pickle=True) as data:
-        times = np.asarray(data["times"], dtype=float)
-        states = np.asarray(data["states"], dtype=float)
+    times, states, _species_names, _metadata = load_trajectory_arrays(trajectory_path, mmap=True)
+    times = np.asarray(times, dtype=float)
     if times.ndim != 1 or states.ndim != 2 or states.shape[0] != times.shape[0]:
         raise ValueError(f"invalid trajectory shape in {trajectory_path}")
     if times.size == 0:
@@ -880,15 +880,15 @@ def _resolve_trajectory_path(item: BatchRunItem) -> Path:
         raise ValueError(f"{item.label()} does not contain trajectory_path; mol_num requires saved trajectories")
     path = Path(str(raw_path))
     if path.is_absolute():
-        if path.exists():
+        if trajectory_storage_exists(path):
             return path
         raise FileNotFoundError(path)
-    if path.exists():
+    if trajectory_storage_exists(path):
         return path
     if item.source_path is not None:
         for parent in [item.source_path.parent, *item.source_path.parents]:
             candidate = parent / path
-            if candidate.exists():
+            if trajectory_storage_exists(candidate):
                 return candidate
     raise FileNotFoundError(path)
 
