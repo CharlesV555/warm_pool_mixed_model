@@ -72,9 +72,9 @@ def analyze_batch_output(
     wall_sample_rows = wall_time_sample_rows(ok_rows, wall_rows)
     wall_sample_csv = out_dir / "wall_time_to_common_t_end_samples.csv"
     write_csv(wall_sample_csv, wall_sample_rows)
-    wall_plot = plot_wall_time_violins(
+    wall_plot = plot_wall_time_box_scatter(
         wall_sample_rows,
-        out_dir / "wall_time_to_common_t_end_violin.png",
+        out_dir / "wall_time_to_common_t_end_box_scatter.png",
     )
 
     distribution_rows, moment_npz_paths = distribution_comparison_rows(
@@ -540,7 +540,7 @@ def valid_sample_mask(values: np.ndarray) -> np.ndarray:
     return np.all(np.isfinite(arr), axis=1)
 
 
-def plot_wall_time_violins(rows: list[dict[str, Any]], output_path: Path) -> Path | None:
+def plot_wall_time_box_scatter(rows: list[dict[str, Any]], output_path: Path) -> Path | None:
     if not rows:
         return None
     networks = sorted({str(row["network"]) for row in rows})
@@ -576,28 +576,33 @@ def plot_wall_time_violins(rows: list[dict[str, Any]], output_path: Path) -> Pat
     fig_width = max(9.0, 1.7 * len(networks) + 0.5 * len(labels))
     fig, ax = plt.subplots(figsize=(fig_width, 5.5))
     if data:
-        parts = ax.violinplot(
+        box = ax.boxplot(
             data,
             positions=positions,
-            widths=label_width * 0.85,
-            showmeans=False,
-            showmedians=True,
-            showextrema=False,
+            widths=label_width * 0.72,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "#111111", "linewidth": 1.2},
+            whiskerprops={"color": "#555555", "linewidth": 0.9},
+            capprops={"color": "#555555", "linewidth": 0.9},
         )
-        for body, color in zip(parts["bodies"], colors):
-            body.set_facecolor(color)
-            body.set_edgecolor(color)
-            body.set_alpha(0.35)
-        if "cmedians" in parts:
-            parts["cmedians"].set_color("#222222")
-            parts["cmedians"].set_linewidth(1.0)
-        for pos, values, color in zip(positions, data, colors):
+        for patch, color in zip(box["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_edgecolor(color)
+            patch.set_alpha(0.24)
+        for index, (pos, values, color) in enumerate(zip(positions, data, colors)):
+            jitter_rng = np.random.default_rng(1000 + int(index))
+            jitter = jitter_rng.uniform(
+                -label_width * 0.18,
+                label_width * 0.18,
+                size=values.shape,
+            )
             ax.scatter(
-                np.full(values.shape, pos, dtype=float),
+                np.full(values.shape, pos, dtype=float) + jitter,
                 values,
-                s=12,
+                s=15,
                 color=color,
-                alpha=0.55,
+                alpha=0.62,
                 edgecolors="none",
                 zorder=3,
             )

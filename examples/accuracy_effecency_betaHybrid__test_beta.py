@@ -40,6 +40,7 @@ N_SAMPLE_TIME_POINTS = 100
 TARGET_EVENTS_PER_WINDOW = 100.0
 LOCAL_WINDOW_ESTIMATION_RUNS = 3
 MIN_SAMPLE_WINDOW_WIDTH = 1e-12
+NETWORK_PARALLEL_WORKERS: int | None = None
 
 
 def run() -> dict[str, Any]:
@@ -55,244 +56,48 @@ def run() -> dict[str, Any]:
     blended_cases = base.build_blended_parameter_cases()
 
     all_records: list[dict[str, Any]] = []
-    for network_case in network_cases:
-        network_dir = output_root / network_case.name
-        network_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            network, catalysis_metadata = base.build_network_case(network_case)
-        except Exception as exc:
-            record = base.network_error_record(network_case, exc)
-            all_records.append(record)
-            write_json(network_dir / "network_build_error.json", record)
-            write_json(output_root / "run_records.json", all_records)
-            print_single_record(record)
-            continue
-
-        write_json(
-            network_dir / "network_metadata.json",
-            {
-                "network_case": asdict(network_case),
-                "n_species": int(network.n_species),
-                "n_channels": int(network.n_channels),
-                "catalysis": catalysis_metadata,
-                "base_rates": base.base_rate_metadata(),
-            },
-        )
-
-        calibration_records: list[dict[str, Any]] = []
-        network_blended_medians: list[dict[str, Any]] = []
-        global_window_widths: dict[str, float] = {}
-        for parameter_case in blended_cases:
-            case_dir = network_dir / parameter_case.label
-
-            pre_dir = case_dir / "precompute_blended"
-            pre_records = run_blended_calibration_batch(
-                network_case=network_case,
-                parameter_case=parameter_case,
-                output_dir=pre_dir,
-                seed_rng=seed_rng,
-            )
-            annotate_records(
-                pre_records,
-                physical_network=network_case.name,
-                calibration_label=parameter_case.label,
-                calibration_role="blended_precompute",
-            )
-            calibration_records.extend(pre_records)
-            write_json(network_dir / "calibration_records.json", calibration_records)
-
-            blended_median_t_end = median_final_time_or_none(pre_records)
-            if blended_median_t_end is None:
-                blended_median_t_end = float(SSA_FALLBACK_T_END)
-            width = median_event_window_width(pre_records)
-            global_window_widths[parameter_case.label] = float(width)
-            network_blended_medians.append(
-                {
-                    "parameter_label": parameter_case.label,
-                    "median_final_time": float(blended_median_t_end),
-                    "global_window_width": float(width),
-                    "n_records": len(pre_records),
-                }
-            )
-            print(
-                f"[{RUN_NAME}] network={network_case.name} parameter={parameter_case.label} "
-                f"precompute_blended_median_final_time={blended_median_t_end:.6g} "
-                f"global_window_width={width:.6g}"
-            )
-
-        finite_blended_medians = [
-            float(item["median_final_time"])
-            for item in network_blended_medians
-            if np.isfinite(float(item["median_final_time"]))
-        ]
-        common_t_end = min(finite_blended_medians) if finite_blended_medians else float(SSA_FALLBACK_T_END)
-        sample_times = np.linspace(0.0, float(common_t_end), int(N_SAMPLE_TIME_POINTS))
-        ssa_t_end = float(common_t_end)
-        ssa_pre_dir = network_dir / "precompute_ssa"
-        ssa_pre_records = run_ssa_to_t_end_batch(
-            network_case=network_case,
-            t_end=ssa_t_end,
-            output_dir=ssa_pre_dir,
-            seed_rng=seed_rng,
-            recording_mode="summary",
-        )
-        annotate_records(
-            ssa_pre_records,
-            physical_network=network_case.name,
-            calibration_label="common_blended_min_t_end",
-            calibration_role="ssa_precompute",
-        )
-        calibration_records.extend(ssa_pre_records)
-        ssa_global_width = median_event_window_width(ssa_pre_records)
-
-        global_windows_by_label: dict[str, np.ndarray] = {
-            item["parameter_label"]: windows_from_widths(
-                sample_times,
-                np.full(sample_times.shape, float(global_window_widths[str(item["parameter_label"])]), dtype=float),
-                float(common_t_end),
-            )
-            for item in network_blended_medians
+    network_tasks = [
+        {
+            "network_case": network_case,
+            "output_root": output_root,
+            "seed": base.next_seed(seed_rng),
         }
-        global_windows_by_label["ssa"] = windows_from_widths(
-            sample_times,
-            np.full(sample_times.shape, float(ssa_global_width), dtype=float),
-            float(common_t_end),
-        )
+        for network_case in network_cases
+    ]
+    network_worker_count = resolve_network_worker_count(len(network_tasks))
+    print(
+        f"[{RUN_NAME}] submitting {len(network_tasks)} network tasks "
+        f"with network_workers={network_worker_count} output={output_root}"
+    )
+    if network_worker_count <= 1:
+        for task in network_tasks:
+            result = run_network_case_task(task)
+            all_records.extend(result["records"])
+            write_json(output_root / "run_records.json", base.sorted_records(all_records))
+    else:
+        with ProcessPoolExecutor(max_workers=network_worker_count) as executor:
+            future_to_task = {executor.submit(run_network_case_task, task): task for task in network_tasks}
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    network_case = task["network_case"]
+                    if not isinstance(network_case, base.NetworkCase):
+                        network_case = base.NetworkCase(**dict(network_case))
+                    record = base.network_error_record(network_case, exc)
+                    all_records.append(record)
+                    print_single_record(record)
+                else:
+                    all_records.extend(result["records"])
+                write_json(output_root / "run_records.json", base.sorted_records(all_records))
 
-        local_widths_by_label: dict[str, np.ndarray] = {}
-        for parameter_case in blended_cases:
-            local_dir = network_dir / parameter_case.label / "local_window_estimate_blended"
-            local_records = run_blended_window_batch(
-                network_case=network_case,
-                parameter_case=parameter_case,
-                t_end=float(common_t_end),
-                output_dir=local_dir,
-                seed_rng=seed_rng,
-                windows=global_windows_by_label[parameter_case.label],
-                n_runs=int(LOCAL_WINDOW_ESTIMATION_RUNS),
-                recording_mode="windowed",
-            )
-            annotate_records(
-                local_records,
-                physical_network=network_case.name,
-                calibration_label=parameter_case.label,
-                calibration_role="blended_local_window_estimate",
-            )
-            calibration_records.extend(local_records)
-            local_widths_by_label[parameter_case.label] = estimate_local_widths(
-                global_windows_by_label[parameter_case.label],
-                local_records,
-                fallback_width=float(global_window_widths[parameter_case.label]),
-            )
-
-        ssa_local_dir = network_dir / "local_window_estimate_ssa"
-        ssa_local_records = run_ssa_to_t_end_batch(
-            network_case=network_case,
-            t_end=float(common_t_end),
-            output_dir=ssa_local_dir,
-            seed_rng=seed_rng,
-            windows=global_windows_by_label["ssa"],
-            n_runs=int(LOCAL_WINDOW_ESTIMATION_RUNS),
-            recording_mode="windowed",
-        )
-        annotate_records(
-            ssa_local_records,
-            physical_network=network_case.name,
-            calibration_label="common_blended_min_t_end",
-            calibration_role="ssa_local_window_estimate",
-        )
-        calibration_records.extend(ssa_local_records)
-        local_widths_by_label["ssa"] = estimate_local_widths(
-            global_windows_by_label["ssa"],
-            ssa_local_records,
-            fallback_width=float(ssa_global_width),
-        )
-        write_json(network_dir / "calibration_records.json", calibration_records)
-
-        final_windows_by_label = {
-            label: windows_from_widths(sample_times, widths, float(common_t_end))
-            for label, widths in local_widths_by_label.items()
-        }
-        write_json(
-            network_dir / "sampling_plan.json",
-            {
-                "network": network_case.name,
-                "common_t_end_rule": "minimum median finite blended simulation_final_time across parameter cases",
-                "common_t_end": float(common_t_end),
-                "n_sample_time_points": int(N_SAMPLE_TIME_POINTS),
-                "target_events_per_window": float(TARGET_EVENTS_PER_WINDOW),
-                "sample_times": sample_times.tolist(),
-                "blended_parameter_medians": network_blended_medians,
-                "ssa_global_window_width": float(ssa_global_width),
-                "local_window_estimation_runs": int(LOCAL_WINDOW_ESTIMATION_RUNS),
-                "final_window_widths": {
-                    label: np.asarray(windows[:, 1] - windows[:, 0], dtype=float).tolist()
-                    for label, windows in final_windows_by_label.items()
-                },
-            },
-        )
-        print(
-            f"[{RUN_NAME}] network={network_case.name} common_t_end={common_t_end:.6g} "
-            f"sample_points={int(N_SAMPLE_TIME_POINTS)}"
-        )
-
-        for parameter_case in blended_cases:
-            blended_dir = network_dir / parameter_case.label / "blended"
-            blended_records = run_blended_window_batch(
-                network_case=network_case,
-                parameter_case=parameter_case,
-                t_end=float(common_t_end),
-                output_dir=blended_dir,
-                seed_rng=seed_rng,
-                windows=final_windows_by_label[parameter_case.label],
-                n_runs=int(base.BLENDED_RUNS_PER_PARAMETER),
-                recording_mode="windowed",
-            )
-            annotate_records(
-                blended_records,
-                physical_network=network_case.name,
-                calibration_label=parameter_case.label,
-                calibration_role="blended_formal_windowed",
-            )
-            all_records.extend(blended_records)
-            write_json(output_root / "run_records.json", all_records)
-
-        write_json(
-            network_dir / "blended_t_end_calibration.json",
-            {
-                "network": network_case.name,
-                "ssa_t_end_rule": str(SSA_T_END_RULE),
-                "ssa_t_end": float(ssa_t_end),
-                "common_t_end": float(common_t_end),
-                "blended_parameter_medians": network_blended_medians,
-            },
-        )
-        print(f"[{RUN_NAME}] network={network_case.name} SSA t_end={ssa_t_end:.6g}")
-
-        ssa_dir = network_dir / "ssa"
-        ssa_records = run_ssa_to_t_end_batch(
-            network_case=network_case,
-            t_end=ssa_t_end,
-            output_dir=ssa_dir,
-            seed_rng=seed_rng,
-            windows=final_windows_by_label["ssa"],
-            n_runs=int(base.SSA_RUNS_PER_NETWORK),
-            recording_mode="windowed",
-        )
-        annotate_records(
-            ssa_records,
-            physical_network=network_case.name,
-            calibration_label="common_blended_min_t_end",
-            calibration_role="ssa_formal_windowed",
-        )
-        all_records.extend(ssa_records)
-        write_json(output_root / "run_records.json", all_records)
-
+    all_records = base.sorted_records(all_records)
 
     payload = {
         "run_name": RUN_NAME,
         "output_root": str(output_root),
-        "seed_source": "np.random.default_rng() without fixed seed",
+        "seed_source": "np.random.default_rng() without fixed seed; one independent seed stream per network",
         "stop_conditions": stop_condition_metadata(),
         "parallel": parallel_metadata(),
         "network_cases": [asdict(case) for case in network_cases],
@@ -311,6 +116,257 @@ def run() -> dict[str, Any]:
     print(f"[{RUN_NAME}] wrote text report: {report_path}")
     print(f"[{RUN_NAME}] wrote metadata: {output_root / 'run_metadata.json'}")
     return payload
+
+
+def run_network_case_task(task: dict[str, Any]) -> dict[str, Any]:
+    network_case = task["network_case"]
+    if not isinstance(network_case, base.NetworkCase):
+        network_case = base.NetworkCase(**dict(network_case))
+    seed_rng = np.random.default_rng(int(task["seed"]))
+    return run_network_case(
+        network_case=network_case,
+        output_root=Path(task["output_root"]),
+        seed_rng=seed_rng,
+    )
+
+
+def run_network_case(
+    *,
+    network_case: base.NetworkCase,
+    output_root: Path,
+    seed_rng: np.random.Generator,
+) -> dict[str, Any]:
+    network_dir = output_root / network_case.name
+    network_dir.mkdir(parents=True, exist_ok=True)
+    all_records: list[dict[str, Any]] = []
+    blended_cases = base.build_blended_parameter_cases()
+    try:
+        network, catalysis_metadata = base.build_network_case(network_case)
+    except Exception as exc:
+        record = base.network_error_record(network_case, exc)
+        write_json(network_dir / "network_build_error.json", record)
+        print_single_record(record)
+        return {"network": network_case.name, "records": [record]}
+
+    write_json(
+        network_dir / "network_metadata.json",
+        {
+            "network_case": asdict(network_case),
+            "n_species": int(network.n_species),
+            "n_channels": int(network.n_channels),
+            "catalysis": catalysis_metadata,
+            "base_rates": base.base_rate_metadata(),
+        },
+    )
+
+    calibration_records: list[dict[str, Any]] = []
+    network_blended_medians: list[dict[str, Any]] = []
+    global_window_widths: dict[str, float] = {}
+    for parameter_case in blended_cases:
+        case_dir = network_dir / parameter_case.label
+
+        pre_dir = case_dir / "precompute_blended"
+        pre_records = run_blended_calibration_batch(
+            network_case=network_case,
+            parameter_case=parameter_case,
+            output_dir=pre_dir,
+            seed_rng=seed_rng,
+        )
+        annotate_records(
+            pre_records,
+            physical_network=network_case.name,
+            calibration_label=parameter_case.label,
+            calibration_role="blended_precompute",
+        )
+        calibration_records.extend(pre_records)
+        write_json(network_dir / "calibration_records.json", calibration_records)
+
+        blended_median_t_end = median_final_time_or_none(pre_records)
+        if blended_median_t_end is None:
+            blended_median_t_end = float(SSA_FALLBACK_T_END)
+        width = median_event_window_width(pre_records)
+        global_window_widths[parameter_case.label] = float(width)
+        network_blended_medians.append(
+            {
+                "parameter_label": parameter_case.label,
+                "median_final_time": float(blended_median_t_end),
+                "global_window_width": float(width),
+                "n_records": len(pre_records),
+            }
+        )
+        print(
+            f"[{RUN_NAME}] network={network_case.name} parameter={parameter_case.label} "
+            f"precompute_blended_median_final_time={blended_median_t_end:.6g} "
+            f"global_window_width={width:.6g}"
+        )
+
+    finite_blended_medians = [
+        float(item["median_final_time"])
+        for item in network_blended_medians
+        if np.isfinite(float(item["median_final_time"]))
+    ]
+    common_t_end = min(finite_blended_medians) if finite_blended_medians else float(SSA_FALLBACK_T_END)
+    sample_times = np.linspace(0.0, float(common_t_end), int(N_SAMPLE_TIME_POINTS))
+    ssa_t_end = float(common_t_end)
+    ssa_pre_dir = network_dir / "precompute_ssa"
+    ssa_pre_records = run_ssa_to_t_end_batch(
+        network_case=network_case,
+        t_end=ssa_t_end,
+        output_dir=ssa_pre_dir,
+        seed_rng=seed_rng,
+        recording_mode="summary",
+    )
+    annotate_records(
+        ssa_pre_records,
+        physical_network=network_case.name,
+        calibration_label="common_blended_min_t_end",
+        calibration_role="ssa_precompute",
+    )
+    calibration_records.extend(ssa_pre_records)
+    ssa_global_width = median_event_window_width(ssa_pre_records)
+
+    global_windows_by_label: dict[str, np.ndarray] = {
+        item["parameter_label"]: windows_from_widths(
+            sample_times,
+            np.full(sample_times.shape, float(global_window_widths[str(item["parameter_label"])]), dtype=float),
+            float(common_t_end),
+        )
+        for item in network_blended_medians
+    }
+    global_windows_by_label["ssa"] = windows_from_widths(
+        sample_times,
+        np.full(sample_times.shape, float(ssa_global_width), dtype=float),
+        float(common_t_end),
+    )
+
+    local_widths_by_label: dict[str, np.ndarray] = {}
+    for parameter_case in blended_cases:
+        local_dir = network_dir / parameter_case.label / "local_window_estimate_blended"
+        local_records = run_blended_window_batch(
+            network_case=network_case,
+            parameter_case=parameter_case,
+            t_end=float(common_t_end),
+            output_dir=local_dir,
+            seed_rng=seed_rng,
+            windows=global_windows_by_label[parameter_case.label],
+            n_runs=int(LOCAL_WINDOW_ESTIMATION_RUNS),
+            recording_mode="windowed",
+        )
+        annotate_records(
+            local_records,
+            physical_network=network_case.name,
+            calibration_label=parameter_case.label,
+            calibration_role="blended_local_window_estimate",
+        )
+        calibration_records.extend(local_records)
+        local_widths_by_label[parameter_case.label] = estimate_local_widths(
+            global_windows_by_label[parameter_case.label],
+            local_records,
+            fallback_width=float(global_window_widths[parameter_case.label]),
+        )
+
+    ssa_local_dir = network_dir / "local_window_estimate_ssa"
+    ssa_local_records = run_ssa_to_t_end_batch(
+        network_case=network_case,
+        t_end=float(common_t_end),
+        output_dir=ssa_local_dir,
+        seed_rng=seed_rng,
+        windows=global_windows_by_label["ssa"],
+        n_runs=int(LOCAL_WINDOW_ESTIMATION_RUNS),
+        recording_mode="windowed",
+    )
+    annotate_records(
+        ssa_local_records,
+        physical_network=network_case.name,
+        calibration_label="common_blended_min_t_end",
+        calibration_role="ssa_local_window_estimate",
+    )
+    calibration_records.extend(ssa_local_records)
+    local_widths_by_label["ssa"] = estimate_local_widths(
+        global_windows_by_label["ssa"],
+        ssa_local_records,
+        fallback_width=float(ssa_global_width),
+    )
+    write_json(network_dir / "calibration_records.json", calibration_records)
+
+    final_windows_by_label = {
+        label: windows_from_widths(sample_times, widths, float(common_t_end))
+        for label, widths in local_widths_by_label.items()
+    }
+    write_json(
+        network_dir / "sampling_plan.json",
+        {
+            "network": network_case.name,
+            "common_t_end_rule": "minimum median finite blended simulation_final_time across parameter cases",
+            "common_t_end": float(common_t_end),
+            "n_sample_time_points": int(N_SAMPLE_TIME_POINTS),
+            "target_events_per_window": float(TARGET_EVENTS_PER_WINDOW),
+            "sample_times": sample_times.tolist(),
+            "blended_parameter_medians": network_blended_medians,
+            "ssa_global_window_width": float(ssa_global_width),
+            "local_window_estimation_runs": int(LOCAL_WINDOW_ESTIMATION_RUNS),
+            "final_window_widths": {
+                label: np.asarray(windows[:, 1] - windows[:, 0], dtype=float).tolist()
+                for label, windows in final_windows_by_label.items()
+            },
+        },
+    )
+    print(
+        f"[{RUN_NAME}] network={network_case.name} common_t_end={common_t_end:.6g} "
+        f"sample_points={int(N_SAMPLE_TIME_POINTS)}"
+    )
+
+    for parameter_case in blended_cases:
+        blended_dir = network_dir / parameter_case.label / "blended"
+        blended_records = run_blended_window_batch(
+            network_case=network_case,
+            parameter_case=parameter_case,
+            t_end=float(common_t_end),
+            output_dir=blended_dir,
+            seed_rng=seed_rng,
+            windows=final_windows_by_label[parameter_case.label],
+            n_runs=int(base.BLENDED_RUNS_PER_PARAMETER),
+            recording_mode="windowed",
+        )
+        annotate_records(
+            blended_records,
+            physical_network=network_case.name,
+            calibration_label=parameter_case.label,
+            calibration_role="blended_formal_windowed",
+        )
+        all_records.extend(blended_records)
+
+    write_json(
+        network_dir / "blended_t_end_calibration.json",
+        {
+            "network": network_case.name,
+            "ssa_t_end_rule": str(SSA_T_END_RULE),
+            "ssa_t_end": float(ssa_t_end),
+            "common_t_end": float(common_t_end),
+            "blended_parameter_medians": network_blended_medians,
+        },
+    )
+    print(f"[{RUN_NAME}] network={network_case.name} SSA t_end={ssa_t_end:.6g}")
+
+    ssa_dir = network_dir / "ssa"
+    ssa_records = run_ssa_to_t_end_batch(
+        network_case=network_case,
+        t_end=ssa_t_end,
+        output_dir=ssa_dir,
+        seed_rng=seed_rng,
+        windows=final_windows_by_label["ssa"],
+        n_runs=int(base.SSA_RUNS_PER_NETWORK),
+        recording_mode="windowed",
+    )
+    annotate_records(
+        ssa_records,
+        physical_network=network_case.name,
+        calibration_label="common_blended_min_t_end",
+        calibration_role="ssa_formal_windowed",
+    )
+    all_records.extend(ssa_records)
+    write_json(network_dir / "network_records.json", base.sorted_records(all_records))
+    return {"network": network_case.name, "records": base.sorted_records(all_records)}
 
 
 def run_blended_calibration_batch(
@@ -748,14 +804,28 @@ def task_error_record(task: dict[str, Any], exc: Exception) -> dict[str, Any]:
 def parallel_metadata() -> dict[str, Any]:
     return {
         "backend": "process",
+        "network_parallel_workers": (
+            None if NETWORK_PARALLEL_WORKERS is None else int(NETWORK_PARALLEL_WORKERS)
+        ),
         "parallel_workers": None if base.PARALLEL_WORKERS is None else int(base.PARALLEL_WORKERS),
         "resolved_cpu_count": os.cpu_count(),
         "stage_order": (
-            "per network: parallel blended calibration for each parameter case "
-            "-> max of per-parameter median blended t_end -> parallel SSA"
+            "parallel networks; inside each network: parallel blended calibration "
+            "for each parameter case -> minimum median blended t_end -> parallel SSA "
+            "precompute -> local window estimates -> formal blended -> formal SSA"
         ),
         "network_rebuild_per_worker": True,
     }
+
+
+def resolve_network_worker_count(task_count: int) -> int:
+    if int(task_count) <= 0:
+        return 0
+    if NETWORK_PARALLEL_WORKERS is None:
+        requested = os.cpu_count() or 1
+    else:
+        requested = int(NETWORK_PARALLEL_WORKERS)
+    return max(1, min(int(requested), int(task_count)))
 
 
 def stop_condition_metadata() -> dict[str, Any]:
@@ -815,6 +885,7 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def apply_environment_overrides() -> None:
+    global NETWORK_PARALLEL_WORKERS
     global BLENDED_MAX_STEPS
     global BLENDED_MAX_WALL_TIME_SECONDS
     global SSA_MAX_STEPS
@@ -825,6 +896,10 @@ def apply_environment_overrides() -> None:
     global LOCAL_WINDOW_ESTIMATION_RUNS
     global MIN_SAMPLE_WINDOW_WIDTH
     base.apply_environment_overrides()
+    NETWORK_PARALLEL_WORKERS = env_optional_int(
+        "BETA_TEST_NETWORK_PARALLEL_WORKERS",
+        NETWORK_PARALLEL_WORKERS,
+    )
     BLENDED_MAX_STEPS = env_int("BETA_TEST_BLENDED_MAX_STEPS", base.MAX_STEPS)
     BLENDED_MAX_WALL_TIME_SECONDS = env_float(
         "BETA_TEST_BLENDED_MAX_WALL_TIME_SECONDS",
@@ -848,6 +923,16 @@ def apply_environment_overrides() -> None:
 def env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     return int(default) if value is None or not value.strip() else int(value)
+
+
+def env_optional_int(name: str, default: int | None) -> int | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    text = value.strip().lower()
+    if text in {"none", "null"}:
+        return None
+    return int(text)
 
 
 def env_float(name: str, default: float) -> float:
