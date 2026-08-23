@@ -302,10 +302,13 @@ def run() -> dict[str, Any]:
         "batch_report": base.batch_report(all_records),
         "records": all_records,
     }
+    report_path = base.write_run_report(payload, output_root, "beta", timestamp)
+    payload["text_report_path"] = str(report_path)
     write_json(output_root / "batch_report.json", payload["batch_report"])
     write_json(output_root / "run_metadata.json", payload)
     print_batch_report(payload["batch_report"])
     print_error_summary(payload["error_summary"])
+    print(f"[{RUN_NAME}] wrote text report: {report_path}")
     print(f"[{RUN_NAME}] wrote metadata: {output_root / 'run_metadata.json'}")
     return payload
 

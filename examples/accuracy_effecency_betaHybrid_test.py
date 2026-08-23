@@ -29,6 +29,7 @@ from polymer_sim import (  # noqa: E402
     build_food_supply_restriction,
     clear_all_catalysis,
     generate_fixed_species_space,
+    load_trajectory_arrays,
     save_trajectory_record,
     set_catalytic_strengths_for_channels,
 )
@@ -249,10 +250,13 @@ def run() -> dict[str, Any]:
         "batch_report": batch_report(all_records),
         "records": all_records,
     }
+    report_path = write_run_report(payload, output_root, "test", timestamp)
+    payload["text_report_path"] = str(report_path)
     _write_json(output_root / "batch_report.json", payload["batch_report"])
     _write_json(output_root / "run_metadata.json", payload)
     print_batch_report(payload["batch_report"])
     print_error_summary(payload["error_summary"])
+    print(f"[{RUN_NAME}] wrote text report: {report_path}")
     print(f"[{RUN_NAME}] wrote metadata: {output_root / 'run_metadata.json'}")
     return payload
 
@@ -876,6 +880,150 @@ def batch_report(records: list[dict[str, Any]]) -> dict[str, Any]:
             ),
         }
     return report
+
+
+def write_run_report(
+    payload: dict[str, Any],
+    output_root: Path,
+    report_tag: str,
+    timestamp: str,
+) -> Path:
+    path = output_root / f"report_{report_tag}_{timestamp}.out"
+    path.write_text(build_run_report_text(payload), encoding="utf-8")
+    return path
+
+
+def build_run_report_text(payload: dict[str, Any]) -> str:
+    records = list(payload.get("records", []))
+    lines: list[str] = []
+    lines.append(f"run_name: {payload.get('run_name')}")
+    lines.append(f"output_root: {payload.get('output_root')}")
+    lines.append(f"n_records: {len(records)}")
+    lines.append("")
+    lines.append("parallelism:")
+    parallel = dict(payload.get("parallel", {}))
+    for key in sorted(parallel):
+        lines.append(f"  {key}: {parallel[key]}")
+    lines.append("  note: current scripts parallelize tasks inside each submitted batch; network-level stages are still executed in loop order.")
+    lines.append("")
+    lines.append("stop reason summary:")
+    for key, count in count_values(record.get("stop_reason") for record in records).items():
+        lines.append(f"  {key}: {count}")
+    lines.append("")
+    lines.append("stop reason by network and algorithm:")
+    for group_key, group_records in grouped_records(records).items():
+        lines.append(f"  {group_key}:")
+        for reason, count in count_values(record.get("stop_reason") for record in group_records).items():
+            lines.append(f"    {reason}: {count}")
+    lines.append("")
+    lines.append("network algorithm wall time seconds:")
+    for row in wall_time_report_rows(records):
+        lines.append(
+            "  "
+            f"network={row['network']} algorithm={row['algorithm']} "
+            f"n={row['n']} min={row['min']} q25={row['q25']} "
+            f"median={row['median']} q75={row['q75']} max={row['max']}"
+        )
+    lines.append("")
+    lines.append("formal sampling coverage:")
+    coverage_rows = sampling_coverage_rows(records)
+    if not coverage_rows:
+        lines.append("  no windowed formal trajectories found; coverage is not applicable for this run.")
+    else:
+        for row in coverage_rows:
+            lines.append(
+                "  "
+                f"network={row['network']} algorithm={row['algorithm']} "
+                f"role={row['calibration_role']} n={row['n']} "
+                f"full={row['n_full_coverage']} expected_windows={row['expected_windows_total']} "
+                f"hit_windows={row['hit_windows_total']} coverage={row['coverage_fraction']}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def grouped_records(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        key = f"network={record.get('network')} algorithm={algorithm_label(record)}"
+        groups.setdefault(key, []).append(record)
+    return dict(sorted(groups.items(), key=lambda item: item[0]))
+
+
+def wall_time_report_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output = []
+    for key, group in grouped_records(records).items():
+        values = [record.get("wall_runtime_seconds") for record in group]
+        quantiles = finite_quantiles(values)
+        network = str(group[0].get("network", "")) if group else ""
+        algorithm = algorithm_label(group[0]) if group else ""
+        output.append({"network": network, "algorithm": algorithm, **quantiles})
+    return output
+
+
+def sampling_coverage_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    formal_records = [
+        record
+        for record in records
+        if str(record.get("status")) == "ok"
+        and str(record.get("recording_mode", "")).lower() == "windowed"
+        and "formal" in str(record.get("calibration_role", "")).lower()
+    ]
+    output = []
+    for key, group in grouped_records(formal_records).items():
+        expected_total = 0
+        hit_total = 0
+        full = 0
+        usable = 0
+        for record in group:
+            expected, hit = trajectory_window_coverage(record)
+            if expected <= 0:
+                continue
+            usable += 1
+            expected_total += int(expected)
+            hit_total += int(hit)
+            if int(hit) >= int(expected):
+                full += 1
+        if usable <= 0:
+            continue
+        output.append(
+            {
+                "network": str(group[0].get("network", "")),
+                "algorithm": algorithm_label(group[0]),
+                "calibration_role": str(group[0].get("calibration_role", "")),
+                "n": int(usable),
+                "n_full_coverage": int(full),
+                "expected_windows_total": int(expected_total),
+                "hit_windows_total": int(hit_total),
+                "coverage_fraction": float(hit_total / expected_total) if expected_total else None,
+            }
+        )
+    return output
+
+
+def trajectory_window_coverage(record: dict[str, Any]) -> tuple[int, int]:
+    path_text = str(record.get("trajectory_path", "")).strip()
+    if not path_text:
+        return 0, 0
+    try:
+        _, _, _, metadata = load_trajectory_arrays(Path(path_text), mmap=True)
+    except Exception:
+        return 0, 0
+    windows = metadata.get("sampling_windows", [])
+    recorded = metadata.get("recorded_window_indices", [])
+    try:
+        expected = len(windows)
+        hit = len(set(int(index) for index in recorded))
+    except Exception:
+        return 0, 0
+    return int(expected), int(hit)
+
+
+def algorithm_label(record: dict[str, Any]) -> str:
+    method = str(record.get("method", "unknown"))
+    parameter = record.get("parameter_case")
+    if isinstance(parameter, dict) and parameter.get("label"):
+        return str(parameter["label"])
+    return method
 
 
 def count_values(values) -> dict[str, int]:

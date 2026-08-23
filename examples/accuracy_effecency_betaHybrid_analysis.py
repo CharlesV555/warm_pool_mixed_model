@@ -69,7 +69,13 @@ def analyze_batch_output(
     wall_rows = wall_time_rows(ok_rows)
     wall_csv = out_dir / "wall_time_to_common_t_end.csv"
     write_csv(wall_csv, wall_rows)
-    wall_plot = plot_wall_time_bars(wall_rows, out_dir / "wall_time_to_common_t_end.png")
+    wall_sample_rows = wall_time_sample_rows(ok_rows, wall_rows)
+    wall_sample_csv = out_dir / "wall_time_to_common_t_end_samples.csv"
+    write_csv(wall_sample_csv, wall_sample_rows)
+    wall_plot = plot_wall_time_violins(
+        wall_sample_rows,
+        out_dir / "wall_time_to_common_t_end_violin.png",
+    )
 
     distribution_rows, moment_npz_paths = distribution_comparison_rows(
         ok_rows,
@@ -80,7 +86,11 @@ def analyze_batch_output(
     )
     distribution_csv = out_dir / "state_distribution_vs_ssa.csv"
     write_csv(distribution_csv, distribution_rows)
-    swd_plot = plot_swd_lines(distribution_rows, out_dir / "sliced_wasserstein_vs_time.png")
+    swd_plots = plot_swd_lines_by_network(distribution_rows, out_dir)
+    final_total_rows = final_total_vs_time_rows([row for row in rows if row.status == "ok"])
+    final_total_csv = out_dir / "final_total_abundance_vs_simulation_time.csv"
+    write_csv(final_total_csv, final_total_rows)
+    final_total_plots = plot_final_total_vs_time_by_network(final_total_rows, out_dir)
 
     summary = {
         "batch_dir": str(batch_path),
@@ -89,9 +99,12 @@ def analyze_batch_output(
         "n_input_records": len(rows),
         "n_ok_trajectory_records": len(ok_rows),
         "wall_time_csv": str(wall_csv),
-        "wall_time_plot": str(wall_plot),
+        "wall_time_sample_csv": str(wall_sample_csv),
+        "wall_time_plot": str(wall_plot) if wall_plot is not None else None,
         "distribution_csv": str(distribution_csv),
-        "sliced_wasserstein_plot": str(swd_plot) if swd_plot is not None else None,
+        "sliced_wasserstein_plots": [str(path) for path in swd_plots],
+        "final_total_abundance_csv": str(final_total_csv),
+        "final_total_abundance_plots": [str(path) for path in final_total_plots],
         "moment_npz_paths": [str(path) for path in moment_npz_paths],
         "parameters": {
             "n_time_points": int(n_time_points),
@@ -102,8 +115,14 @@ def analyze_batch_output(
     summary_path = out_dir / "analysis_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
     print(f"[analysis] wrote wall-time CSV: {wall_csv}")
+    print(f"[analysis] wrote wall-time sample CSV: {wall_sample_csv}")
     print(f"[analysis] wrote wall-time plot: {wall_plot}")
     print(f"[analysis] wrote distribution CSV: {distribution_csv}")
+    for path in swd_plots:
+        print(f"[analysis] wrote network accuracy plot: {path}")
+    print(f"[analysis] wrote final-total CSV: {final_total_csv}")
+    for path in final_total_plots:
+        print(f"[analysis] wrote final-total scatter plot: {path}")
     print(f"[analysis] wrote summary: {summary_path}")
     return summary
 
@@ -178,6 +197,64 @@ def wall_time_rows(rows: list[RunRow]) -> list[dict[str, Any]]:
                     "wall_seconds_max": float(np.max(wall_values)) if wall_values else float("nan"),
                 }
             )
+    return output
+
+
+def wall_time_sample_rows(
+    rows: list[RunRow],
+    wall_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    common_by_network: dict[str, float] = {}
+    for row in wall_rows:
+        network = str(row["network"])
+        common_t_end = optional_float(row.get("common_t_end"))
+        if common_t_end is not None:
+            common_by_network.setdefault(network, common_t_end)
+
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        common_t_end = common_by_network.get(row.network)
+        if common_t_end is None:
+            continue
+        if row.wall_runtime_seconds is None or row.simulation_final_time is None:
+            continue
+        if row.simulation_final_time < common_t_end - 1e-12:
+            continue
+        output.append(
+            {
+                "network": row.network,
+                "algorithm_label": row.algorithm_label,
+                "method": row.method,
+                "run_index": row.raw.get("run_index"),
+                "seed": row.raw.get("seed"),
+                "common_t_end": float(common_t_end),
+                "simulation_final_time": float(row.simulation_final_time),
+                "wall_runtime_seconds": float(row.wall_runtime_seconds),
+            }
+        )
+    return output
+
+
+def final_total_vs_time_rows(rows: list[RunRow]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        final_time = row.simulation_final_time
+        total = optional_float(row.raw.get("final_total_abundance"))
+        if final_time is None or total is None:
+            continue
+        output.append(
+            {
+                "network": row.network,
+                "algorithm_label": row.algorithm_label,
+                "method": row.method,
+                "run_index": row.raw.get("run_index"),
+                "seed": row.raw.get("seed"),
+                "simulation_final_time": float(final_time),
+                "final_total_abundance": float(total),
+                "wall_runtime_seconds": row.wall_runtime_seconds,
+                "stop_reason": row.raw.get("stop_reason"),
+            }
+        )
     return output
 
 
@@ -463,35 +540,80 @@ def valid_sample_mask(values: np.ndarray) -> np.ndarray:
     return np.all(np.isfinite(arr), axis=1)
 
 
-def plot_wall_time_bars(rows: list[dict[str, Any]], output_path: Path) -> Path:
+def plot_wall_time_violins(rows: list[dict[str, Any]], output_path: Path) -> Path | None:
     if not rows:
-        return output_path
+        return None
     networks = sorted({str(row["network"]) for row in rows})
     labels = sorted({str(row["algorithm_label"]) for row in rows})
-    x = np.arange(len(networks), dtype=float)
-    width = 0.8 / max(len(labels), 1)
+    if not networks or not labels:
+        return None
+
+    data: list[np.ndarray] = []
+    positions: list[float] = []
+    colors: list[Any] = []
+    tick_positions: list[float] = []
+    cmap = plt.get_cmap("tab10")
+    group_width = 0.78
+    label_width = group_width / max(len(labels), 1)
+
+    for network_index, network in enumerate(networks):
+        tick_positions.append(float(network_index))
+        for label_index, label in enumerate(labels):
+            values = [
+                float(row["wall_runtime_seconds"])
+                for row in rows
+                if str(row["network"]) == network
+                and str(row["algorithm_label"]) == label
+                and np.isfinite(float(row["wall_runtime_seconds"]))
+            ]
+            if not values:
+                continue
+            offset = (label_index - (len(labels) - 1) / 2.0) * label_width
+            data.append(np.asarray(values, dtype=float))
+            positions.append(float(network_index) + offset)
+            colors.append(cmap(label_index % 10))
+
     fig_width = max(9.0, 1.7 * len(networks) + 0.5 * len(labels))
     fig, ax = plt.subplots(figsize=(fig_width, 5.5))
-    for label_index, label in enumerate(labels):
-        heights = []
-        for network in networks:
-            match = next(
-                (
-                    row
-                    for row in rows
-                    if row["network"] == network and row["algorithm_label"] == label
-                ),
-                None,
+    if data:
+        parts = ax.violinplot(
+            data,
+            positions=positions,
+            widths=label_width * 0.85,
+            showmeans=False,
+            showmedians=True,
+            showextrema=False,
+        )
+        for body, color in zip(parts["bodies"], colors):
+            body.set_facecolor(color)
+            body.set_edgecolor(color)
+            body.set_alpha(0.35)
+        if "cmedians" in parts:
+            parts["cmedians"].set_color("#222222")
+            parts["cmedians"].set_linewidth(1.0)
+        for pos, values, color in zip(positions, data, colors):
+            ax.scatter(
+                np.full(values.shape, pos, dtype=float),
+                values,
+                s=12,
+                color=color,
+                alpha=0.55,
+                edgecolors="none",
+                zorder=3,
             )
-            heights.append(float("nan") if match is None else float(match["wall_seconds_median"]))
-        offset = (label_index - (len(labels) - 1) / 2.0) * width
-        ax.bar(x + offset, heights, width=width, label=short_label(label))
-    ax.set_ylabel("median wall seconds to common t_end")
+
+    from matplotlib.patches import Patch
+
+    legend_handles = [
+        Patch(facecolor=cmap(index % 10), edgecolor=cmap(index % 10), alpha=0.35, label=short_label(label))
+        for index, label in enumerate(labels)
+    ]
+    ax.set_ylabel("wall seconds to common t_end")
     ax.set_xlabel("network")
-    ax.set_xticks(x)
+    ax.set_xticks(tick_positions)
     ax.set_xticklabels(networks, rotation=30, ha="right")
-    ax.legend(fontsize=8)
-    ax.set_title("Wall Time To Common Simulation Time")
+    ax.legend(handles=legend_handles, fontsize=8)
+    ax.set_title("Wall Time Distribution To Common Simulation Time")
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)
@@ -499,24 +621,92 @@ def plot_wall_time_bars(rows: list[dict[str, Any]], output_path: Path) -> Path:
     return output_path
 
 
-def plot_swd_lines(rows: list[dict[str, Any]], output_path: Path) -> Path | None:
+def plot_swd_lines_by_network(rows: list[dict[str, Any]], output_dir: Path) -> list[Path]:
+    if not rows:
+        return []
+    output_paths: list[Path] = []
+    for network, network_rows in group_by(rows, lambda row: str(row["network"])).items():
+        path = output_dir / f"sliced_wasserstein_vs_time__{safe_name(network)}.png"
+        plotted = plot_swd_lines_for_network(network_rows, path, network)
+        if plotted is not None:
+            output_paths.append(plotted)
+    return output_paths
+
+
+def plot_swd_lines_for_network(
+    rows: list[dict[str, Any]],
+    output_path: Path,
+    network: str,
+) -> Path | None:
     if not rows:
         return None
-    grouped = group_by(rows, lambda row: (str(row["network"]), str(row["algorithm_label"])))
+    grouped = group_by(rows, lambda row: str(row["algorithm_label"]))
     fig, ax = plt.subplots(figsize=(10.0, 6.0))
-    for (network, label), group_rows in grouped.items():
+    for label, group_rows in grouped.items():
         ordered = sorted(group_rows, key=lambda row: int(row["time_index"]))
         ax.plot(
             [float(row["time"]) for row in ordered],
             [float(row["sliced_wasserstein_distance"]) for row in ordered],
             linewidth=1.0,
             alpha=0.75,
-            label=f"{network}:{short_label(label)}",
+            label=short_label(label),
         )
     ax.set_xlabel("simulation time")
     ax.set_ylabel("Sliced Wasserstein Distance vs SSA")
-    ax.set_title("Blended State Distribution Distance To SSA")
+    ax.set_title(f"Blended State Distribution Distance To SSA: {network}")
     ax.legend(fontsize=7, ncol=1)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    return output_path
+
+
+def plot_final_total_vs_time_by_network(rows: list[dict[str, Any]], output_dir: Path) -> list[Path]:
+    if not rows:
+        return []
+    paths: list[Path] = []
+    for network, network_rows in group_by(rows, lambda row: str(row["network"])).items():
+        path = output_dir / f"final_total_abundance_vs_simulation_time__{safe_name(network)}.png"
+        plotted = plot_final_total_vs_time_for_network(network_rows, path, network)
+        if plotted is not None:
+            paths.append(plotted)
+    return paths
+
+
+def plot_final_total_vs_time_for_network(
+    rows: list[dict[str, Any]],
+    output_path: Path,
+    network: str,
+) -> Path | None:
+    if not rows:
+        return None
+    grouped = group_by(rows, lambda row: str(row["algorithm_label"]))
+    fig, ax = plt.subplots(figsize=(9.0, 6.0))
+    cmap = plt.get_cmap("tab10")
+    for index, (label, group_rows) in enumerate(sorted(grouped.items(), key=lambda item: item[0])):
+        pairs = [
+            (float(row["simulation_final_time"]), float(row["final_total_abundance"]))
+            for row in group_rows
+            if np.isfinite(float(row["simulation_final_time"]))
+            and np.isfinite(float(row["final_total_abundance"]))
+        ]
+        if not pairs:
+            continue
+        x_values, y_values = zip(*pairs)
+        ax.scatter(
+            x_values,
+            y_values,
+            s=18,
+            alpha=0.65,
+            color=cmap(index % 10),
+            label=short_label(label),
+            edgecolors="none",
+        )
+    ax.set_xlabel("simulation final time")
+    ax.set_ylabel("final total abundance")
+    ax.set_title(f"Final Total Abundance vs Simulation Time: {network}")
+    ax.legend(fontsize=7)
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)
