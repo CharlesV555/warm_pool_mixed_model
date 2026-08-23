@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 import accuracy_effecency_betaHybrid_test as base  # noqa: E402
+from polymer_sim import SummaryRecorder  # noqa: E402
 
 
 RUN_NAME = "accuracy_effecency_betaHybrid_tend_gradient"
@@ -404,7 +405,7 @@ def run_single(
     parameter_case: base.BlendedParameterCase | None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    recorder = base.TrajectoryRecorder()
+    recorder = SummaryRecorder()
     started_at = perf_counter()
     stop_reason = "unknown"
     error = ""
@@ -435,7 +436,6 @@ def run_single(
         traceback_path = str(trace_path)
     wall_runtime = perf_counter() - started_at
 
-    trajectory_path = output_dir / f"run_{int(run_index):04d}_seed_{int(seed)}.npz"
     if summary is not None:
         final_state = np.asarray(summary.final_state, dtype=float)
         record = {
@@ -455,41 +455,14 @@ def run_single(
             "con_steps": int(summary.metadata.get("con_steps", 0)),
             "stop_reason": stop_reason,
             "reached_requested_t_end": reached_requested_t_end(summary.final_time, t_end, stop_reason),
-            "trajectory_path": str(trajectory_path),
+            "trajectory_path": "",
             "final_total_abundance": float(final_state.sum()),
             "max_species_count": float(final_state.max()) if final_state.size else 0.0,
+            "final_state": final_state.tolist(),
             "parameter_case": base.parameter_payload(parameter_case),
             "error": "",
             "traceback_path": "",
         }
-        try:
-            trajectory_record = recorder.finalize()
-            trajectory_record.run_metadata.update(
-                {
-                    "network": network_case.name,
-                    "algorithm_label": str(algorithm_label),
-                    "method": method,
-                    "run_index": int(run_index),
-                    "seed": int(seed),
-                    "requested_t_end": base.json_float_or_none(t_end),
-                    "max_steps": int(MAX_STEPS),
-                    "max_runtime_seconds": float(MAX_RUNTIME_SECONDS),
-                    "wall_runtime_seconds": float(wall_runtime),
-                    "stop_reason": stop_reason,
-                    "reached_requested_t_end": bool(record["reached_requested_t_end"]),
-                    "parameter_case": base.parameter_payload(parameter_case),
-                }
-            )
-            base.save_trajectory_record(trajectory_path, trajectory_record)
-        except Exception as exc:
-            trace_path = output_dir / f"{algorithm_label}_run_{int(run_index):04d}_save_traceback.txt"
-            trace_path.write_text(traceback.format_exc(), encoding="utf-8")
-            record["status"] = "error"
-            record["stop_reason"] = "trajectory_save_exception"
-            record["reached_requested_t_end"] = False
-            record["trajectory_path"] = ""
-            record["error"] = repr(exc)
-            record["traceback_path"] = str(trace_path)
     else:
         record = {
             "status": "error",
@@ -513,31 +486,7 @@ def run_single(
             "error": error,
             "traceback_path": traceback_path,
         }
-        partial_path = output_dir / f"run_{int(run_index):04d}_seed_{int(seed)}_partial.npz"
-        if base.try_save_partial_trajectory(
-            recorder,
-            partial_path,
-            metadata={
-                "network": network_case.name,
-                "algorithm_label": str(algorithm_label),
-                "method": method,
-                "run_index": int(run_index),
-                "seed": int(seed),
-                "requested_t_end": base.json_float_or_none(t_end),
-                "max_steps": int(MAX_STEPS),
-                "max_runtime_seconds": float(MAX_RUNTIME_SECONDS),
-                "wall_runtime_seconds": float(wall_runtime),
-                "stop_reason": stop_reason,
-                "reached_requested_t_end": False,
-                "partial_after_error": True,
-                "error": error,
-                "parameter_case": base.parameter_payload(parameter_case),
-            },
-        ):
-            record["trajectory_path"] = str(partial_path)
-            record["partial_trajectory_saved"] = True
-        else:
-            record["partial_trajectory_saved"] = False
+        record["partial_trajectory_saved"] = False
     write_json(output_dir / f"{algorithm_label}_run_{int(run_index):04d}_record.json", record)
     return record
 
