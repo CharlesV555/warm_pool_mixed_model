@@ -25,7 +25,7 @@ def analyze_tend_gradient(
     batch_dir: str | Path,
     *,
     output_dir: str | Path | None = None,
-    reached_only: bool = True,
+    reached_only: bool = False,
 ) -> dict[str, Any]:
     batch_path = Path(batch_dir)
     metadata_path = batch_path / RUN_METADATA_NAME
@@ -101,6 +101,7 @@ def plot_wall_time_by_t_end(rows: list[dict[str, Any]], output_path: Path) -> Pa
 
     positions: list[float] = []
     data: list[np.ndarray] = []
+    reasons_by_group: list[list[str]] = []
     colors: list[Any] = []
     y_tick_positions: list[float] = []
     y_tick_labels: list[str] = []
@@ -120,18 +121,20 @@ def plot_wall_time_by_t_end(rows: list[dict[str, Any]], output_path: Path) -> Pa
             y_tick_labels.append(f"t={t_end:g}")
             offsets = (np.arange(len(labels), dtype=float) - (len(labels) - 1) / 2.0) * algorithm_gap
             for label_index, label in enumerate(labels):
-                values = [
-                    float(row["wall_runtime_seconds"])
+                group_rows = [
+                    row
                     for row in rows
                     if str(row["network"]) == network
                     and float(row["t_end"]) == float(t_end)
                     and str(row["algorithm_label"]) == label
                     and np.isfinite(float(row["wall_runtime_seconds"]))
                 ]
+                values = [float(row["wall_runtime_seconds"]) for row in group_rows]
                 if not values:
                     continue
                 positions.append(center + float(offsets[label_index]))
                 data.append(np.asarray(values, dtype=float))
+                reasons_by_group.append([str(row.get("stop_reason", "unknown")) for row in group_rows])
                 colors.append(cmap(label_index % 10))
             current_y += t_end_gap
         network_end = current_y - t_end_gap if t_ends_by_network[network] else network_start
@@ -156,18 +159,23 @@ def plot_wall_time_by_t_end(rows: list[dict[str, Any]], output_path: Path) -> Pa
             patch.set_facecolor(color)
             patch.set_edgecolor(color)
             patch.set_alpha(0.24)
-        for index, (pos, values, color) in enumerate(zip(positions, data, colors)):
+        for index, (pos, values, color, reasons) in enumerate(zip(positions, data, colors, reasons_by_group)):
             rng = np.random.default_rng(2000 + int(index))
             jitter = rng.uniform(-box_height * 0.32, box_height * 0.32, size=values.shape)
-            ax.scatter(
-                values,
-                np.full(values.shape, pos, dtype=float) + jitter,
-                s=15,
-                color=color,
-                alpha=0.62,
-                edgecolors="none",
-                zorder=3,
-            )
+            reason_arr = np.asarray(reasons, dtype=object)
+            for reason in sorted(set(reasons), key=stop_reason_sort_key):
+                mask = reason_arr == reason
+                marker = stop_reason_marker(reason)
+                ax.scatter(
+                    values[mask],
+                    np.full(int(np.count_nonzero(mask)), pos, dtype=float) + jitter[mask],
+                    s=22 if marker == "^" else 16,
+                    marker=marker,
+                    color=color,
+                    alpha=0.66,
+                    edgecolors="none",
+                    zorder=3,
+                )
 
     from matplotlib.patches import Patch
 
@@ -181,7 +189,21 @@ def plot_wall_time_by_t_end(rows: list[dict[str, Any]], output_path: Path) -> Pa
     ax.set_yticklabels(y_tick_labels)
     ax.invert_yaxis()
     ax.grid(axis="x", alpha=0.25)
-    ax.legend(handles=handles, fontsize=8, loc="best")
+    algorithm_legend = ax.legend(handles=handles, fontsize=8, loc="upper right", title="algorithm")
+    ax.add_artist(algorithm_legend)
+    reason_handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker=stop_reason_marker(reason),
+            color="none",
+            markerfacecolor="#555555",
+            markersize=6,
+            label=short_label(reason, max_len=28),
+        )
+        for reason in sorted({str(row.get("stop_reason", "unknown")) for row in rows}, key=stop_reason_sort_key)
+    ]
+    ax.legend(handles=reason_handles, fontsize=8, loc="lower right", title="stop reason")
     ax.set_title("Wall Time To Reach Target Simulation Time")
 
     x_left, x_right = ax.get_xlim()
@@ -217,6 +239,29 @@ def algorithm_label(record: dict[str, Any]) -> str:
 def algorithm_sort_key(label: str) -> tuple[int, str]:
     text = str(label).lower()
     return (1 if text == "ssa" else 0, text)
+
+
+def stop_reason_marker(reason: str) -> str:
+    text = str(reason).lower()
+    if text in {"max_runtime_seconds", "max_run_time", "max_runtime", "runtime_limit"}:
+        return "^"
+    if text == "reached_t_end":
+        return "o"
+    if text == "max_steps":
+        return "s"
+    if "exception" in text or "error" in text:
+        return "x"
+    return "D"
+
+
+def stop_reason_sort_key(reason: str) -> tuple[int, str]:
+    order = {
+        "reached_t_end": 0,
+        "max_runtime_seconds": 1,
+        "max_steps": 2,
+    }
+    text = str(reason)
+    return (order.get(text, 99), text)
 
 
 def optional_float(value: Any) -> float | None:
@@ -255,7 +300,12 @@ def parser() -> argparse.ArgumentParser:
     arg_parser.add_argument(
         "--include-failed",
         action="store_true",
-        help="Include runs that did not reach requested_t_end.",
+        help="Deprecated; failed runs are included by default.",
+    )
+    arg_parser.add_argument(
+        "--reached-only",
+        action="store_true",
+        help="Only plot runs that reached requested_t_end.",
     )
     return arg_parser
 
@@ -265,7 +315,7 @@ def main() -> None:
     analyze_tend_gradient(
         args.batch_dir,
         output_dir=args.output_dir,
-        reached_only=not bool(args.include_failed),
+        reached_only=bool(args.reached_only),
     )
 
 

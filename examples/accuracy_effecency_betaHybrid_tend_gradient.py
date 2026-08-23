@@ -50,6 +50,7 @@ MAX_RUNTIME_SECONDS = base.MAX_RUNTIME_SECONDS
 
 # Parallelism. None means all visible CPUs, capped by task count.
 PARALLEL_WORKERS: int | None = None
+GROUP_PARALLEL_WORKERS: int | None = None
 
 # Algorithm cases. The "method" value must be understood by base.make_stepper:
 # - "ssa" uses SSAStepper through base.InfiniteHorizonSSAStepper.
@@ -102,92 +103,24 @@ def run() -> dict[str, Any]:
             algorithm_cases=algorithm_cases,
         )
 
-    all_records: list[dict[str, Any]] = []
-    gate_reports: list[dict[str, Any]] = []
-
-    for network_case in network_cases:
-        network_dir = output_root / network_case.name
-        network_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            network, catalysis_metadata = base.build_network_case(network_case)
-        except Exception as exc:
-            record = base.network_error_record(network_case, exc)
-            all_records.append(record)
-            write_json(network_dir / "network_build_error.json", record)
-            write_json(output_root / "run_records.json", base.sorted_records(all_records))
-            base.print_single_record(record)
-            continue
-
-        write_json(
-            network_dir / "network_metadata.json",
-            {
-                "network_case": asdict(network_case),
-                "n_species": int(network.n_species),
-                "n_channels": int(network.n_channels),
-                "catalysis": catalysis_metadata,
-                "base_rates": base.base_rate_metadata(),
-            },
+    group_results = run_algorithm_groups_parallel(
+        build_algorithm_group_tasks(
+            output_root=output_root,
+            network_cases=network_cases,
+            algorithm_cases=algorithm_cases,
+            t_end_values=t_end_values,
+            seed_rng=seed_rng,
+            mode="t_end_gradient",
         )
-
-        for algorithm_case in algorithm_cases:
-            group_label = str(algorithm_case["label"])
-            group_dir = network_dir / group_label
-            group_dir.mkdir(parents=True, exist_ok=True)
-            seeds = [base.next_seed(seed_rng) for _ in range(int(RUNS_PER_GROUP))]
-            write_json(
-                group_dir / "seed_plan.json",
-                {
-                    "network": network_case.name,
-                    "algorithm_label": group_label,
-                    "method": algorithm_case["method"],
-                    "runs_per_group": int(RUNS_PER_GROUP),
-                    "seeds": seeds,
-                    "same_seeds_across_t_end": True,
-                },
-            )
-
-            group_failed = False
-            for t_end in t_end_values:
-                if group_failed:
-                    skipped = {
-                        "network": network_case.name,
-                        "algorithm_label": group_label,
-                        "method": algorithm_case["method"],
-                        "t_end": float(t_end),
-                        "status": "skipped",
-                        "reason": "previous_t_end_not_reached",
-                        "n_runs": int(RUNS_PER_GROUP),
-                    }
-                    gate_reports.append(skipped)
-                    print_gate_report(skipped)
-                    continue
-
-                t_dir = group_dir / f"t_end_{float_label(t_end)}"
-                tasks = build_tasks(
-                    network_case=network_case,
-                    algorithm_case=algorithm_case,
-                    t_end=float(t_end),
-                    output_dir=t_dir,
-                    seeds=seeds,
-                )
-                records = run_tasks_parallel(tasks, t_dir)
-                annotate_records(records, algorithm_case=algorithm_case, requested_t_end=float(t_end))
-                all_records.extend(records)
-                write_json(output_root / "run_records.json", sorted_records(all_records))
-
-                report = t_end_gate_report(
-                    records,
-                    network=network_case.name,
-                    algorithm_label=group_label,
-                    method=str(algorithm_case["method"]),
-                    t_end=float(t_end),
-                )
-                gate_reports.append(report)
-                write_json(t_dir / "t_end_gate_report.json", report)
-                write_json(output_root / "t_end_gate_reports.json", gate_reports)
-                print_gate_report(report)
-                if not bool(report["all_reached_t_end"]):
-                    group_failed = True
+    )
+    all_records = sorted_records(
+        [record for result in group_results for record in list(result.get("records", []))]
+    )
+    gate_reports = sorted_gate_reports(
+        [report for result in group_results for report in list(result.get("gate_reports", []))]
+    )
+    write_json(output_root / "run_records.json", all_records)
+    write_json(output_root / "t_end_gate_reports.json", gate_reports)
 
     payload = {
         "run_name": RUN_NAME,
@@ -221,75 +154,24 @@ def run_max_runtime_probe(
     network_cases: list[base.NetworkCase],
     algorithm_cases: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    all_records: list[dict[str, Any]] = []
-    probe_reports: list[dict[str, Any]] = []
-
-    for network_case in network_cases:
-        network_dir = output_root / network_case.name
-        network_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            network, catalysis_metadata = base.build_network_case(network_case)
-        except Exception as exc:
-            record = base.network_error_record(network_case, exc)
-            all_records.append(record)
-            write_json(network_dir / "network_build_error.json", record)
-            write_json(output_root / "run_records.json", sorted_records(all_records))
-            base.print_single_record(record)
-            continue
-
-        write_json(
-            network_dir / "network_metadata.json",
-            {
-                "network_case": asdict(network_case),
-                "n_species": int(network.n_species),
-                "n_channels": int(network.n_channels),
-                "catalysis": catalysis_metadata,
-                "base_rates": base.base_rate_metadata(),
-            },
+    group_results = run_algorithm_groups_parallel(
+        build_algorithm_group_tasks(
+            output_root=output_root,
+            network_cases=network_cases,
+            algorithm_cases=algorithm_cases,
+            t_end_values=[],
+            seed_rng=seed_rng,
+            mode="max_runtime_probe",
         )
-
-        for algorithm_case in algorithm_cases:
-            group_label = str(algorithm_case["label"])
-            group_dir = network_dir / group_label / "max_runtime_probe"
-            seeds = [base.next_seed(seed_rng) for _ in range(int(RUNS_PER_GROUP))]
-            write_json(
-                group_dir / "seed_plan.json",
-                {
-                    "network": network_case.name,
-                    "algorithm_label": group_label,
-                    "method": algorithm_case["method"],
-                    "runs_per_group": int(RUNS_PER_GROUP),
-                    "seeds": seeds,
-                    "mode": "max_runtime_probe",
-                    "requested_t_end": None,
-                    "runner_t_end": "inf",
-                    "max_runtime_seconds": float(MAX_RUNTIME_SECONDS),
-                },
-            )
-            tasks = build_tasks(
-                network_case=network_case,
-                algorithm_case=algorithm_case,
-                t_end=float("inf"),
-                output_dir=group_dir,
-                seeds=seeds,
-            )
-            records = run_tasks_parallel(tasks, group_dir)
-            annotate_records(records, algorithm_case=algorithm_case, requested_t_end=None)
-            for record in records:
-                record["max_runtime_probe"] = True
-            all_records.extend(records)
-            write_json(output_root / "run_records.json", sorted_records(all_records))
-
-            report = max_runtime_probe_report(
-                records,
-                network=network_case.name,
-                algorithm_label=group_label,
-                method=str(algorithm_case["method"]),
-            )
-            probe_reports.append(report)
-            write_json(group_dir / "max_runtime_probe_report.json", report)
-            write_json(output_root / "max_runtime_probe_reports.json", probe_reports)
-            print_probe_report(report)
+    )
+    all_records = sorted_records(
+        [record for result in group_results for record in list(result.get("records", []))]
+    )
+    probe_reports = sorted_probe_reports(
+        [report for result in group_results for report in list(result.get("probe_reports", []))]
+    )
+    write_json(output_root / "run_records.json", all_records)
+    write_json(output_root / "max_runtime_probe_reports.json", probe_reports)
 
     payload = {
         "run_name": RUN_NAME,
@@ -314,6 +196,236 @@ def run_max_runtime_probe(
     print_probe_summary(payload["probe_summary"])
     print(f"[{RUN_NAME}] wrote metadata: {output_root / 'run_metadata.json'}")
     return payload
+
+
+def build_algorithm_group_tasks(
+    *,
+    output_root: Path,
+    network_cases: list[base.NetworkCase],
+    algorithm_cases: list[dict[str, Any]],
+    t_end_values: list[float],
+    seed_rng: np.random.Generator,
+    mode: str,
+) -> list[dict[str, Any]]:
+    tasks = []
+    for network_case in network_cases:
+        for algorithm_case in algorithm_cases:
+            tasks.append(
+                {
+                    "output_root": output_root,
+                    "network_case": network_case,
+                    "algorithm_case": algorithm_case,
+                    "t_end_values": [float(value) for value in t_end_values],
+                    "seeds": [base.next_seed(seed_rng) for _ in range(int(RUNS_PER_GROUP))],
+                    "mode": str(mode),
+                }
+            )
+    return tasks
+
+
+def run_algorithm_groups_parallel(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not tasks:
+        return []
+    worker_count = resolve_group_worker_count(len(tasks))
+    print(f"[{RUN_NAME}] submitting {len(tasks)} algorithm groups with workers={worker_count}")
+    results: list[dict[str, Any]] = []
+    if worker_count <= 1:
+        for task in tasks:
+            result = run_algorithm_group_task(task)
+            results.append(result)
+            print_group_result(result)
+        return results
+
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        future_to_task = {executor.submit(run_algorithm_group_task, task): task for task in tasks}
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = algorithm_group_error_result(task, exc)
+            results.append(result)
+            print_group_result(result)
+    return results
+
+
+def run_algorithm_group_task(task: dict[str, Any]) -> dict[str, Any]:
+    network_case = task["network_case"]
+    if not isinstance(network_case, base.NetworkCase):
+        network_case = base.NetworkCase(**dict(network_case))
+    algorithm_case = normalize_algorithm_case(dict(task["algorithm_case"]))
+    mode = str(task.get("mode", "t_end_gradient"))
+    if mode == "max_runtime_probe":
+        return run_max_runtime_probe_group(
+            output_root=Path(task["output_root"]),
+            network_case=network_case,
+            algorithm_case=algorithm_case,
+            seeds=[int(seed) for seed in task["seeds"]],
+        )
+    return run_t_end_gradient_group(
+        output_root=Path(task["output_root"]),
+        network_case=network_case,
+        algorithm_case=algorithm_case,
+        t_end_values=[float(value) for value in task["t_end_values"]],
+        seeds=[int(seed) for seed in task["seeds"]],
+    )
+
+
+def run_t_end_gradient_group(
+    *,
+    output_root: Path,
+    network_case: base.NetworkCase,
+    algorithm_case: dict[str, Any],
+    t_end_values: list[float],
+    seeds: list[int],
+) -> dict[str, Any]:
+    write_network_metadata(output_root, network_case)
+    network_dir = output_root / network_case.name
+    group_label = str(algorithm_case["label"])
+    group_dir = network_dir / group_label
+    write_json(
+        group_dir / "seed_plan.json",
+        {
+            "network": network_case.name,
+            "algorithm_label": group_label,
+            "method": algorithm_case["method"],
+            "runs_per_group": int(RUNS_PER_GROUP),
+            "seeds": [int(seed) for seed in seeds],
+            "same_seeds_across_t_end": True,
+        },
+    )
+    records_all: list[dict[str, Any]] = []
+    reports: list[dict[str, Any]] = []
+    group_failed = False
+    for t_end in t_end_values:
+        if group_failed:
+            skipped = {
+                "network": network_case.name,
+                "algorithm_label": group_label,
+                "method": algorithm_case["method"],
+                "t_end": float(t_end),
+                "status": "skipped",
+                "reason": "previous_t_end_not_reached",
+                "n_runs": int(RUNS_PER_GROUP),
+            }
+            reports.append(skipped)
+            print_gate_report(skipped)
+            continue
+
+        t_dir = group_dir / f"t_end_{float_label(t_end)}"
+        run_records = run_tasks_parallel(
+            build_tasks(
+                network_case=network_case,
+                algorithm_case=algorithm_case,
+                t_end=float(t_end),
+                output_dir=t_dir,
+                seeds=seeds,
+            ),
+            t_dir,
+        )
+        annotate_records(run_records, algorithm_case=algorithm_case, requested_t_end=float(t_end))
+        records_all.extend(run_records)
+        report = t_end_gate_report(
+            run_records,
+            network=network_case.name,
+            algorithm_label=group_label,
+            method=str(algorithm_case["method"]),
+            t_end=float(t_end),
+        )
+        reports.append(report)
+        write_json(t_dir / "t_end_gate_report.json", report)
+        print_gate_report(report)
+        if not bool(report["all_reached_t_end"]):
+            group_failed = True
+    write_json(group_dir / "group_records.json", sorted_records(records_all))
+    write_json(group_dir / "group_gate_reports.json", reports)
+    return {
+        "mode": "t_end_gradient",
+        "network": network_case.name,
+        "algorithm_label": group_label,
+        "records": sorted_records(records_all),
+        "gate_reports": reports,
+        "probe_reports": [],
+    }
+
+
+def run_max_runtime_probe_group(
+    *,
+    output_root: Path,
+    network_case: base.NetworkCase,
+    algorithm_case: dict[str, Any],
+    seeds: list[int],
+) -> dict[str, Any]:
+    write_network_metadata(output_root, network_case)
+    group_label = str(algorithm_case["label"])
+    group_dir = output_root / network_case.name / group_label / "max_runtime_probe"
+    write_json(
+        group_dir / "seed_plan.json",
+        {
+            "network": network_case.name,
+            "algorithm_label": group_label,
+            "method": algorithm_case["method"],
+            "runs_per_group": int(RUNS_PER_GROUP),
+            "seeds": [int(seed) for seed in seeds],
+            "mode": "max_runtime_probe",
+            "requested_t_end": None,
+            "runner_t_end": "inf",
+            "max_runtime_seconds": float(MAX_RUNTIME_SECONDS),
+        },
+    )
+    records = run_tasks_parallel(
+        build_tasks(
+            network_case=network_case,
+            algorithm_case=algorithm_case,
+            t_end=float("inf"),
+            output_dir=group_dir,
+            seeds=seeds,
+        ),
+        group_dir,
+    )
+    annotate_records(records, algorithm_case=algorithm_case, requested_t_end=None)
+    for record in records:
+        record["max_runtime_probe"] = True
+    report = max_runtime_probe_report(
+        records,
+        network=network_case.name,
+        algorithm_label=group_label,
+        method=str(algorithm_case["method"]),
+    )
+    write_json(group_dir / "max_runtime_probe_report.json", report)
+    print_probe_report(report)
+    return {
+        "mode": "max_runtime_probe",
+        "network": network_case.name,
+        "algorithm_label": group_label,
+        "records": sorted_records(records),
+        "gate_reports": [],
+        "probe_reports": [report],
+    }
+
+
+def write_network_metadata(output_root: Path, network_case: base.NetworkCase) -> None:
+    network_dir = output_root / network_case.name
+    network_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        network, catalysis_metadata = base.build_network_case(network_case)
+    except Exception as exc:
+        record = base.network_error_record(network_case, exc)
+        write_json(network_dir / "network_build_error.json", record)
+        raise
+    metadata_path = network_dir / "network_metadata.json"
+    if metadata_path.exists():
+        return
+    write_json(
+        metadata_path,
+        {
+            "network_case": asdict(network_case),
+            "n_species": int(network.n_species),
+            "n_channels": int(network.n_channels),
+            "catalysis": catalysis_metadata,
+            "base_rates": base.base_rate_metadata(),
+        },
+    )
 
 
 def build_tasks(
@@ -675,6 +787,78 @@ def sorted_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def sorted_gate_reports(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        reports,
+        key=lambda item: (
+            str(item.get("network", "")),
+            str(item.get("algorithm_label", "")),
+            float(item.get("t_end") or -1.0),
+        ),
+    )
+
+
+def sorted_probe_reports(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        reports,
+        key=lambda item: (
+            str(item.get("network", "")),
+            str(item.get("algorithm_label", "")),
+        ),
+    )
+
+
+def algorithm_group_error_result(task: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    network_case = task["network_case"]
+    if not isinstance(network_case, base.NetworkCase):
+        network_case = base.NetworkCase(**dict(network_case))
+    algorithm_case = normalize_algorithm_case(dict(task["algorithm_case"]))
+    records = [
+        {
+            "status": "error",
+            "network": network_case.name,
+            "max_len": int(network_case.max_len),
+            "algorithm_label": str(algorithm_case["label"]),
+            "method": str(algorithm_case["method"]),
+            "run_index": None,
+            "seed": None,
+            "requested_t_end": None,
+            "simulation_final_time": None,
+            "wall_runtime_seconds": None,
+            "n_steps": None,
+            "n_events": None,
+            "ssa_steps": None,
+            "con_steps": None,
+            "stop_reason": "algorithm_group_exception",
+            "reached_requested_t_end": False,
+            "trajectory_path": "",
+            "parameter_case": base.parameter_payload(algorithm_case.get("parameter_case")),
+            "error": repr(exc),
+            "traceback_path": "",
+        }
+    ]
+    return {
+        "mode": str(task.get("mode", "")),
+        "network": network_case.name,
+        "algorithm_label": str(algorithm_case["label"]),
+        "records": records,
+        "gate_reports": [],
+        "probe_reports": [],
+        "error": repr(exc),
+    }
+
+
+def print_group_result(result: dict[str, Any]) -> None:
+    print(
+        f"[{RUN_NAME}] group done mode={result.get('mode')} "
+        f"network={result.get('network')} algorithm={result.get('algorithm_label')} "
+        f"records={len(list(result.get('records', [])))} "
+        f"gate_reports={len(list(result.get('gate_reports', [])))} "
+        f"probe_reports={len(list(result.get('probe_reports', [])))} "
+        f"error={result.get('error', '')}"
+    )
+
+
 def print_single_record(record: dict[str, Any]) -> None:
     print(
         f"[{RUN_NAME}] status={record.get('status')} network={record.get('network')} "
@@ -740,6 +924,13 @@ def resolve_worker_count(task_count: int) -> int:
     return max(1, min(int(requested), int(task_count)))
 
 
+def resolve_group_worker_count(task_count: int) -> int:
+    if int(task_count) <= 0:
+        return 0
+    requested = os.cpu_count() or 1 if GROUP_PARALLEL_WORKERS is None else int(GROUP_PARALLEL_WORKERS)
+    return max(1, min(int(requested), int(task_count)))
+
+
 def settings_metadata() -> dict[str, Any]:
     return {
         "max_runtime_probe_mode": bool(MAX_RUNTIME_PROBE_MODE),
@@ -749,8 +940,10 @@ def settings_metadata() -> dict[str, Any]:
         "max_steps": int(MAX_STEPS),
         "max_runtime_seconds": float(MAX_RUNTIME_SECONDS),
         "parallel_workers": None if PARALLEL_WORKERS is None else int(PARALLEL_WORKERS),
+        "group_parallel_workers": None if GROUP_PARALLEL_WORKERS is None else int(GROUP_PARALLEL_WORKERS),
         "same_seeds_across_t_end": True,
-        "blended_runs_first": True,
+        "algorithm_groups_parallel": True,
+        "blended_and_ssa_groups_parallel": True,
         "skip_longer_t_end_after_first_failed_group": True,
     }
 
@@ -772,6 +965,7 @@ def apply_environment_overrides() -> None:
     global MAX_STEPS
     global MAX_RUNTIME_SECONDS
     global PARALLEL_WORKERS
+    global GROUP_PARALLEL_WORKERS
 
     base.apply_environment_overrides()
     MAX_RUNTIME_PROBE_MODE = env_bool("TEND_GRADIENT_MAX_RUNTIME_PROBE_MODE", MAX_RUNTIME_PROBE_MODE)
@@ -781,6 +975,10 @@ def apply_environment_overrides() -> None:
     MAX_STEPS = env_int("TEND_GRADIENT_MAX_STEPS", base.MAX_STEPS)
     MAX_RUNTIME_SECONDS = env_float("TEND_GRADIENT_MAX_RUNTIME_SECONDS", base.MAX_RUNTIME_SECONDS)
     PARALLEL_WORKERS = env_optional_int("TEND_GRADIENT_PARALLEL_WORKERS", PARALLEL_WORKERS)
+    GROUP_PARALLEL_WORKERS = env_optional_int(
+        "TEND_GRADIENT_GROUP_PARALLEL_WORKERS",
+        GROUP_PARALLEL_WORKERS,
+    )
 
 
 def env_int(name: str, default: int) -> int:
